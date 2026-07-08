@@ -79,9 +79,9 @@ Use real APIs and open-source tools wherever possible.
 
 If a workflow cannot run without unavailable regulated or physical-system data, return a typed not_implemented result and document the missing connector.
 
-## Reuse strategy for existing `panoptic-trial-intel` repo
+## Reuse strategy for existing `levigoldberg/ClinicalTrialIntel` repo
 
-The existing `panoptic-trial-intel` repository should be treated as a source of reusable implementations for one workflow: Trial Intelligence / Due Diligence.
+The existing `levigoldberg/ClinicalTrialIntel` repository should be treated as a source of reusable implementations for one workflow: Trial Intelligence / Due Diligence.
 
 Do not copy its full architecture directly.
 

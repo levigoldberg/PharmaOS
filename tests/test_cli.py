@@ -7,10 +7,10 @@ import json
 from pharma_os.cli import main
 
 
-def test_run_command_outputs_completed_workflow(capsys):
+def test_run_command_outputs_completed_workflow(capsys, tmp_path):
     """The run command emits a completed workflow run."""
 
-    exit_code = main(["run", "demo-workflow"])
+    exit_code = main(["run", "demo-workflow", "--db-path", str(tmp_path / "memory.sqlite")])
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)
@@ -19,10 +19,12 @@ def test_run_command_outputs_completed_workflow(capsys):
     assert output["run_id"]
 
 
-def test_report_command_outputs_report(capsys):
+def test_report_command_outputs_report(capsys, tmp_path):
     """The report command emits a report for the requested run id."""
 
-    exit_code = main(["report", "--run-id", "RUN123"])
+    exit_code = main(
+        ["report", "--run-id", "RUN123", "--db-path", str(tmp_path / "memory.sqlite")]
+    )
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)

@@ -117,6 +117,123 @@ class WorkflowRun(StrictSchema):
     )
 
 
+class ClinicalTrialIntelligenceInput(StrictSchema):
+    """Input contract for the first Clinical Trial Intelligence workflow."""
+
+    disease: str = Field(..., min_length=1, description="Disease or indication to search.")
+    drug: str | None = Field(default=None, description="Optional drug or intervention name.")
+    target: str | None = Field(default=None, description="Optional biological target.")
+    phase: str | None = Field(default=None, description="Optional trial phase filter.")
+    limit: int = Field(default=10, ge=1, le=50, description="Maximum trials to retrieve.")
+
+
+class TrialIntervention(StrictSchema):
+    """Normalized intervention from ClinicalTrials.gov."""
+
+    name: str = Field(..., min_length=1)
+    type: str | None = None
+    description: str | None = None
+    other_names: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class TrialSponsor(StrictSchema):
+    """Normalized trial sponsor or collaborator."""
+
+    name: str = Field(..., min_length=1)
+    sponsor_class: str | None = None
+
+
+class TrialEndpoint(StrictSchema):
+    """Normalized endpoint/outcome from ClinicalTrials.gov."""
+
+    measure: str = Field(..., min_length=1)
+    time_frame: str | None = None
+    description: str | None = None
+    endpoint_type: Literal["primary", "secondary", "other"] = "other"
+
+
+class ClinicalTrialRecord(StrictSchema):
+    """A normalized ClinicalTrials.gov study record."""
+
+    nct_id: str = Field(..., min_length=1)
+    brief_title: str | None = None
+    official_title: str | None = None
+    overall_status: str | None = None
+    phases: tuple[str, ...] = Field(default_factory=tuple)
+    study_type: str | None = None
+    conditions: tuple[str, ...] = Field(default_factory=tuple)
+    interventions: tuple[TrialIntervention, ...] = Field(default_factory=tuple)
+    lead_sponsor: TrialSponsor | None = None
+    collaborators: tuple[TrialSponsor, ...] = Field(default_factory=tuple)
+    enrollment_count: int | None = None
+    enrollment_type: str | None = None
+    start_date: str | None = None
+    primary_completion_date: str | None = None
+    completion_date: str | None = None
+    results_available: bool = False
+    primary_endpoints: tuple[TrialEndpoint, ...] = Field(default_factory=tuple)
+    secondary_endpoints: tuple[TrialEndpoint, ...] = Field(default_factory=tuple)
+    eligibility_criteria: str | None = None
+    minimum_age: str | None = None
+    maximum_age: str | None = None
+    sex: str | None = None
+    source_id: str = Field(..., min_length=1)
+
+
+class TrialLandscapeRisk(StrictSchema):
+    """A source-backed risk or uncertainty in the trial landscape."""
+
+    risk_id: str = Field(..., min_length=1)
+    trial_id: str | None = None
+    risk_type: Literal[
+        "terminated_or_withdrawn",
+        "missing_results",
+        "small_enrollment",
+        "outdated_status",
+        "unclear_endpoints",
+        "tool_failure",
+        "other",
+    ]
+    description: str = Field(..., min_length=1)
+    severity: Literal["low", "medium", "high"] = "medium"
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class ClinicalTrialsSearchResult(StrictSchema):
+    """Typed result from the ClinicalTrials.gov deterministic tool."""
+
+    query: ClinicalTrialIntelligenceInput
+    trials: tuple[ClinicalTrialRecord, ...] = Field(default_factory=tuple)
+    sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
+    retrieved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    api_url: str = Field(..., min_length=1)
+    errors: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class ClinicalTrialIntelligenceOutput(StrictSchema):
+    """Structured output from the Clinical Trial Intelligence Agent/workflow."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    input: ClinicalTrialIntelligenceInput
+    trials: tuple[ClinicalTrialRecord, ...] = Field(default_factory=tuple)
+    sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
+    claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
+    risk_flags: tuple[TrialLandscapeRisk, ...] = Field(default_factory=tuple)
+    landscape_summary: str = Field(..., min_length=1)
+    status_summary: str = Field(..., min_length=1)
+    phase_summary: str = Field(..., min_length=1)
+    sponsor_summary: str = Field(..., min_length=1)
+    endpoint_summary: str = Field(..., min_length=1)
+    population_summary: str = Field(..., min_length=1)
+    validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
+    confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
+    human_gate: HumanGate | None = None
+    confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    validation_status: ValidationStatus = "not_run"
+    trace_metadata: dict[str, MetadataValue] = Field(default_factory=dict)
+
+
 class AgentOutput(StrictSchema):
     """Common output contract for agents before workflow-specific schemas."""
 

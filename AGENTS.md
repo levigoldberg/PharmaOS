@@ -62,7 +62,7 @@ Implement multiple workflows where real data is available:
 
 Before implementing the Trial Intelligence / Due Diligence workflow, inspect:
 
-- `panoptic-trial-intel`
+- `levigoldberg/ClinicalTrialIntel`
 
 Use it as reusable source material for that workflow only. Do not copy its whole NCT-centered architecture into this project.
 

@@ -60,7 +60,7 @@ Automate by default. Human gates should be reserved for decisions that require h
 
 There is an existing repository that should be inspected before implementing the Trial Intelligence / Due Diligence vertical slice:
 
-- `panoptic-trial-intel`
+- `levigoldberg/ClinicalTrialIntel`
 
 Use it as reusable source material, not as the governing architecture for this new project.
 
