@@ -1,0 +1,42 @@
+rules:
+  - id: indication_ph_hfpef
+    all_terms: [Pulmonary Hypertension, Heart Failure With Preserved Ejection Fraction]
+    terms: [PH-HFpEF]
+    normalized_indication: pulmonary hypertension secondary to heart failure with preserved ejection fraction
+    therapeutic_area: cardiology
+  - id: indication_glioblastoma
+    terms: [Glioblastoma, GBM]
+    normalized_indication: glioblastoma
+    therapeutic_area: oncology
+  - id: indication_alzheimers
+    terms: [Alzheimer Disease, Alzheimer's Disease]
+    normalized_indication: Alzheimer's disease
+    therapeutic_area: neurology
+  - id: indication_parkinsons
+    terms: [Parkinson Disease, Parkinson's Disease]
+    normalized_indication: Parkinson's disease
+    therapeutic_area: neurology
+  - id: indication_dementia_related_psychosis
+    terms: [Dementia-related Psychosis, Dementia With Lewy Bodies]
+    normalized_indication: dementia-related psychosis
+    therapeutic_area: neurology
+  - id: indication_major_depressive_disorder
+    terms: [Major Depressive Disorder, Depression]
+    normalized_indication: major depressive disorder
+    therapeutic_area: psychiatry
+  - id: indication_multiple_sclerosis
+    terms: [Multiple Sclerosis]
+    normalized_indication: multiple sclerosis
+    therapeutic_area: neurology/immunology
+  - id: indication_rheumatoid_arthritis
+    terms: [Rheumatoid Arthritis]
+    normalized_indication: rheumatoid arthritis
+    therapeutic_area: immunology
+  - id: indication_type_2_diabetes
+    terms: [Type 2 Diabetes, Diabetes Mellitus, Type 2]
+    normalized_indication: type 2 diabetes mellitus
+    therapeutic_area: endocrinology
+  - id: indication_solid_tumor
+    terms: [Solid Tumor, Solid Malignancy]
+    normalized_indication: advanced solid tumors
+    therapeutic_area: oncology

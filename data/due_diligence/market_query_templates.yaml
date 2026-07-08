@@ -1,0 +1,11 @@
+templates:
+  disease_prevalence: "\"{condition}\" prevalence {geography}"
+  disease_epidemiology: "\"{condition}\" epidemiology {geography}"
+  disease_population: "\"{condition}\" disease population {geography}"
+  combined_indication_prevalence: "\"{indication_phrase}\" prevalence {geography}"
+  combined_indication_epidemiology: "\"{indication_phrase}\" epidemiology {geography}"
+  combined_indication_population: "\"{indication_phrase}\" disease population {geography}"
+  indication_acronym_prevalence: "\"{acronym}\" prevalence {geography}"
+  indication_acronym_epidemiology: "\"{acronym}\" epidemiology {geography}"
+  trial_indication_prevalence: "\"{normalized_indication}\" prevalence {geography}"
+  trial_eligibility_population: "{trial_title} eligibility population"

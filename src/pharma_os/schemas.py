@@ -255,8 +255,16 @@ class AssumptionRecord(StrictSchema):
 
     assumption_id: str = Field(..., min_length=1)
     name: str = Field(..., min_length=1)
-    value: str | float | int | bool | None = None
+    value: MetadataValue = None
     unit: str | None = None
+    assumption_type: Literal[
+        "source_derived",
+        "user_reviewed",
+        "config_default",
+        "fallback_assumption",
+        "calculated",
+        "missing",
+    ] = "user_reviewed"
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     provenance: str = Field(..., min_length=1)
     requires_human_review: bool = False

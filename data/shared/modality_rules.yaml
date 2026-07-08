@@ -15,6 +15,9 @@ rules:
   - id: modality_vaccine
     modality: vaccine
     keywords: [vaccine]
+  - id: modality_protein
+    modality: protein or biologic
+    keywords: [recombinant, enzyme, protein]
   - id: modality_small_molecule
     modality: small molecule
     keywords: [inhibitor, agonist, antagonist, modulator, capsule, tablet, oral]

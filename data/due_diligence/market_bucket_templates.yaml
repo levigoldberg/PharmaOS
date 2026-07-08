@@ -1,0 +1,52 @@
+us_population_denominator:
+  purpose: establish the base geography
+  always_available: true
+  sub_buckets:
+    - total_us_population
+    - adult_population
+    - pediatric_population
+    - age_bands
+    - sex_split_if_relevant
+  primary_source: US Census API
+  notes: This bucket should always be sourced first because it defines the US-only market denominator.
+
+disease_population:
+  purpose: estimate the number of US patients with the disease or indication of interest
+  sub_buckets:
+    - prevalence
+    - incidence_if_relevant
+    - disease_population_estimate
+    - geography
+    - source_year
+  recommended_sources:
+    - PubMed
+    - society guidelines
+    - CDC or NIH disease pages when available
+    - disease registries when available
+
+clinically_relevant_or_trial_eligible_population:
+  purpose: estimate the portion of disease patients likely to match the clinical-trial or future-label population
+  sub_buckets:
+    - trial_eligibility_filters
+    - age_criteria
+    - severity_criteria
+    - biomarker_or_clinical_criteria_if_relevant
+    - exclusion_criteria
+    - eligible_fraction
+  recommended_sources:
+    - ClinicalTrials.gov eligibility criteria
+    - trial protocol if available
+    - peer-reviewed disease literature
+    - company materials as triangulation
+
+commercially_addressable_population_placeholder:
+  purpose: placeholder for later commercial model inputs without calculating commercial uptake yet
+  sub_buckets:
+    - commercially_addressable_patients
+    - rationale
+    - human_review_notes
+  recommended_sources:
+    - human-reviewed assumption
+    - company materials
+    - claims or utilization literature if available
+

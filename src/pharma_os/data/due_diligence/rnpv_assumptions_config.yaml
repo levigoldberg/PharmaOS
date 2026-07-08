@@ -1,0 +1,40 @@
+schema_version: "1.0"
+valuation_year: 2026
+launch_timing:
+  default_years_to_launch_by_phase:
+    PHASE1: 6
+    Phase I: 6
+    PHASE2: 4
+    Phase II: 4
+    PHASE3: 2
+    Phase III: 2
+    NDA/BLA: 1
+    APPROVED: 0
+    default: 4
+discount_rate: 0.12
+tax_rate: 0.21
+operating_margin: 0.65
+development_costs:
+  default_allocation: evenly_until_launch
+  by_phase:
+    PHASE1:
+      total_cost: 450000000
+      source: default YAML assumption
+    Phase I:
+      total_cost: 450000000
+      source: default YAML assumption
+    PHASE2:
+      total_cost: 250000000
+      source: default YAML assumption
+    Phase II:
+      total_cost: 250000000
+      source: default YAML assumption
+    PHASE3:
+      total_cost: 125000000
+      source: default YAML assumption
+    Phase III:
+      total_cost: 125000000
+      source: default YAML assumption
+    default:
+      total_cost: 250000000
+      source: default YAML assumption

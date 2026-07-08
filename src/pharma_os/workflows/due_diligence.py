@@ -24,6 +24,7 @@ from pharma_os.tools.due_diligence import (
     resolve_asset_identity,
     search_patent_exclusivity,
 )
+from pharma_os.tools.rules import config_source
 from pharma_os.validators import (
     aggregate_validation_status,
     assign_human_gate,
@@ -83,6 +84,7 @@ def run_due_diligence_workflow(
         discount_rate=input_data.discount_rate,
         operating_margin=input_data.operating_margin,
         development_cost=input_data.development_cost,
+        phase=pos.current_phase or (trial.phases[0] if trial.phases else None),
     )
 
     user_source = SourceMetadata(
@@ -92,7 +94,8 @@ def run_due_diligence_workflow(
         source_type="human_input",
         version="local",
     )
-    sources = _dedupe_sources((*identity_sources, *patent_sources, pos_source, *pricing_sources, user_source))
+    config_sources = _config_sources_from_assumptions((*commercial_model.assumptions, *rnpv.assumptions))
+    sources = _dedupe_sources((*identity_sources, *patent_sources, pos_source, *pricing_sources, *config_sources, user_source))
     missing_data_flags = (
         *asset_identity.missing_data_flags,
         *patent_exclusivity.missing_data_flags,
@@ -103,7 +106,7 @@ def run_due_diligence_workflow(
     )
     assumptions = tuple(
         assumption.model_copy(update={"source_ids": (user_source.source_id,)})
-        if assumption.provenance.startswith("cli.") or "override" in assumption.provenance.casefold()
+        if not assumption.source_ids and (assumption.provenance.startswith("cli.") or "override" in assumption.provenance.casefold())
         else assumption
         for assumption in (*commercial_model.assumptions, *rnpv.assumptions)
     )
@@ -111,6 +114,8 @@ def run_due_diligence_workflow(
         update={
             "assumptions": tuple(
                 assumption.model_copy(update={"source_ids": (user_source.source_id,)})
+                if not assumption.source_ids
+                else assumption
                 for assumption in commercial_model.assumptions
             )
         }
@@ -119,7 +124,7 @@ def run_due_diligence_workflow(
         update={
             "assumptions": tuple(
                 assumption.model_copy(update={"source_ids": (user_source.source_id,)})
-                if assumption.provenance.startswith("cli.") or "override" in assumption.provenance.casefold()
+                if not assumption.source_ids and (assumption.provenance.startswith("cli.") or "override" in assumption.provenance.casefold())
                 else assumption
                 for assumption in rnpv.assumptions
             ),
@@ -343,3 +348,14 @@ def _confidence(flags: tuple[object, ...]) -> float:
     high = sum(1 for flag in flags if getattr(flag, "severity", None) == "high")
     medium = sum(1 for flag in flags if getattr(flag, "severity", None) == "medium")
     return max(0.1, 0.85 - high * 0.15 - medium * 0.05)
+
+
+def _config_sources_from_assumptions(assumptions: tuple[object, ...]) -> tuple[SourceMetadata, ...]:
+    sources = []
+    for assumption in assumptions:
+        for source_id in getattr(assumption, "source_ids", ()):
+            if source_id == "config:due_diligence:default_archetypes":
+                sources.append(config_source("default_archetypes.yaml", section="due_diligence"))
+            elif source_id == "config:due_diligence:rnpv_assumptions_config":
+                sources.append(config_source("rnpv_assumptions_config.yaml", section="due_diligence"))
+    return _dedupe_sources(tuple(sources))  # type: ignore[return-value]

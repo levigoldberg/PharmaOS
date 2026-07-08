@@ -1,0 +1,71 @@
+schema_version: "1.0"
+forecast_years: 6
+price_sensitivity_multipliers:
+  low: 0.8
+  high: 1.2
+case_construction_rules:
+  positive_revenue_drivers:
+    - starting_population
+    - diagnosed_fraction
+    - treated_fraction
+    - eligibility_fraction
+    - commercially_addressable_fraction
+    - peak_penetration
+    - annual_gross_wac
+  inverse_revenue_drivers:
+    - gross_to_net
+archetypes:
+  chronic_specialty_prevalence:
+    description: Chronic specialty drug market where prevalent patients define the commercial opportunity.
+    market_basis: prevalence_stock
+    peak_penetration:
+      low: 0.05
+      base: 0.12
+      high: 0.20
+    gross_to_net:
+      low: 0.12
+      base: 0.18
+      high: 0.25
+    launch_ramp:
+      - 0.05
+      - 0.15
+      - 0.30
+      - 0.50
+      - 0.75
+      - 1.00
+  incidence_flow_specialty:
+    description: Specialty drug market where annual incident patients define yearly opportunity.
+    market_basis: incidence_flow
+    peak_penetration:
+      low: 0.06
+      base: 0.14
+      high: 0.24
+    gross_to_net:
+      low: 0.12
+      base: 0.18
+      high: 0.25
+    launch_ramp:
+      - 0.05
+      - 0.18
+      - 0.35
+      - 0.55
+      - 0.78
+      - 1.00
+  procedure_flow:
+    description: Procedure-linked market where annual procedures or episodes define opportunity.
+    market_basis: procedure_flow
+    peak_penetration:
+      low: 0.08
+      base: 0.18
+      high: 0.30
+    gross_to_net:
+      low: 0.10
+      base: 0.16
+      high: 0.22
+    launch_ramp:
+      - 0.08
+      - 0.22
+      - 0.40
+      - 0.60
+      - 0.82
+      - 1.00

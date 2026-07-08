@@ -1,0 +1,14 @@
+approved_sources:
+  - id: california_hcai_wac_combined
+    name: California HCAI WAC increases combined workbook
+    source_type: california_excel
+    local_path: data/california_wac_data.xlsx
+    notes: Sole approved pricing source. Use sheet combined_wac_increases.
+forbidden_sources:
+  - GoodRx
+  - NADAC
+  - ASP
+  - AWP
+  - CMS Part D spend
+  - copay pages
+  - random pricing blogs

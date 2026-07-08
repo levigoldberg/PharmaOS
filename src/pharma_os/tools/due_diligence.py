@@ -27,7 +27,7 @@ from pharma_os.schemas import (
     SourceMetadata,
 )
 from pharma_os.tools.rxnorm import RxNormClient, RxNormError
-from pharma_os.tools.rules import human_override, load_rule_config
+from pharma_os.tools.rules import config_provenance, config_source, config_source_id, human_override, load_config, load_rule_config
 
 
 DEFAULT_POS_WORKBOOK = Path("data/Source_Based_PoS_Workbook.xlsx")
@@ -292,11 +292,14 @@ def lookup_pricing(
 ) -> tuple[PricingOutput, tuple[SourceMetadata, ...]]:
     """Match local WAC rows and openFDA dosing/label data."""
 
-    path = Path(wac_data_path or os.getenv("PHARMA_OS_WAC_DATA_PATH") or DEFAULT_WAC_DATA)
+    wac_config = load_config("wac_sources.yaml", section="due_diligence")
+    wac_config_source = config_source("wac_sources.yaml", section="due_diligence")
+    configured_path = _configured_wac_path(wac_config)
+    path = Path(wac_data_path or os.getenv("PHARMA_OS_WAC_DATA_PATH") or configured_path or DEFAULT_WAC_DATA)
     wac_source = SourceMetadata(
         source_id=f"wac:{_slug(path.name)}",
         title="Local WAC workbook",
-        provenance="Local WAC workbook combined_wac_increases lookup",
+        provenance=f"Local WAC workbook combined_wac_increases lookup approved by {config_provenance('wac_sources.yaml', 'approved_sources[0]', section='due_diligence')}",
         source_type="wac_workbook",
         version=path.name,
     )
@@ -365,7 +368,7 @@ def lookup_pricing(
     annual_wac = wac_value
     if wac_value is not None and dosing_summary is None:
         flags.append(_missing("pricing-dosing-review-required", "pricing", "annual_wac", "WAC was found but annualization lacks sourced dosing.", "high"))
-    sources = tuple(source for source in (wac_source if wac_value is not None else None, label_source if dosing_summary else None) if source)
+    sources = tuple(source for source in (wac_config_source, wac_source if wac_value is not None else None, label_source if dosing_summary else None) if source)
     return (
         PricingOutput(
             annual_wac=annual_wac if dosing_summary else None,
@@ -391,14 +394,51 @@ def build_commercial_model(
     """Run a compact deterministic commercial model when reviewed inputs exist."""
 
     flags: list[MissingDataFlag] = []
+    archetype_name = "chronic_specialty_prevalence"
+    config = load_config("default_archetypes.yaml", section="due_diligence")
+    config_id = config_source_id("default_archetypes.yaml", section="due_diligence")
+    archetype = (config.get("archetypes") or {}).get(archetype_name, {})
+    selected_peak_penetration = _select_assumption_value(
+        "commercial-peak-penetration",
+        "peak_penetration",
+        peak_penetration,
+        "fraction",
+        config_value=_triplet_base(archetype.get("peak_penetration")),
+        config_filename="default_archetypes.yaml",
+        config_field_path=f"archetypes.{archetype_name}.peak_penetration.base",
+    )
+    selected_gross_to_net = _select_assumption_value(
+        "commercial-gross-to-net",
+        "gross_to_net",
+        gross_to_net,
+        "fraction",
+        config_value=_triplet_base(archetype.get("gross_to_net")),
+        config_filename="default_archetypes.yaml",
+        config_field_path=f"archetypes.{archetype_name}.gross_to_net.base",
+    )
+    launch_ramp = [float(value) for value in archetype.get("launch_ramp") or [] if _float(value) is not None]
     assumptions = [
-        _assumption("commercial-annual-patients", "annual_patients", annual_patients, "patients", "cli.due_diligence"),
-        _assumption("commercial-peak-penetration", "peak_penetration", peak_penetration, "fraction", "cli.due_diligence"),
-        _assumption("commercial-gross-to-net", "gross_to_net", gross_to_net, "fraction", "cli.due_diligence"),
+        _assumption("commercial-annual-patients", "annual_patients", annual_patients, "patients", "cli.due_diligence", assumption_type="user_reviewed"),
+        selected_peak_penetration,
+        selected_gross_to_net,
     ]
+    if launch_ramp:
+        assumptions.append(
+            _assumption(
+                "commercial-launch-ramp",
+                "launch_ramp",
+                launch_ramp,
+                "fraction_by_year",
+                config_provenance("default_archetypes.yaml", f"archetypes.{archetype_name}.launch_ramp", section="due_diligence"),
+                assumption_type="config_default",
+                source_ids=(config_id,),
+            )
+        )
+    else:
+        flags.append(_missing("commercial-launch-ramp-missing", "commercial_model", "launch_ramp", "No launch ramp was available from default_archetypes.yaml.", "high"))
     for assumption in assumptions:
         if assumption.value is None:
-            flags.append(_missing(f"{assumption.assumption_id}-missing", "commercial_model", assumption.name, "Reviewed commercial assumption is required.", "high"))
+            flags.append(_missing(f"{assumption.assumption_id}-missing", "commercial_model", assumption.name, "No source-backed, user-reviewed, or config fallback value is available.", "high"))
     if pricing.annual_wac is None:
         flags.append(_missing("commercial-annual-wac-missing", "commercial_model", "annual_wac", "Annual WAC must come from pricing evidence.", "high"))
     calculable = not flags
@@ -406,21 +446,21 @@ def build_commercial_model(
     net_price = None
     peak_sales = None
     if calculable:
-        net_price = float(pricing.annual_wac) * (1 - float(gross_to_net))
-        for year, ramp in enumerate((0.1, 0.25, 0.45, 0.7, 1.0), start=1):
-            treated = float(annual_patients) * float(peak_penetration) * ramp
+        net_price = float(pricing.annual_wac) * (1 - float(selected_gross_to_net.value))
+        for year, ramp in enumerate(launch_ramp, start=1):
+            treated = float(annual_patients) * float(selected_peak_penetration.value) * ramp
             rows.append(RevenueForecastYear(year=year, treated_patients=round(treated, 2), net_price=round(net_price, 2), net_revenue=round(treated * net_price, 2)))
         peak_sales = rows[-1].net_revenue
     return CommercialModelOutput(
         calculable=calculable,
         annual_patients=annual_patients,
-        peak_penetration=peak_penetration,
-        gross_to_net=gross_to_net,
+        peak_penetration=float(selected_peak_penetration.value) if selected_peak_penetration.value is not None else None,
+        gross_to_net=float(selected_gross_to_net.value) if selected_gross_to_net.value is not None else None,
         net_price=net_price,
         peak_net_sales=peak_sales,
         revenue_forecast=tuple(rows),
         assumptions=tuple(assumptions),
-        source_ids=pricing.source_ids,
+        source_ids=tuple(dict.fromkeys([*pricing.source_ids, *([config_id] if any(item.source_ids and config_id in item.source_ids for item in assumptions) else [])])),
         missing_data_flags=tuple(flags),
         confidence=0.75 if calculable else 0.15,
     )
@@ -436,16 +476,84 @@ def build_rnpv(
     discount_rate: float | None,
     operating_margin: float | None,
     development_cost: float | None,
+    phase: str | None = None,
 ) -> RNPVOutput:
     """Calculate rNPV when all upstream sourced/reviewed inputs exist."""
 
     flags: list[MissingDataFlag] = []
+    config = load_config("rnpv_assumptions_config.yaml", section="due_diligence")
+    config_id = config_source_id("rnpv_assumptions_config.yaml", section="due_diligence")
+    selected_launch_year = _select_assumption_value(
+        "rnpv-launch-year",
+        "launch_year",
+        launch_year,
+        "year",
+        config_value=_launch_year_from_config(config, phase),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path=f"launch_timing.default_years_to_launch_by_phase.{phase or 'default'}",
+    )
+    selected_discount_rate = _select_assumption_value(
+        "rnpv-discount-rate",
+        "discount_rate",
+        discount_rate,
+        "fraction",
+        config_value=_float(config.get("discount_rate")),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path="discount_rate",
+    )
+    selected_operating_margin = _select_assumption_value(
+        "rnpv-operating-margin",
+        "operating_margin",
+        operating_margin,
+        "fraction",
+        config_value=_float(config.get("operating_margin")),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path="operating_margin",
+    )
+    selected_development_cost = _select_assumption_value(
+        "rnpv-development-cost",
+        "development_cost",
+        development_cost,
+        "USD",
+        config_value=_development_cost_from_config(config, phase),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path=f"development_costs.by_phase.{phase or 'default'}.total_cost",
+    )
+    selected_tax_rate = _select_assumption_value(
+        "rnpv-tax-rate",
+        "tax_rate",
+        None,
+        "fraction",
+        config_value=_float(config.get("tax_rate")),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path="tax_rate",
+    )
+    selected_valuation_year = _select_assumption_value(
+        "rnpv-valuation-year",
+        "valuation_year",
+        None,
+        "year",
+        config_value=_float(config.get("valuation_year")),
+        config_filename="rnpv_assumptions_config.yaml",
+        config_field_path="valuation_year",
+    )
+    selected_loe_year = loe_year or patent.estimated_loe_year
     assumptions = [
-        _assumption("rnpv-launch-year", "launch_year", launch_year, "year", "cli.due_diligence"),
-        _assumption("rnpv-loe-year", "loe_year", loe_year or patent.estimated_loe_year, "year", "Lens/regulatory source or human override"),
-        _assumption("rnpv-discount-rate", "discount_rate", discount_rate, "fraction", "cli.due_diligence"),
-        _assumption("rnpv-operating-margin", "operating_margin", operating_margin, "fraction", "cli.due_diligence"),
-        _assumption("rnpv-development-cost", "development_cost", development_cost, "USD", "cli.due_diligence"),
+        selected_launch_year,
+        _assumption(
+            "rnpv-loe-year",
+            "loe_year",
+            selected_loe_year,
+            "year",
+            "cli.due_diligence" if loe_year is not None else "Lens/regulatory source",
+            assumption_type="user_reviewed" if loe_year is not None else "source_derived",
+            source_ids=() if loe_year is not None else patent.source_ids,
+        ),
+        selected_discount_rate,
+        selected_operating_margin,
+        selected_development_cost,
+        selected_tax_rate,
+        selected_valuation_year,
     ]
     for assumption in assumptions:
         if assumption.value is None:
@@ -454,34 +562,33 @@ def build_rnpv(
         flags.append(_missing("rnpv-commercial-not-calculable", "rnpv", "commercial_model", "Commercial model is not calculable.", "high"))
     if pos.probability_of_success is None:
         flags.append(_missing("rnpv-pos-missing", "rnpv", "probability_of_success", "PoS must come from workbook.", "high"))
-    selected_loe_year = loe_year or patent.estimated_loe_year
     if selected_loe_year is None:
         flags.append(_missing("rnpv-loe-missing", "rnpv", "loe_year", "LOE must cite Lens/regulatory source or human review.", "high"))
-    if launch_year and selected_loe_year and selected_loe_year < launch_year:
+    if selected_launch_year.value and selected_loe_year and selected_loe_year < int(float(selected_launch_year.value)):
         flags.append(_missing("rnpv-loe-before-launch", "rnpv", "loe_year", "LOE year is before launch year.", "critical"))
     calculable = not flags
     value = None
     if calculable:
-        value = -float(development_cost)
+        value = -float(selected_development_cost.value)
         for row in commercial.revenue_forecast:
-            calendar_year = int(launch_year) + row.year - 1
+            calendar_year = int(float(selected_launch_year.value)) + row.year - 1
             if calendar_year > int(selected_loe_year):
                 continue
-            years = max(0, calendar_year - datetime.now(timezone.utc).year)
-            cash_flow = row.net_revenue * float(operating_margin) * float(pos.probability_of_success)
-            value += cash_flow / ((1 + float(discount_rate)) ** years)
+            years = max(0, calendar_year - int(float(selected_valuation_year.value)))
+            cash_flow = row.net_revenue * float(selected_operating_margin.value) * (1 - float(selected_tax_rate.value)) * float(pos.probability_of_success)
+            value += cash_flow / ((1 + float(selected_discount_rate.value)) ** years)
         value = round(value, 2)
     return RNPVOutput(
         calculable=calculable,
         rnpv=value,
         probability_of_success=pos.probability_of_success,
         loe_year=selected_loe_year,
-        launch_year=launch_year,
-        discount_rate=discount_rate,
-        operating_margin=operating_margin,
-        development_cost=development_cost,
+        launch_year=int(float(selected_launch_year.value)) if selected_launch_year.value is not None else None,
+        discount_rate=float(selected_discount_rate.value) if selected_discount_rate.value is not None else None,
+        operating_margin=float(selected_operating_margin.value) if selected_operating_margin.value is not None else None,
+        development_cost=float(selected_development_cost.value) if selected_development_cost.value is not None else None,
         assumptions=tuple(assumptions),
-        source_ids=tuple(dict.fromkeys([*commercial.source_ids, *pos.source_ids, *patent.source_ids])),
+        source_ids=tuple(dict.fromkeys([*commercial.source_ids, *pos.source_ids, *patent.source_ids, *([config_id] if any(config_id in item.source_ids for item in assumptions) else [])])),
         missing_data_flags=tuple(flags),
         confidence=0.75 if calculable else 0.1,
     )
@@ -519,6 +626,16 @@ def _pricing_terms(asset: AssetIdentityOutput) -> tuple[str, ...]:
     return tuple(dict.fromkeys(term for term in terms if term))
 
 
+def _configured_wac_path(config: dict[str, Any]) -> str | None:
+    sources = config.get("approved_sources")
+    if not isinstance(sources, list):
+        return None
+    for source in sources:
+        if isinstance(source, dict) and source.get("local_path"):
+            return str(source["local_path"])
+    return None
+
+
 def _disease_area_for_workbook(therapeutic_area: str | None, conditions: tuple[str, ...]) -> str | None:
     text = " ".join([therapeutic_area or "", *conditions]).casefold()
     if "oncology" in text or "cancer" in text or "tumor" in text or "glioblastoma" in text:
@@ -545,8 +662,88 @@ def _missing(flag_id: str, section: str, field: str, reason: str, severity: str)
     return MissingDataFlag(flag_id=flag_id, section=section, field=field, reason=reason, severity=severity)  # type: ignore[arg-type]
 
 
-def _assumption(assumption_id: str, name: str, value: Any, unit: str, provenance: str) -> AssumptionRecord:
-    return AssumptionRecord(assumption_id=assumption_id, name=name, value=value, unit=unit, provenance=provenance, requires_human_review=value is None)
+def _select_assumption_value(
+    assumption_id: str,
+    name: str,
+    user_value: Any,
+    unit: str,
+    *,
+    config_value: Any,
+    config_filename: str,
+    config_field_path: str,
+) -> AssumptionRecord:
+    if user_value is not None:
+        return _assumption(
+            assumption_id,
+            name,
+            user_value,
+            unit,
+            "cli.due_diligence",
+            assumption_type="user_reviewed",
+        )
+    if config_value is not None:
+        return _assumption(
+            assumption_id,
+            name,
+            config_value,
+            unit,
+            config_provenance(config_filename, config_field_path, section="due_diligence"),
+            assumption_type="fallback_assumption",
+            source_ids=(config_source_id(config_filename, section="due_diligence"),),
+        )
+    return _assumption(
+        assumption_id,
+        name,
+        None,
+        unit,
+        f"missing:{config_filename}:{config_field_path}",
+        assumption_type="missing",
+        requires_human_review=True,
+    )
+
+
+def _assumption(
+    assumption_id: str,
+    name: str,
+    value: Any,
+    unit: str,
+    provenance: str,
+    *,
+    assumption_type: str,
+    source_ids: tuple[str, ...] = (),
+    requires_human_review: bool | None = None,
+) -> AssumptionRecord:
+    return AssumptionRecord(
+        assumption_id=assumption_id,
+        name=name,
+        value=value,
+        unit=unit,
+        assumption_type=assumption_type,  # type: ignore[arg-type]
+        source_ids=source_ids,
+        provenance=provenance,
+        requires_human_review=value is None if requires_human_review is None else requires_human_review,
+    )
+
+
+def _triplet_base(value: Any) -> float | None:
+    return _float(value.get("base")) if isinstance(value, dict) else None
+
+
+def _launch_year_from_config(config: dict[str, Any], phase: str | None) -> int | None:
+    valuation_year = _float(config.get("valuation_year"))
+    timing = ((config.get("launch_timing") or {}).get("default_years_to_launch_by_phase") or {})
+    years = _float(timing.get(phase or "") or timing.get("default"))
+    if valuation_year is None or years is None:
+        return None
+    return int(valuation_year + years)
+
+
+def _development_cost_from_config(config: dict[str, Any], phase: str | None) -> float | None:
+    by_phase = ((config.get("development_costs") or {}).get("by_phase") or {})
+    selected = by_phase.get(phase or "") or by_phase.get("default")
+    if not isinstance(selected, dict):
+        return None
+    return _float(selected.get("total_cost"))
 
 
 def _lens_records(payload: Any) -> list[dict[str, Any]]:

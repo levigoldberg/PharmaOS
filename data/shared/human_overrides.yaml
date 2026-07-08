@@ -1,0 +1,10 @@
+# Add reviewed corrections by NCT ID. Example:
+# NCT00000000:
+#   asset_name: Example Drug
+#   aliases: [EX-001]
+#   sponsor: Example Bio, Inc.
+#   modality: small molecule
+#   indication: example disease
+#   therapeutic_area: neurology
+{}
+

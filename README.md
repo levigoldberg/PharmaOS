@@ -23,6 +23,13 @@ Optional for due diligence:
 - `PHARMA_OS_POS_WORKBOOK_PATH`, defaults to `data/Source_Based_PoS_Workbook.xlsx`
 - `PHARMA_OS_WAC_DATA_PATH`, defaults to `data/california_wac_data.xlsx`
 
+Config layout:
+
+- Shared identity rules live in `src/pharma_os/data/shared/`.
+- Due-diligence assumptions and source registries live in `src/pharma_os/data/due_diligence/`.
+- Due diligence applies values in this order: source-backed or calculated values, user-reviewed CLI input, config fallback, then a missing-data flag plus human gate.
+- Config fallback values are persisted as `AssumptionRecord` objects with config source IDs and filename/field-path provenance.
+
 ## Example Commands
 
 Clinical trial intelligence:
