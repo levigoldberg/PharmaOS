@@ -14,7 +14,7 @@ def test_run_command_outputs_completed_workflow(capsys):
 
     assert exit_code == 0
     output = json.loads(capsys.readouterr().out)
-    assert output["workflow"] == "demo-workflow"
+    assert output["workflow_name"] == "demo-workflow"
     assert output["status"] == "completed"
     assert output["run_id"]
 
@@ -28,3 +28,4 @@ def test_report_command_outputs_report(capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["run_id"] == "RUN123"
     assert output["title"] == "PharmaOS report for RUN123"
+    assert output["validation_status"] == "warning"

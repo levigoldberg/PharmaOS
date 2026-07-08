@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from pharma_os.schemas import Report
+from pharma_os.schemas import FinalReport
 
 
-def build_report(run_id: str) -> Report:
+def build_report(run_id: str) -> FinalReport:
     """Build a minimal report for a run id."""
 
-    return Report(
+    return FinalReport(
+        report_id=f"report-{run_id}",
         run_id=run_id,
         title=f"PharmaOS report for {run_id}",
-        content="No persisted workflow details are available yet.",
+        summary="No persisted workflow details are available yet.",
+        confidence=0.0,
+        validation_status="warning",
+        provenance="cli.report.placeholder",
     )
