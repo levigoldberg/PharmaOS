@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.report import build_report
-from pharma_os.schemas import ClinicalTrialIntelligenceInput
+from pharma_os.schemas import ClinicalTrialIntelligenceInput, DueDiligenceInput
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,6 +31,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--target", help="Optional target for trial_intelligence")
     run_parser.add_argument("--phase", help="Optional phase for trial_intelligence")
     run_parser.add_argument("--limit", type=int, default=10, help="Maximum records to retrieve")
+    run_parser.add_argument("--nct-id", help="NCT ID for due_diligence")
+    run_parser.add_argument("--pos-workbook-path", help="Optional PoS workbook path for due_diligence")
+    run_parser.add_argument("--wac-data-path", help="Optional WAC workbook path for due_diligence")
+    run_parser.add_argument("--annual-patients", type=float, help="Reviewed annual eligible patient assumption")
+    run_parser.add_argument("--peak-penetration", type=float, help="Reviewed peak penetration assumption")
+    run_parser.add_argument("--gross-to-net", type=float, help="Reviewed gross-to-net assumption")
+    run_parser.add_argument("--operating-margin", type=float, help="Reviewed operating margin assumption")
+    run_parser.add_argument("--discount-rate", type=float, help="Reviewed discount rate assumption")
+    run_parser.add_argument("--development-cost", type=float, help="Reviewed remaining development cost assumption")
+    run_parser.add_argument("--launch-year", type=int, help="Reviewed expected launch year")
+    run_parser.add_argument("--loe-year", type=int, help="Reviewed expected loss-of-exclusivity year")
 
     report_parser = subparsers.add_parser("report", help="Generate a run report")
     report_parser.add_argument("--run-id", required=True, help="Workflow run id")
@@ -62,28 +73,50 @@ def main(argv: list[str] | None = None) -> int:
             _write_output(args.output_json, payload)
             print(payload)
             return 0
-    except (OSError, ValueError, ValidationError) as exc:
+    except (OSError, RuntimeError, ValueError, ValidationError) as exc:
         print(f"error: {exc}")
         return 2
     return 1
 
 
-def _workflow_input(args: argparse.Namespace) -> ClinicalTrialIntelligenceInput | None:
-    if args.workflow != "trial_intelligence":
-        return None
-    if args.input_json:
-        return ClinicalTrialIntelligenceInput.model_validate_json(
-            Path(args.input_json).read_text(encoding="utf-8")
+def _workflow_input(args: argparse.Namespace) -> ClinicalTrialIntelligenceInput | DueDiligenceInput | None:
+    if args.workflow == "trial_intelligence":
+        if args.input_json:
+            return ClinicalTrialIntelligenceInput.model_validate_json(
+                Path(args.input_json).read_text(encoding="utf-8")
+            )
+        if not args.disease:
+            raise ValueError("trial_intelligence requires --disease unless --input-json is supplied")
+        return ClinicalTrialIntelligenceInput(
+            disease=args.disease,
+            drug=args.drug,
+            target=args.target,
+            phase=args.phase,
+            limit=args.limit,
         )
-    if not args.disease:
-        raise ValueError("trial_intelligence requires --disease unless --input-json is supplied")
-    return ClinicalTrialIntelligenceInput(
-        disease=args.disease,
-        drug=args.drug,
-        target=args.target,
-        phase=args.phase,
-        limit=args.limit,
-    )
+    if args.workflow == "due_diligence":
+        if args.input_json:
+            return DueDiligenceInput.model_validate_json(
+                Path(args.input_json).read_text(encoding="utf-8")
+            )
+        if not args.nct_id:
+            raise ValueError("due_diligence requires --nct-id unless --input-json is supplied")
+        return DueDiligenceInput(
+            nct_id=args.nct_id,
+            pos_workbook_path=args.pos_workbook_path,
+            wac_data_path=args.wac_data_path,
+            annual_patients=args.annual_patients,
+            peak_penetration=args.peak_penetration,
+            gross_to_net=args.gross_to_net,
+            operating_margin=args.operating_margin,
+            discount_rate=args.discount_rate,
+            development_cost=args.development_cost,
+            launch_year=args.launch_year,
+            loe_year=args.loe_year,
+        )
+    if args.input_json:
+        raise ValueError(f"{args.workflow} does not define an input schema")
+    return None
 
 
 def _write_output(path: str | None, payload: str) -> None:

@@ -1,0 +1,20 @@
+default: unknown
+rules:
+  - id: modality_cell_therapy
+    modality: cell therapy
+    keywords: [cell therapy, CAR-T, CART, TCR-T]
+  - id: modality_gene_therapy
+    modality: gene therapy
+    keywords: [gene therapy, AAV, adeno-associated]
+  - id: modality_oligonucleotide
+    modality: oligonucleotide
+    keywords: [oligonucleotide, siRNA, ASO, antisense]
+  - id: modality_antibody
+    modality: antibody
+    keywords: [antibody, monoclonal, mAb, bispecific]
+  - id: modality_vaccine
+    modality: vaccine
+    keywords: [vaccine]
+  - id: modality_small_molecule
+    modality: small molecule
+    keywords: [inhibitor, agonist, antagonist, modulator, capsule, tablet, oral]

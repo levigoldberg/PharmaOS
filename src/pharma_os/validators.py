@@ -227,7 +227,7 @@ def generate_confidence_flags(
         )
     for index, risk in enumerate(risk_flags, start=1):
         severity = getattr(risk, "severity", "medium")
-        description = getattr(risk, "description", str(risk))
+        description = getattr(risk, "description", None) or getattr(risk, "reason", str(risk))
         source_ids = tuple(getattr(risk, "source_ids", ()))
         flags.append(
             ConfidenceFlag(

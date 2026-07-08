@@ -234,6 +234,188 @@ class ClinicalTrialIntelligenceOutput(StrictSchema):
     trace_metadata: dict[str, MetadataValue] = Field(default_factory=dict)
 
 
+class DueDiligenceInput(StrictSchema):
+    """Input contract for the PharmaOS-native due diligence workflow."""
+
+    nct_id: str = Field(..., pattern=r"^NCT\d{8}$", description="ClinicalTrials.gov NCT identifier.")
+    pos_workbook_path: str | None = Field(default=None, description="Optional PoS workbook path.")
+    wac_data_path: str | None = Field(default=None, description="Optional local WAC workbook path.")
+    annual_patients: float | None = Field(default=None, ge=0, description="Reviewed annual eligible patient assumption.")
+    peak_penetration: float | None = Field(default=None, ge=0, le=1, description="Reviewed peak penetration assumption.")
+    gross_to_net: float | None = Field(default=None, ge=0, le=1, description="Reviewed gross-to-net assumption.")
+    operating_margin: float | None = Field(default=None, ge=0, le=1, description="Reviewed operating margin assumption.")
+    discount_rate: float | None = Field(default=None, ge=0, le=1, description="Reviewed discount rate assumption.")
+    development_cost: float | None = Field(default=None, ge=0, description="Reviewed remaining development cost assumption.")
+    launch_year: int | None = Field(default=None, ge=2020, le=2100, description="Reviewed expected launch year.")
+    loe_year: int | None = Field(default=None, ge=2020, le=2150, description="Reviewed expected loss-of-exclusivity year.")
+
+
+class AssumptionRecord(StrictSchema):
+    """A numeric or categorical assumption used by a deterministic calculator."""
+
+    assumption_id: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    value: str | float | int | bool | None = None
+    unit: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    provenance: str = Field(..., min_length=1)
+    requires_human_review: bool = False
+
+
+class MissingDataFlag(StrictSchema):
+    """Missing or unavailable data needed for diligence confidence."""
+
+    flag_id: str = Field(..., min_length=1)
+    section: str = Field(..., min_length=1)
+    field: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+
+
+class RxNormMatch(StrictSchema):
+    """Best-effort RxNorm normalized drug identity."""
+
+    matched_name: str
+    rxcui: str
+    aliases: tuple[str, ...] = Field(default_factory=tuple)
+    source_id: str = Field(..., min_length=1)
+
+
+class AssetIdentityOutput(StrictSchema):
+    """Resolved trial asset, sponsor, modality, and indication identity."""
+
+    nct_id: str
+    asset_name: str | None = None
+    raw_intervention_names: tuple[str, ...] = Field(default_factory=tuple)
+    intervention_type: str | None = None
+    aliases: tuple[str, ...] = Field(default_factory=tuple)
+    rxnorm_match: RxNormMatch | None = None
+    sponsor: str | None = None
+    normalized_indication: str | None = None
+    therapeutic_area: str | None = None
+    modality: str | None = None
+    rule_ids: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class PatentCandidate(StrictSchema):
+    """Normalized patent search candidate from Lens."""
+
+    candidate_id: str = Field(..., min_length=1)
+    title: str | None = None
+    jurisdiction: str | None = None
+    publication_date: str | None = None
+    legal_status: str | None = None
+    source_id: str = Field(..., min_length=1)
+
+
+class PatentExclusivityOutput(StrictSchema):
+    """Patent and loss-of-exclusivity section."""
+
+    asset_name: str | None = None
+    searched_terms: tuple[str, ...] = Field(default_factory=tuple)
+    candidates: tuple[PatentCandidate, ...] = Field(default_factory=tuple)
+    estimated_loe_year: int | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class PoSOutput(StrictSchema):
+    """Source-backed probability of success section."""
+
+    probability_of_success: float | None = Field(default=None, ge=0, le=1)
+    current_phase: str | None = None
+    disease_area: str | None = None
+    workbook_path: str | None = None
+    lookup_key: str | None = None
+    benchmark_row: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class PricingOutput(StrictSchema):
+    """Pricing benchmark from local WAC data and openFDA label/dosing evidence."""
+
+    annual_wac: float | None = Field(default=None, ge=0)
+    wac_value: float | None = Field(default=None, ge=0)
+    wac_unit_basis: str | None = None
+    matched_product: str | None = None
+    dosing_summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class RevenueForecastYear(StrictSchema):
+    """One deterministic commercial model revenue row."""
+
+    year: int
+    treated_patients: float
+    net_price: float
+    net_revenue: float
+
+
+class CommercialModelOutput(StrictSchema):
+    """Deterministic commercial model section."""
+
+    calculable: bool
+    annual_patients: float | None = None
+    peak_penetration: float | None = None
+    gross_to_net: float | None = None
+    net_price: float | None = None
+    peak_net_sales: float | None = None
+    revenue_forecast: tuple[RevenueForecastYear, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class RNPVOutput(StrictSchema):
+    """Deterministic risk-adjusted NPV section."""
+
+    calculable: bool
+    rnpv: float | None = None
+    probability_of_success: float | None = Field(default=None, ge=0, le=1)
+    loe_year: int | None = None
+    launch_year: int | None = None
+    discount_rate: float | None = Field(default=None, ge=0, le=1)
+    operating_margin: float | None = Field(default=None, ge=0, le=1)
+    development_cost: float | None = Field(default=None, ge=0)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class DueDiligenceOutput(StrictSchema):
+    """Structured PharmaOS due-diligence workflow output."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    input: DueDiligenceInput
+    trial: ClinicalTrialRecord
+    asset_identity: AssetIdentityOutput
+    patent_exclusivity: PatentExclusivityOutput
+    pos: PoSOutput
+    pricing: PricingOutput
+    commercial_model: CommercialModelOutput
+    rnpv: RNPVOutput
+    sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
+    claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
+    confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
+    human_gate: HumanGate | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    validation_status: ValidationStatus = "not_run"
+
+
 class AgentOutput(StrictSchema):
     """Common output contract for agents before workflow-specific schemas."""
 

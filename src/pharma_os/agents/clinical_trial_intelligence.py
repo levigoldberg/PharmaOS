@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from pharma_os.agents.runtime import load_agents_sdk, run_agent
@@ -52,6 +53,7 @@ def build_clinical_trial_intelligence_agent() -> Any:
 
     return Agent(
         name=AGENT_NAME,
+        model=os.getenv("PHARMA_OS_MODEL", "gpt-5.5"),
         output_type=AgentOutputSchema(
             ClinicalTrialIntelligenceOutput,
             strict_json_schema=False,

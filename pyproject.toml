@@ -10,9 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.27.0",
+  "openpyxl>=3.1.0",
   "openai-agents>=0.18.0",
   "pydantic>=2.0.0,<3.0.0",
   "python-dotenv>=1.0.0",
+  "PyYAML>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -26,3 +28,9 @@ pharma-os = "pharma_os.cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pharma_os"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/pharma_os/data" = "pharma_os/data"

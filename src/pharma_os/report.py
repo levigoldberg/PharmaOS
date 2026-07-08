@@ -25,6 +25,8 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
 
     validation_status = aggregate_validation_status(bundle.validation_results)
     latest_gate = bundle.human_gates[-1] if bundle.human_gates else None
+    if latest_gate is not None and validation_status == "passed":
+        validation_status = "needs_human_review"
     summary = _summary(bundle)
     confidence = _confidence(validation_status, bool(latest_gate), len(bundle.confidence_flags))
     report = FinalReport(
