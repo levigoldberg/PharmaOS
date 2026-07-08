@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from pydantic import ValidationError
+from dotenv import load_dotenv
 
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the PharmaOS CLI."""
 
+    load_dotenv(dotenv_path=Path(".env"))
     args = build_parser().parse_args(argv)
     try:
         if args.command == "run":

@@ -17,7 +17,7 @@ ConfidenceLevel = Literal["very_low", "low", "medium", "high", "very_high"]
 ValidationStatus = Literal["not_run", "passed", "failed", "warning", "needs_human_review"]
 GateDecision = Literal["approved", "rejected", "needs_human_review", "blocked"]
 WorkflowStatus = Literal["pending", "running", "completed", "failed", "blocked"]
-MetadataValue = str | int | float | bool | None
+MetadataValue = str | int | float | bool | None | list[str] | list[int] | list[float] | list[bool]
 
 
 class StrictSchema(BaseModel):
