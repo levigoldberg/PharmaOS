@@ -16,6 +16,7 @@ from pharma_os.schemas import (
     SourceMetadata,
     TrialEndpoint,
     TrialIntervention,
+    TrialLocation,
     TrialSponsor,
 )
 
@@ -132,6 +133,7 @@ def _normalize_study(payload: dict[str, Any]) -> ClinicalTrialRecord:
     arms_module = protocol.get("armsInterventionsModule") or {}
     outcomes_module = protocol.get("outcomesModule") or {}
     eligibility_module = protocol.get("eligibilityModule") or {}
+    contacts_locations_module = protocol.get("contactsLocationsModule") or {}
     nct_id = identification.get("nctId")
     if not isinstance(nct_id, str):
         raise ClinicalTrialsGovError("ClinicalTrials.gov response is missing nctId")
@@ -164,6 +166,7 @@ def _normalize_study(payload: dict[str, Any]) -> ClinicalTrialRecord:
         secondary_endpoints=tuple(
             _endpoint(item, "secondary") for item in outcomes_module.get("secondaryOutcomes") or ()
         ),
+        locations=tuple(_location(item) for item in contacts_locations_module.get("locations") or ()),
         eligibility_criteria=eligibility_module.get("eligibilityCriteria"),
         minimum_age=eligibility_module.get("minimumAge"),
         maximum_age=eligibility_module.get("maximumAge"),
@@ -210,6 +213,16 @@ def _endpoint(item: dict[str, Any], endpoint_type: str) -> TrialEndpoint:
         time_frame=item.get("timeFrame"),
         description=item.get("description"),
         endpoint_type=endpoint_type,  # type: ignore[arg-type]
+    )
+
+
+def _location(item: dict[str, Any]) -> TrialLocation:
+    return TrialLocation(
+        facility=item.get("facility"),
+        city=item.get("city"),
+        state=item.get("state"),
+        country=item.get("country"),
+        status=item.get("status"),
     )
 
 

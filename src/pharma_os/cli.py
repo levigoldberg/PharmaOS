@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.report import build_report
-from pharma_os.schemas import ClinicalTrialIntelligenceInput, DueDiligenceInput
+from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,8 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--target", help="Optional target for trial_intelligence")
     run_parser.add_argument("--phase", help="Optional phase for trial_intelligence")
     run_parser.add_argument("--limit", type=int, default=10, help="Maximum records to retrieve")
-    run_parser.add_argument("--nct-id", help="NCT ID for due_diligence")
-    run_parser.add_argument("--pos-workbook-path", help="Optional PoS workbook path for due_diligence")
+    run_parser.add_argument("--nct-id", help="NCT ID for due_diligence or clinical_outcome_prediction")
+    run_parser.add_argument("--pos-workbook-path", help="Optional PoS workbook path")
     run_parser.add_argument("--wac-data-path", help="Optional WAC workbook path for due_diligence")
     run_parser.add_argument("--annual-patients", type=float, help="Reviewed annual eligible patient assumption")
     run_parser.add_argument("--peak-penetration", type=float, help="Reviewed peak penetration assumption")
@@ -79,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def _workflow_input(args: argparse.Namespace) -> ClinicalTrialIntelligenceInput | DueDiligenceInput | None:
+def _workflow_input(
+    args: argparse.Namespace,
+) -> ClinicalTrialIntelligenceInput | DueDiligenceInput | ClinicalOutcomePredictionInput | None:
     if args.workflow == "trial_intelligence":
         if args.input_json:
             return ClinicalTrialIntelligenceInput.model_validate_json(
@@ -113,6 +115,17 @@ def _workflow_input(args: argparse.Namespace) -> ClinicalTrialIntelligenceInput 
             development_cost=args.development_cost,
             launch_year=args.launch_year,
             loe_year=args.loe_year,
+        )
+    if args.workflow == "clinical_outcome_prediction":
+        if args.input_json:
+            return ClinicalOutcomePredictionInput.model_validate_json(
+                Path(args.input_json).read_text(encoding="utf-8")
+            )
+        if not args.nct_id:
+            raise ValueError("clinical_outcome_prediction requires --nct-id unless --input-json is supplied")
+        return ClinicalOutcomePredictionInput(
+            nct_id=args.nct_id,
+            pos_workbook_path=args.pos_workbook_path,
         )
     if args.input_json:
         raise ValueError(f"{args.workflow} does not define an input schema")

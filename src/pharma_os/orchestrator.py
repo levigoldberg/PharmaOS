@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from pharma_os.memory import MemoryStore
-from pharma_os.schemas import ClinicalTrialIntelligenceInput, DueDiligenceInput, WorkflowRun
+from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, WorkflowRun
 from pharma_os.validators import validate_workflow_name
+from pharma_os.workflows.clinical_outcome_prediction import run_clinical_outcome_prediction_workflow
 from pharma_os.workflows.due_diligence import run_due_diligence_workflow
 from pharma_os.workflows.trial_intelligence import run_trial_intelligence_workflow
 
@@ -21,7 +22,7 @@ class Orchestrator:
     def run(
         self,
         workflow: str,
-        input_data: ClinicalTrialIntelligenceInput | DueDiligenceInput | None = None,
+        input_data: ClinicalTrialIntelligenceInput | DueDiligenceInput | ClinicalOutcomePredictionInput | None = None,
     ) -> object:
         """Run a workflow by name."""
 
@@ -38,6 +39,12 @@ class Orchestrator:
             if not isinstance(input_data, DueDiligenceInput):
                 raise ValueError("due_diligence requires DueDiligenceInput")
             return run_due_diligence_workflow(input_data, memory=self.memory)
+        if workflow_name == "clinical_outcome_prediction":
+            if input_data is None:
+                raise ValueError("clinical_outcome_prediction requires ClinicalOutcomePredictionInput")
+            if not isinstance(input_data, ClinicalOutcomePredictionInput):
+                raise ValueError("clinical_outcome_prediction requires ClinicalOutcomePredictionInput")
+            return run_clinical_outcome_prediction_workflow(input_data, memory=self.memory)
         return self._placeholder_run(workflow_name)
 
     def _placeholder_run(self, workflow_name: str) -> WorkflowRun:

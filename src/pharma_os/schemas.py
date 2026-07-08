@@ -152,6 +152,16 @@ class TrialEndpoint(StrictSchema):
     endpoint_type: Literal["primary", "secondary", "other"] = "other"
 
 
+class TrialLocation(StrictSchema):
+    """Normalized trial site or geography from ClinicalTrials.gov."""
+
+    facility: str | None = None
+    city: str | None = None
+    state: str | None = None
+    country: str | None = None
+    status: str | None = None
+
+
 class ClinicalTrialRecord(StrictSchema):
     """A normalized ClinicalTrials.gov study record."""
 
@@ -173,6 +183,7 @@ class ClinicalTrialRecord(StrictSchema):
     results_available: bool = False
     primary_endpoints: tuple[TrialEndpoint, ...] = Field(default_factory=tuple)
     secondary_endpoints: tuple[TrialEndpoint, ...] = Field(default_factory=tuple)
+    locations: tuple[TrialLocation, ...] = Field(default_factory=tuple)
     eligibility_criteria: str | None = None
     minimum_age: str | None = None
     maximum_age: str | None = None
@@ -248,6 +259,13 @@ class DueDiligenceInput(StrictSchema):
     development_cost: float | None = Field(default=None, ge=0, description="Reviewed remaining development cost assumption.")
     launch_year: int | None = Field(default=None, ge=2020, le=2100, description="Reviewed expected launch year.")
     loe_year: int | None = Field(default=None, ge=2020, le=2150, description="Reviewed expected loss-of-exclusivity year.")
+
+
+class ClinicalOutcomePredictionInput(StrictSchema):
+    """Input contract for the Clinical Outcome Prediction Agent 3 workflow."""
+
+    nct_id: str = Field(..., pattern=r"^NCT\d{8}$", description="ClinicalTrials.gov NCT identifier.")
+    pos_workbook_path: str | None = Field(default=None, description="Optional local PoS workbook path.")
 
 
 class AssumptionRecord(StrictSchema):
@@ -343,6 +361,183 @@ class PoSOutput(StrictSchema):
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class SourceAvailabilityFlag(StrictSchema):
+    """Typed availability status for desired public, local, or unavailable sources."""
+
+    source_name: str = Field(..., min_length=1)
+    status: Literal["available", "source_unavailable", "not_implemented"]
+    reason: str = Field(..., min_length=1)
+    source_type: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class SourceAvailabilityReport(StrictSchema):
+    """Source availability summary for Agent 3."""
+
+    flags: tuple[SourceAvailabilityFlag, ...] = Field(default_factory=tuple)
+
+
+class TrialIdentity(StrictSchema):
+    """Trial identity facts used by clinical outcome prediction."""
+
+    nct_id: str = Field(..., min_length=1)
+    brief_title: str | None = None
+    official_title: str | None = None
+    overall_status: str | None = None
+    phases: tuple[str, ...] = Field(default_factory=tuple)
+    conditions: tuple[str, ...] = Field(default_factory=tuple)
+    sponsor: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class TrialDesignFeatures(StrictSchema):
+    """Protocol design features relevant to clinical outcome risk."""
+
+    study_type: str | None = None
+    arms_count: int = Field(default=0, ge=0)
+    intervention_count: int = Field(default=0, ge=0)
+    enrollment_count: int | None = Field(default=None, ge=0)
+    enrollment_type: str | None = None
+    primary_endpoint_count: int = Field(default=0, ge=0)
+    secondary_endpoint_count: int = Field(default=0, ge=0)
+    primary_endpoint_measures: tuple[str, ...] = Field(default_factory=tuple)
+    secondary_endpoint_measures: tuple[str, ...] = Field(default_factory=tuple)
+    start_date: str | None = None
+    primary_completion_date: str | None = None
+    completion_date: str | None = None
+    eligibility_summary: str | None = None
+    countries: tuple[str, ...] = Field(default_factory=tuple)
+    sites_count: int | None = Field(default=None, ge=0)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class EndpointRiskAssessment(StrictSchema):
+    """Endpoint-level risk assessment with registry-backed rationale."""
+
+    risk_level: Literal["low", "medium", "high", "unknown"] = "unknown"
+    risk_factors: tuple[str, ...] = Field(default_factory=tuple)
+    rationale: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class EnrollmentDurationRisk(StrictSchema):
+    """Enrollment and duration risk assessment with numeric provenance."""
+
+    risk_level: Literal["low", "medium", "high", "unknown"] = "unknown"
+    enrollment_count: int | None = Field(default=None, ge=0)
+    planned_duration_months: float | None = Field(default=None, ge=0)
+    rationale: str = Field(..., min_length=1)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ComparatorBenchmarkBundle(StrictSchema):
+    """Public benchmark trials matched by indication and phase."""
+
+    matched_public_trials_count: int = Field(default=0, ge=0)
+    comparator_trial_ids: tuple[str, ...] = Field(default_factory=tuple)
+    benchmark_summary: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class HistoricalPoSEstimate(StrictSchema):
+    """Historical probability-of-success estimate from the local source workbook."""
+
+    probability_of_success: float | None = Field(default=None, ge=0, le=1)
+    current_phase: str | None = None
+    disease_area: str | None = None
+    lookup_key: str | None = None
+    benchmark_row: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    assumption_type: Literal["source_derived", "missing"] = "missing"
+    source_type: str = "pos_workbook"
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class ApprovalLikelihoodProxy(StrictSchema):
+    """Source-backed or config-derived approval likelihood proxy, not a decision."""
+
+    probability: float | None = Field(default=None, ge=0, le=1)
+    basis: str = Field(..., min_length=1)
+    assumption_type: Literal["source_derived", "heuristic", "missing"] = "missing"
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class FailureMode(StrictSchema):
+    """One likely clinical failure mode for the trial."""
+
+    category: Literal["endpoint", "enrollment", "safety", "comparator", "biology", "operational", "missing_data"]
+    severity: Literal["low", "medium", "high"]
+    rationale: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class FailureModeClassification(StrictSchema):
+    """Structured failure-mode classification for Agent 4 consumption."""
+
+    likely_failure_modes: tuple[FailureMode, ...] = Field(default_factory=tuple)
+    overall_risk_level: Literal["low", "medium", "high", "unknown"] = "unknown"
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class SafetyContext(StrictSchema):
+    """Label-derived safety context when an open public label is available."""
+
+    label_available: bool = False
+    summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class LabelExpansionClinicalRationale(StrictSchema):
+    """Clinical rationale for label expansion; excludes commercial recommendations."""
+
+    rationale: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class ClinicalOutcomePredictionOutput(StrictSchema):
+    """Structured output from the Clinical Outcome Prediction Agent 3 workflow."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    input: ClinicalOutcomePredictionInput
+    trial_identity: TrialIdentity
+    asset_identity: AssetIdentityOutput
+    trial_design_features: TrialDesignFeatures
+    endpoint_risk_assessment: EndpointRiskAssessment
+    enrollment_duration_risk: EnrollmentDurationRisk
+    comparator_benchmarking: ComparatorBenchmarkBundle
+    historical_pos_estimate: HistoricalPoSEstimate
+    approval_likelihood_proxy: ApprovalLikelihoodProxy
+    failure_mode_classification: FailureModeClassification
+    safety_context: SafetyContext
+    label_expansion_clinical_rationale: LabelExpansionClinicalRationale
+    source_availability: SourceAvailabilityReport
+    sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
+    claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
+    confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
+    human_gate: HumanGate | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    validation_status: ValidationStatus = "not_run"
 
 
 class PricingOutput(StrictSchema):
