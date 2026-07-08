@@ -222,7 +222,7 @@ class ClinicalTrialsSearchResult(StrictSchema):
 
 
 class ClinicalTrialIntelligenceOutput(StrictSchema):
-    """Structured output from the Clinical Trial Intelligence Agent/workflow."""
+    """Structured output from Agent 3 trial-landscape mode."""
 
     output_id: str = Field(..., min_length=1)
     run_id: str = Field(..., min_length=1)
@@ -259,6 +259,26 @@ class DueDiligenceInput(StrictSchema):
     development_cost: float | None = Field(default=None, ge=0, description="Reviewed remaining development cost assumption.")
     launch_year: int | None = Field(default=None, ge=2020, le=2100, description="Reviewed expected launch year.")
     loe_year: int | None = Field(default=None, ge=2020, le=2150, description="Reviewed expected loss-of-exclusivity year.")
+    refresh_agent3: bool = Field(default=False, description="Force a fresh Agent 3 clinical outcome prediction handoff.")
+
+
+class ProtocolDesignInput(StrictSchema):
+    """Input contract for the Protocol Design Brief Agent 5 workflow."""
+
+    nct_id: str = Field(..., pattern=r"^NCT\d{8}$", description="ClinicalTrials.gov NCT identifier.")
+    pos_workbook_path: str | None = Field(default=None, description="Optional local PoS workbook path for upstream Agent 3/4 runs.")
+    wac_data_path: str | None = Field(default=None, description="Optional local WAC workbook path for upstream Agent 4 runs.")
+    annual_patients: float | None = Field(default=None, ge=0, description="Reviewed annual eligible patient assumption for upstream Agent 4 runs.")
+    peak_penetration: float | None = Field(default=None, ge=0, le=1, description="Reviewed peak penetration assumption for upstream Agent 4 runs.")
+    gross_to_net: float | None = Field(default=None, ge=0, le=1, description="Reviewed gross-to-net assumption for upstream Agent 4 runs.")
+    operating_margin: float | None = Field(default=None, ge=0, le=1, description="Reviewed operating margin assumption for upstream Agent 4 runs.")
+    discount_rate: float | None = Field(default=None, ge=0, le=1, description="Reviewed discount rate assumption for upstream Agent 4 runs.")
+    development_cost: float | None = Field(default=None, ge=0, description="Reviewed remaining development cost assumption for upstream Agent 4 runs.")
+    launch_year: int | None = Field(default=None, ge=2020, le=2100, description="Reviewed expected launch year for upstream Agent 4 runs.")
+    loe_year: int | None = Field(default=None, ge=2020, le=2150, description="Reviewed expected loss-of-exclusivity year for upstream Agent 4 runs.")
+    refresh_agent3: bool = Field(default=False, description="Force a fresh Agent 3 handoff through upstream workflows.")
+    refresh_agent4: bool = Field(default=False, description="Force a fresh Agent 4 due-diligence handoff.")
+    analog_top_k: int = Field(default=10, ge=1, le=25, description="Maximum selected analog trials.")
 
 
 class ClinicalOutcomePredictionInput(StrictSchema):
@@ -443,6 +463,13 @@ class ComparatorBenchmarkBundle(StrictSchema):
     matched_public_trials_count: int = Field(default=0, ge=0)
     comparator_trial_ids: tuple[str, ...] = Field(default_factory=tuple)
     benchmark_summary: str = Field(..., min_length=1)
+    landscape_summary: str | None = None
+    status_summary: str | None = None
+    phase_summary: str | None = None
+    sponsor_summary: str | None = None
+    endpoint_summary: str | None = None
+    population_summary: str | None = None
+    risk_flags: tuple[TrialLandscapeRisk, ...] = Field(default_factory=tuple)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.0, ge=0, le=1)
@@ -595,19 +622,358 @@ class RNPVOutput(StrictSchema):
     confidence: float = Field(default=0.0, ge=0, le=1)
 
 
+class Agent3HandoffReference(StrictSchema):
+    """Reference to an Agent 3 output consumed by Agent 4."""
+
+    agent3_run_id: str = Field(..., min_length=1)
+    agent3_output_id: str = Field(..., min_length=1)
+    nct_id: str = Field(..., min_length=1)
+    generated_or_reused: Literal["generated", "reused"]
+    retrieved_from_memory: bool
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class ClinicalRiskSummary(StrictSchema):
+    """Agent 3 clinical-risk summary consumed by Agent 4."""
+
+    nct_id: str = Field(..., min_length=1)
+    asset_name: str | None = None
+    indication: str | None = None
+    phase: str | None = None
+    sponsor: str | None = None
+    endpoint_risk_level: str | None = None
+    enrollment_duration_risk_level: str | None = None
+    failure_modes: tuple[FailureMode, ...] = Field(default_factory=tuple)
+    historical_pos: float | None = Field(default=None, ge=0, le=1)
+    approval_likelihood_proxy: float | None = Field(default=None, ge=0, le=1)
+    safety_context_summary: str | None = None
+    comparator_benchmark_summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+
+
+class ClinicalEvidenceSummary(StrictSchema):
+    """CT.gov and PubMed evidence extracted for Agent 4 diligence."""
+
+    nct_id: str = Field(..., min_length=1)
+    ctgov_summary: str = Field(..., min_length=1)
+    pubmed_query: str | None = None
+    pubmed_article_count: int = Field(default=0, ge=0)
+    pubmed_titles: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class CompetitiveLandscapeSummary(StrictSchema):
+    """Competitive landscape summarized from Agent 3 comparator context."""
+
+    nct_id: str = Field(..., min_length=1)
+    comparator_trial_ids: tuple[str, ...] = Field(default_factory=tuple)
+    matched_public_trials_count: int = Field(default=0, ge=0)
+    benchmark_summary: str = Field(..., min_length=1)
+    status_summary: str | None = None
+    phase_summary: str | None = None
+    sponsor_summary: str | None = None
+    endpoint_summary: str | None = None
+    population_summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class SafetyLabelSummary(StrictSchema):
+    """openFDA safety label summary without unsupported inference."""
+
+    asset_name: str | None = None
+    label_available: bool = False
+    warnings_summary: str | None = None
+    adverse_reactions_summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class PatentLOEReview(StrictSchema):
+    """Lens-only patent and LOE review for Agent 4 diligence."""
+
+    asset_name: str | None = None
+    searched_terms: tuple[str, ...] = Field(default_factory=tuple)
+    candidate_count: int = Field(default=0, ge=0)
+    estimated_loe_year: int | None = None
+    review_summary: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class DiligenceRedFlag(StrictSchema):
+    """Rule-based due-diligence red flag."""
+
+    flag_id: str = Field(..., min_length=1)
+    category: Literal["clinical", "safety", "ip_loe", "pricing", "commercial", "rnpv", "source_coverage", "cross_agent"]
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+    reason: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    provenance: str = Field(..., min_length=1)
+
+
+class AssetMemo(StrictSchema):
+    """Source-backed draft asset memo requiring human review."""
+
+    memo_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    summary: str = Field(..., min_length=1)
+    sections: tuple[str, ...] = Field(default_factory=tuple)
+    source_backed_claims: tuple[str, ...] = Field(default_factory=tuple)
+    assumptions_summary: tuple[str, ...] = Field(default_factory=tuple)
+    missing_evidence: tuple[str, ...] = Field(default_factory=tuple)
+    review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    requires_human_review: bool = True
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
 class DueDiligenceOutput(StrictSchema):
     """Structured PharmaOS due-diligence workflow output."""
 
     output_id: str = Field(..., min_length=1)
     run_id: str = Field(..., min_length=1)
     input: DueDiligenceInput
+    target_trial: ClinicalTrialRecord
     trial: ClinicalTrialRecord
     asset_identity: AssetIdentityOutput
+    agent3_handoff: Agent3HandoffReference
+    clinical_risk_summary: ClinicalRiskSummary
+    clinical_evidence: ClinicalEvidenceSummary
+    competitive_landscape: CompetitiveLandscapeSummary
+    safety_label_summary: SafetyLabelSummary
+    patent_loe_review: PatentLOEReview
     patent_exclusivity: PatentExclusivityOutput
     pos: PoSOutput
     pricing: PricingOutput
     commercial_model: CommercialModelOutput
     rnpv: RNPVOutput
+    red_flags: tuple[DiligenceRedFlag, ...] = Field(default_factory=tuple)
+    asset_memo: AssetMemo
+    sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
+    claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
+    confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
+    human_gate: HumanGate | None = None
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    validation_status: ValidationStatus = "not_run"
+
+
+class Agent4HandoffReference(StrictSchema):
+    """Reference to an Agent 4 output consumed by Agent 5."""
+
+    agent4_run_id: str = Field(..., min_length=1)
+    agent4_output_id: str = Field(..., min_length=1)
+    nct_id: str = Field(..., min_length=1)
+    generated_or_reused: Literal["generated", "reused"]
+    retrieved_from_memory: bool
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class CTGovSearchQuery(StrictSchema):
+    """One deterministic ClinicalTrials.gov analog-search query."""
+
+    query_id: str = Field(..., min_length=1)
+    condition: str = Field(..., min_length=1)
+    intervention: str | None = None
+    phase: str | None = None
+    target_or_moa: str | None = None
+    endpoint_family: str | None = None
+    comparator: str | None = None
+    biomarker_or_line: str | None = None
+    term: str | None = None
+    limit: int = Field(default=25, ge=1, le=100)
+    expected_analog_dimension: str = Field(..., min_length=1)
+    rationale: str = Field(..., min_length=1)
+
+
+class AnalogSearchPlanOutput(StrictSchema):
+    """Structured search-strategy subagent output for CT.gov retrieval."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    queries: tuple[CTGovSearchQuery, ...] = Field(..., min_length=1)
+    rationale: str = Field(..., min_length=1)
+    expected_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.6, ge=0, le=1)
+
+
+class AnalogCandidateRecord(StrictSchema):
+    """A normalized analog candidate with query provenance."""
+
+    candidate_id: str = Field(..., min_length=1)
+    trial: ClinicalTrialRecord
+    query_ids: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    provenance: str = Field(..., min_length=1)
+
+
+class SelectedAnalogTrial(StrictSchema):
+    """Selected analog trial and matching rationale."""
+
+    nct_id: str = Field(..., min_length=1)
+    match_score: float = Field(..., ge=0.0, le=1.0)
+    match_confidence: Literal["high", "medium", "low"]
+    matched_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    mismatched_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    unknown_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    reasoning: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class ExcludedAnalogTrial(StrictSchema):
+    """Candidate analog excluded from benchmarking."""
+
+    nct_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class AnalogTrialSelectionOutput(StrictSchema):
+    """Analog-selection subagent output."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    selected_analogs: tuple[SelectedAnalogTrial, ...] = Field(default_factory=tuple)
+    excluded_candidates: tuple[ExcludedAnalogTrial, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class BenchmarkNumericSummary(StrictSchema):
+    """Summary statistics for an analog numeric field."""
+
+    observed_count: int = Field(default=0, ge=0)
+    missing_count: int = Field(default=0, ge=0)
+    mean: float | None = None
+    median: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+    iqr: float | None = None
+    unit: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class BenchmarkFrequency(StrictSchema):
+    """Frequency count for an analog benchmark category."""
+
+    label: str = Field(..., min_length=1)
+    count: int = Field(..., ge=0)
+    frequency: float = Field(..., ge=0, le=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class AnalogBenchmarkBundle(StrictSchema):
+    """First-class analog trial benchmark artifact for Agent 5."""
+
+    bundle_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    selected_analog_ids: tuple[str, ...] = Field(default_factory=tuple)
+    excluded_analog_ids: tuple[str, ...] = Field(default_factory=tuple)
+    search_plan: AnalogSearchPlanOutput
+    selection: AnalogTrialSelectionOutput
+    enrollment: BenchmarkNumericSummary
+    planned_duration_months: BenchmarkNumericSummary
+    randomized_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    blinding_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    arm_count_distribution: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    primary_endpoint_family_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    secondary_endpoint_family_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    comparator_categories: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    named_comparators: tuple[str, ...] = Field(default_factory=tuple)
+    inclusion_themes: tuple[str, ...] = Field(default_factory=tuple)
+    exclusion_themes: tuple[str, ...] = Field(default_factory=tuple)
+    biomarker_testing_themes: tuple[str, ...] = Field(default_factory=tuple)
+    prior_treatment_themes: tuple[str, ...] = Field(default_factory=tuple)
+    safety_exclusion_themes: tuple[str, ...] = Field(default_factory=tuple)
+    country_distribution: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    site_count: BenchmarkNumericSummary
+    status_distribution: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    results_availability: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
+    limitations: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ProtocolSectionDraft(StrictSchema):
+    """One draft ProtocolDesignBrief section."""
+
+    section_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    body: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ProtocolReviewerCritique(StrictSchema):
+    """Regulatory/statistical reviewer critique without approval logic."""
+
+    critique_id: str = Field(..., min_length=1)
+    missing_elements: tuple[str, ...] = Field(default_factory=tuple)
+    statistical_questions: tuple[str, ...] = Field(default_factory=tuple)
+    regulatory_questions: tuple[str, ...] = Field(default_factory=tuple)
+    limitations: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ProtocolDesignBrief(StrictSchema):
+    """Source-grounded draft protocol design strategy artifact."""
+
+    brief_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    artifact_type: Literal["draft_protocol_design_brief"] = "draft_protocol_design_brief"
+    requires_human_review: bool = True
+    executive_synopsis: ProtocolSectionDraft
+    strategic_rationale: ProtocolSectionDraft
+    analog_trial_benchmark_summary: ProtocolSectionDraft
+    target_population: ProtocolSectionDraft
+    study_design: ProtocolSectionDraft
+    comparator_and_landscape_rationale: ProtocolSectionDraft
+    endpoint_strategy: ProtocolSectionDraft
+    draft_eligibility_framework: ProtocolSectionDraft
+    draft_schedule_of_assessments_framework: ProtocolSectionDraft
+    safety_monitoring_outline: ProtocolSectionDraft
+    statistical_analysis_skeleton: ProtocolSectionDraft
+    operational_feasibility_risks: ProtocolSectionDraft
+    regulatory_standards_considerations: ProtocolSectionDraft
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_backed_claim_ids: tuple[str, ...] = Field(default_factory=tuple)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    reviewer_critique: ProtocolReviewerCritique
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ProtocolDesignOutput(StrictSchema):
+    """Structured Agent 5 Protocol Design workflow output."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    input: ProtocolDesignInput
+    target_trial: ClinicalTrialRecord
+    agent3_handoff: Agent3HandoffReference
+    agent4_handoff: Agent4HandoffReference
+    analog_candidates: tuple[AnalogCandidateRecord, ...] = Field(default_factory=tuple)
+    analog_benchmark_bundle: AnalogBenchmarkBundle
+    protocol_design_brief: ProtocolDesignBrief
     sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
     claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)
     assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)

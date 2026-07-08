@@ -2,28 +2,40 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
+from pharma_os.components.due_diligence_sections import (
+    build_asset_memo,
+    build_clinical_evidence_summary,
+    build_competitive_landscape_summary,
+    build_patent_loe_review,
+    build_red_flags,
+    build_safety_label_summary,
+)
 from pharma_os.schemas import (
     AgentOutput,
+    Agent3HandoffReference,
+    ClinicalOutcomePredictionInput,
+    ClinicalOutcomePredictionOutput,
+    ClinicalRiskSummary,
     DueDiligenceInput,
     DueDiligenceOutput,
     EvidenceClaim,
     SourceMetadata,
     WorkflowRun,
 )
+from pharma_os.workflows.clinical_outcome_prediction import run_clinical_outcome_prediction_workflow
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovClient
-from pharma_os.tools.due_diligence import (
-    build_commercial_model,
-    build_rnpv,
-    lookup_pos,
-    lookup_pricing,
-    resolve_asset_identity,
-    search_patent_exclusivity,
-)
+from pharma_os.tools.asset_identity import resolve_asset_identity
+from pharma_os.tools.commercial_model import build_commercial_model
+from pharma_os.tools.patents_lens import search_patent_exclusivity
+from pharma_os.tools.pos import lookup_pos
+from pharma_os.tools.pricing import lookup_pricing
+from pharma_os.tools.rnpv import build_rnpv
 from pharma_os.tools.rules import config_source
 from pharma_os.validators import (
     aggregate_validation_status,
@@ -32,6 +44,7 @@ from pharma_os.validators import (
     validate_numeric_provenance,
     validate_schema,
     validate_source_coverage,
+    validate_cross_agent_consistency,
 )
 
 
@@ -54,12 +67,22 @@ def run_due_diligence_workflow(
     )
     store.save_run(run, input_payload=input_data)
 
+    agent3_output, handoff = _get_or_run_agent3(input_data, memory=store)
+    clinical_risk_summary = _clinical_risk_summary(agent3_output)
     trial = ClinicalTrialsGovClient().fetch_trial(input_data.nct_id)
     asset_identity, identity_sources = resolve_asset_identity(trial)
+    clinical_evidence, clinical_evidence_sources, clinical_evidence_claims = build_clinical_evidence_summary(
+        run_id=run_id,
+        trial=trial,
+        asset=asset_identity,
+    )
+    competitive_landscape = build_competitive_landscape_summary(agent3_output)
+    safety_label_summary, safety_sources = build_safety_label_summary(asset_identity)
     patent_exclusivity, patent_sources = search_patent_exclusivity(
         asset_identity,
         loe_year_override=input_data.loe_year,
     )
+    patent_loe_review = build_patent_loe_review(patent_exclusivity)
     pos, pos_source = lookup_pos(
         trial,
         asset_identity,
@@ -95,9 +118,23 @@ def run_due_diligence_workflow(
         version="local",
     )
     config_sources = _config_sources_from_assumptions((*commercial_model.assumptions, *rnpv.assumptions))
-    sources = _dedupe_sources((*identity_sources, *patent_sources, pos_source, *pricing_sources, *config_sources, user_source))
+    sources = _dedupe_sources((
+        *agent3_output.sources,
+        *identity_sources,
+        *clinical_evidence_sources,
+        *safety_sources,
+        *patent_sources,
+        pos_source,
+        *pricing_sources,
+        *config_sources,
+        user_source,
+    ))
     missing_data_flags = (
         *asset_identity.missing_data_flags,
+        *clinical_risk_summary.missing_data_flags,
+        *clinical_evidence.missing_data_flags,
+        *competitive_landscape.missing_data_flags,
+        *safety_label_summary.missing_data_flags,
         *patent_exclusivity.missing_data_flags,
         *pos.missing_data_flags,
         *pricing.missing_data_flags,
@@ -141,17 +178,52 @@ def run_due_diligence_workflow(
         commercial=commercial_model,
         rnpv=rnpv,
     )
+    claims = (*claims, *clinical_evidence_claims)
+    red_flags = build_red_flags(
+        clinical_risk=clinical_risk_summary,
+        safety=safety_label_summary,
+        patent=patent_loe_review,
+        pricing=pricing,
+        commercial=commercial_model,
+        rnpv=rnpv,
+        missing_data_flags=missing_data_flags,
+    )
+    asset_memo = build_asset_memo(
+        run_id=run_id,
+        asset=asset_identity,
+        clinical_risk=clinical_risk_summary,
+        evidence=clinical_evidence,
+        landscape=competitive_landscape,
+        safety=safety_label_summary,
+        patent=patent_loe_review,
+        pricing=pricing,
+        commercial=commercial_model,
+        rnpv=rnpv,
+        red_flags=red_flags,
+        claims=claims,
+        assumptions=assumptions,
+        missing_data_flags=missing_data_flags,
+    )
     output = DueDiligenceOutput(
         output_id=f"due-diligence-output-{run_id}",
         run_id=run_id,
         input=input_data,
+        target_trial=trial,
         trial=trial,
         asset_identity=asset_identity,
+        agent3_handoff=handoff,
+        clinical_risk_summary=clinical_risk_summary,
+        clinical_evidence=clinical_evidence,
+        competitive_landscape=competitive_landscape,
+        safety_label_summary=safety_label_summary,
+        patent_loe_review=patent_loe_review,
         patent_exclusivity=patent_exclusivity,
         pos=pos,
         pricing=pricing,
         commercial_model=commercial_model,
         rnpv=rnpv,
+        red_flags=red_flags,
+        asset_memo=asset_memo,
         sources=sources,
         claims=claims,
         assumptions=assumptions,
@@ -177,15 +249,26 @@ def run_due_diligence_workflow(
             claims=output.claims,
             run_id=run_id,
         ),
+        *validate_cross_agent_consistency(
+            run_id=run_id,
+            agent3_output=agent3_output,
+            agent4_output=output,
+        ),
     )
-    output_text = "\n".join([*(claim.claim_text for claim in claims), *(flag.reason for flag in missing_data_flags)])
+    output_text = "\n".join([
+        *(claim.claim_text for claim in claims),
+        *(flag.reason for flag in missing_data_flags),
+        *(flag.reason for flag in red_flags),
+        asset_memo.summary,
+        *asset_memo.sections,
+    ])
     gate = assign_human_gate(
         run_id=run_id,
         workflow_name="due_diligence",
         validation_results=validation_results,
         output_text=output_text,
     )
-    if missing_data_flags and gate is None:
+    if (missing_data_flags or any(flag.severity in {"high", "critical"} for flag in red_flags)) and gate is None:
         from pharma_os.schemas import HumanGate
 
         gate = HumanGate(
@@ -199,7 +282,7 @@ def run_due_diligence_workflow(
     confidence_flags = generate_confidence_flags(
         run_id=run_id,
         validation_results=validation_results,
-        risk_flags=missing_data_flags,
+        risk_flags=(*missing_data_flags, *red_flags),
     )
     validation_status = aggregate_validation_status(validation_results)
     if gate and validation_status == "passed":
@@ -335,10 +418,105 @@ def _claims(
     return tuple(claims)
 
 
+def _get_or_run_agent3(
+    input_data: DueDiligenceInput,
+    *,
+    memory: MemoryStore,
+) -> tuple[ClinicalOutcomePredictionOutput, Agent3HandoffReference]:
+    latest = None if input_data.refresh_agent3 else memory.get_latest_workflow_output(
+        workflow_name="clinical_outcome_prediction",
+        nct_id=input_data.nct_id,
+    )
+    if latest is not None:
+        agent3_run, payload = latest
+        output = ClinicalOutcomePredictionOutput.model_validate_json(json.dumps(payload))
+        return output, Agent3HandoffReference(
+            agent3_run_id=agent3_run.run_id,
+            agent3_output_id=output.output_id,
+            nct_id=output.input.nct_id,
+            generated_or_reused="reused",
+            retrieved_from_memory=True,
+            source_ids=tuple(source.source_id for source in output.sources),
+            confidence=output.confidence,
+        )
+
+    output = run_clinical_outcome_prediction_workflow(
+        ClinicalOutcomePredictionInput(
+            nct_id=input_data.nct_id,
+            pos_workbook_path=input_data.pos_workbook_path,
+        ),
+        memory=memory,
+    )
+    return output, Agent3HandoffReference(
+        agent3_run_id=output.run_id,
+        agent3_output_id=output.output_id,
+        nct_id=output.input.nct_id,
+        generated_or_reused="generated",
+        retrieved_from_memory=False,
+        source_ids=tuple(source.source_id for source in output.sources),
+        confidence=output.confidence,
+    )
+
+
+def _clinical_risk_summary(output: ClinicalOutcomePredictionOutput) -> ClinicalRiskSummary:
+    missing_flags = _dedupe_missing_flags(
+        (
+            *output.missing_data_flags,
+            *output.endpoint_risk_assessment.missing_data_flags,
+            *output.enrollment_duration_risk.missing_data_flags,
+            *output.comparator_benchmarking.missing_data_flags,
+            *output.historical_pos_estimate.missing_data_flags,
+            *output.safety_context.missing_data_flags,
+            *output.label_expansion_clinical_rationale.missing_data_flags,
+        )
+    )
+    phase = output.trial_identity.phases[0] if output.trial_identity.phases else output.historical_pos_estimate.current_phase
+    indication = output.asset_identity.normalized_indication or (output.trial_identity.conditions[0] if output.trial_identity.conditions else None)
+    source_ids = tuple(
+        dict.fromkeys(
+            (
+                *output.trial_identity.source_ids,
+                *output.asset_identity.source_ids,
+                *output.endpoint_risk_assessment.source_ids,
+                *output.enrollment_duration_risk.source_ids,
+                *output.failure_mode_classification.source_ids,
+                *output.historical_pos_estimate.source_ids,
+                *output.approval_likelihood_proxy.source_ids,
+                *output.safety_context.source_ids,
+                *output.comparator_benchmarking.source_ids,
+            )
+        )
+    )
+    return ClinicalRiskSummary(
+        nct_id=output.trial_identity.nct_id,
+        asset_name=output.asset_identity.asset_name,
+        indication=indication,
+        phase=phase,
+        sponsor=output.trial_identity.sponsor,
+        endpoint_risk_level=output.endpoint_risk_assessment.risk_level,
+        enrollment_duration_risk_level=output.enrollment_duration_risk.risk_level,
+        failure_modes=output.failure_mode_classification.likely_failure_modes,
+        historical_pos=output.historical_pos_estimate.probability_of_success,
+        approval_likelihood_proxy=output.approval_likelihood_proxy.probability,
+        safety_context_summary=output.safety_context.summary,
+        comparator_benchmark_summary=output.comparator_benchmarking.benchmark_summary,
+        source_ids=source_ids,
+        confidence=output.confidence,
+        missing_data_flags=missing_flags,
+    )
+
+
 def _dedupe_sources(sources: tuple[object, ...]) -> tuple[object, ...]:
     deduped: dict[str, object] = {}
     for source in sources:
         deduped[getattr(source, "source_id")] = source
+    return tuple(deduped.values())
+
+
+def _dedupe_missing_flags(flags: tuple[object, ...]) -> tuple[object, ...]:
+    deduped: dict[str, object] = {}
+    for flag in flags:
+        deduped[getattr(flag, "flag_id")] = flag
     return tuple(deduped.values())
 
 

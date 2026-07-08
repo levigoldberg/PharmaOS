@@ -155,6 +155,9 @@ def test_clinical_outcome_prediction_workflow_persists_bundle(monkeypatch) -> No
     assert output.historical_pos_estimate.probability_of_success == 0.344
     assert output.approval_likelihood_proxy.probability == 0.344
     assert output.comparator_benchmarking.matched_public_trials_count == 1
+    assert output.comparator_benchmarking.landscape_summary == "Found 2 ClinicalTrials.gov records for Glioblastoma."
+    assert output.comparator_benchmarking.status_summary is not None
+    assert output.comparator_benchmarking.risk_flags
     assert output.failure_mode_classification.likely_failure_modes
     assert any(flag.status == "not_implemented" for flag in output.source_availability.flags)
     assert bundle.sources

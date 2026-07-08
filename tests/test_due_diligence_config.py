@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from pharma_os.schemas import PatentExclusivityOutput, PoSOutput, PricingOutput
-from pharma_os.tools.due_diligence import build_commercial_model, build_rnpv
+from pharma_os.tools.commercial_model import build_commercial_model
+from pharma_os.tools.rnpv import build_rnpv
 from pharma_os.tools.rules import config_source_id, load_config
 
 

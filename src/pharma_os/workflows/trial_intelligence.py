@@ -1,4 +1,4 @@
-"""Clinical Trial Intelligence workflow."""
+"""Compatibility workflow for Agent 3 trial-landscape mode."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def run_trial_intelligence_workflow(
     memory: MemoryStore | None = None,
     agent_runner: AgentRunner | None = None,
 ) -> ClinicalTrialIntelligenceOutput:
-    """Run the first PharmaOS agent loop end to end."""
+    """Run the Agent 3 trial-landscape component through the legacy route."""
 
     store = memory or MemoryStore()
     run_id = str(uuid4())
@@ -47,7 +47,7 @@ def run_trial_intelligence_workflow(
         workflow_name="trial_intelligence",
         status="running",
         started_at=started_at,
-        input_provenance="cli.trial_intelligence",
+        input_provenance="cli.trial_intelligence.agent3_landscape_mode",
         metadata={"limit": input_data.limit},
     )
     store.save_run(run, input_payload=input_data)
@@ -113,9 +113,9 @@ def run_trial_intelligence_workflow(
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
-        agent_name="clinical_trial_intelligence_agent",
+        agent_name="agent3_trial_landscape_component",
         run_id=run_id,
-        provenance="OpenAI Agents SDK Runner.run_sync",
+        provenance="PharmaOS deterministic Agent 3 trial-landscape component",
         claims=output.claims,
         sources=output.sources,
         confidence=output.confidence,

@@ -46,6 +46,7 @@ def test_trial_intelligence_workflow_persists_bundle() -> None:
     assert bundle.validation_results
     assert bundle.confidence_flags
     assert bundle.agent_outputs
+    assert bundle.agent_outputs[0].agent_name == "agent3_trial_landscape_component"
     assert bundle.reports
 
 
@@ -92,3 +93,28 @@ def test_cli_report_reads_prior_persisted_run(tmp_path, monkeypatch, capsys) -> 
     report_output = json.loads(report_json.read_text(encoding="utf-8"))
     assert report_output["run_id"] == run_id
     assert report_output["sources"]
+
+
+def test_default_trial_intelligence_runner_uses_agent3_landscape_component(monkeypatch) -> None:
+    from pharma_os.agents import clinical_trial_intelligence as cti_agent
+
+    original_search = ClinicalTrialsGovClient.search_trials
+
+    def fake_search(self, input_data):
+        import httpx
+
+        payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        client = ClinicalTrialsGovClient(
+            client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+        )
+        return original_search(client, input_data)
+
+    monkeypatch.setattr(cti_agent.ClinicalTrialsGovClient, "search_trials", fake_search)
+
+    output, trace = cti_agent.run_clinical_trial_intelligence_agent(
+        ClinicalTrialIntelligenceInput(disease="glioblastoma", target="EGFR", limit=10),
+        run_id="test-run",
+    )
+
+    assert output.landscape_summary == "Found 2 ClinicalTrials.gov records for glioblastoma."
+    assert trace["mode"] == "agent3_trial_landscape_component"

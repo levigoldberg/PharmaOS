@@ -32,7 +32,16 @@ Config layout:
 
 ## Example Commands
 
-Clinical trial intelligence:
+Clinical outcome prediction, the canonical Agent 3 workflow:
+
+```bash
+python -m pharma_os run clinical_outcome_prediction \
+  --nct-id NCT04903795 \
+  --db-path .pharma_os/scientific_memory.sqlite \
+  --output-json outputs/clinical_outcome_prediction.json
+```
+
+Agent 3 trial-landscape compatibility mode:
 
 ```bash
 python -m pharma_os run trial_intelligence \
@@ -60,6 +69,15 @@ python -m pharma_os run due_diligence \
   --output-json outputs/due_diligence.json
 ```
 
+Protocol design brief, the Agent 5 draft-strategy workflow:
+
+```bash
+python -m pharma_os run protocol_design \
+  --nct-id NCT04903795 \
+  --db-path .pharma_os/scientific_memory.sqlite \
+  --output-json outputs/protocol_design.json
+```
+
 Report from Scientific Memory:
 
 ```bash
@@ -71,5 +89,9 @@ python -m pharma_os report \
 
 Notes:
 
+- `trial_intelligence` is a thin compatibility route over the internal Agent 3 trial-landscape component used by `clinical_outcome_prediction`; it is not a separate LLM agent.
 - Due diligence uses ClinicalTrials.gov, RxNorm, local PoS/WAC workbooks, openFDA labels, and Lens when `LENS_API_TOKEN` is valid.
+- Due diligence remains the Agent 4 owner for patents, pricing, commercial model, market sizing, BD logic, and rNPV.
 - The workflow does not invent LOE, PoS, pricing, market size, or rNPV inputs. Missing or low-confidence inputs create confidence flags and human gates.
+- `protocol_design` consumes Agent 3 and Agent 4 outputs, then uses CT.gov analog trials, PubMed metadata/abstract context, openFDA label context, and local templates/checklists only.
+- Agent 5 returns a typed `ProtocolDesignBrief` with an `AnalogBenchmarkBundle`; it is a draft strategy artifact requiring human review, not a full protocol, IRB-ready protocol, submission-ready protocol, or final decision.

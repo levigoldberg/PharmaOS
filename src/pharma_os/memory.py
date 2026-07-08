@@ -114,6 +114,54 @@ class MemoryStore:
             metadata=json.loads(row["metadata_json"] or "{}"),
         )
 
+    def get_latest_workflow_output(
+        self,
+        *,
+        workflow_name: str,
+        nct_id: str,
+    ) -> tuple[WorkflowRun, dict[str, Any]] | None:
+        """Return the latest completed non-failed workflow output for an NCT ID."""
+
+        rows = self._connection.execute(
+            """
+            SELECT * FROM runs
+            WHERE workflow_name = ?
+              AND status = 'completed'
+              AND validation_status != 'failed'
+              AND output_json IS NOT NULL
+            ORDER BY COALESCE(completed_at, started_at) DESC, started_at DESC
+            """,
+            (workflow_name,),
+        ).fetchall()
+        normalized_nct = nct_id.strip().upper()
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}") or {}
+            input_payload = json.loads(row["input_json"] or "{}") or {}
+            output_payload = json.loads(row["output_json"] or "{}") or {}
+            candidate_nct = (
+                metadata.get("nct_id")
+                or input_payload.get("nct_id")
+                or (output_payload.get("input") or {}).get("nct_id")
+            )
+            if str(candidate_nct or "").strip().upper() != normalized_nct:
+                continue
+            return (
+                WorkflowRun(
+                    run_id=row["run_id"],
+                    workflow_name=row["workflow_name"],
+                    status=row["status"],
+                    started_at=_parse_dt(row["started_at"]),
+                    completed_at=_parse_dt(row["completed_at"]),
+                    input_provenance=row["input_provenance"],
+                    source_ids=tuple(json.loads(row["source_ids_json"] or "[]")),
+                    validation_status=row["validation_status"],
+                    gate_reason=row["gate_reason"],
+                    metadata=metadata,
+                ),
+                output_payload,
+            )
+        return None
+
     def save_sources(self, run_id: str, sources: tuple[SourceMetadata, ...]) -> None:
         """Persist source metadata for a run."""
 

@@ -159,6 +159,20 @@ Prefer real API data and open-source tools.
 
 Do not create fake patient, site, batch, EHR, CTMS, EDC, MES, LIMS, or manufacturing data by default. If a module requires unavailable regulated data or physical systems, return a typed `not_implemented` result with the missing connector or required system.
 
+## Shared Artifact Reuse Rule
+
+Before any workflow calls an external API or recomputes a derived object, it must first check Scientific Memory or the canonical shared component for an existing valid artifact with the same stable key.
+
+Stable keys should include the artifact type plus relevant identifiers such as NCT ID, asset name, indication, phase, source name, and query parameters.
+
+Reuse existing valid artifacts unless a refresh flag is explicitly supplied or the artifact is missing, schema-invalid, source-stale, or incompatible with the requested inputs.
+
+When a workflow reuses an artifact, persist a typed reference to the original run ID, output ID, artifact ID, and source IDs. Do not copy unstructured text as the handoff.
+
+When a workflow refreshes an artifact, record why it was refreshed.
+
+Downstream agents must consume typed artifacts from upstream workflows or shared components instead of repeating upstream retrieval, reasoning, or calculations.
+
 ## Commands
 
 Use these commands when available:

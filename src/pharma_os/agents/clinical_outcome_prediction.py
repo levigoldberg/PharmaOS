@@ -14,7 +14,6 @@ from pharma_os.schemas import (
     AssumptionRecord,
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
-    ClinicalTrialIntelligenceInput,
     ClinicalTrialRecord,
     ComparatorBenchmarkBundle,
     EndpointRiskAssessment,
@@ -32,8 +31,10 @@ from pharma_os.schemas import (
     TrialDesignFeatures,
     TrialIdentity,
 )
+from pharma_os.components.trial_landscape import search_trial_landscape
+from pharma_os.tools.asset_identity import resolve_asset_identity
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovClient, ClinicalTrialsGovError
-from pharma_os.tools.due_diligence import lookup_pos, resolve_asset_identity
+from pharma_os.tools.pos import lookup_pos
 
 
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
@@ -285,12 +286,12 @@ def _comparator_benchmarks(
             (search_source,),
         )
     try:
-        result = client.search_trials(
-            ClinicalTrialIntelligenceInput(
-                disease=condition,
-                phase=phase,
-                limit=10,
-            )
+        landscape = search_trial_landscape(
+            disease=condition,
+            phase=phase,
+            limit=10,
+            run_id=f"{run_id}-agent3-landscape",
+            client=client,
         )
     except (ClinicalTrialsGovError, ValueError) as exc:
         flag = _missing("cop-comparator-search-failed", "comparator_benchmarking", "matched_public_trials_count", f"ClinicalTrials.gov comparator search failed: {exc.__class__.__name__}.", "medium")
@@ -303,18 +304,25 @@ def _comparator_benchmarks(
             ),
             (search_source,),
         )
-    comparators = tuple(record for record in result.trials if record.nct_id != trial.nct_id)
+    comparators = tuple(record for record in landscape.trials if record.nct_id != trial.nct_id)
     comparator_ids = tuple(record.nct_id for record in comparators[:5])
     summary = f"ClinicalTrials.gov search found {len(comparators)} public comparator trials for {condition}"
     if phase:
         summary += f" and {phase}"
     summary += "."
-    sources = _dedupe_sources((search_source, *result.sources))
+    sources = _dedupe_sources((search_source, *landscape.sources))
     return (
         ComparatorBenchmarkBundle(
             matched_public_trials_count=len(comparators),
             comparator_trial_ids=comparator_ids,
             benchmark_summary=summary,
+            landscape_summary=landscape.landscape_summary,
+            status_summary=landscape.status_summary,
+            phase_summary=landscape.phase_summary,
+            sponsor_summary=landscape.sponsor_summary,
+            endpoint_summary=landscape.endpoint_summary,
+            population_summary=landscape.population_summary,
+            risk_flags=landscape.risk_flags,
             source_ids=tuple(source.source_id for source in sources),
             confidence=0.65 if comparators else 0.4,
         ),
