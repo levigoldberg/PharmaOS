@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from pharma_os.cli import main
 from pharma_os.memory import MemoryStore
+from pharma_os.agents import due_diligence as due_agent
 from pharma_os.schemas import (
     AgentOutput,
     ApprovalLikelihoodProxy,
@@ -16,6 +17,7 @@ from pharma_os.schemas import (
     ComparatorBenchmarkBundle,
     CompetitiveLandscapeSummary,
     DueDiligenceInput,
+    DueDiligenceSynthesisOutput,
     EndpointRiskAssessment,
     EnrollmentDurationRisk,
     EvidenceClaim,
@@ -298,6 +300,9 @@ def test_due_diligence_workflow_persists_bundle(monkeypatch) -> None:
     assert output.rnpv.calculable
     assert output.red_flags
     assert output.asset_memo.requires_human_review is True
+    assert output.human_readable_summary is not None
+    assert output.human_readable_summary.module_name == "due_diligence"
+    assert "Agent 5" in output.human_readable_summary.handoff_summary
     assert bundle.sources
     assert bundle.claims
     assert bundle.validation_results
@@ -312,10 +317,97 @@ def test_due_diligence_workflow_persists_bundle(monkeypatch) -> None:
         "CommercialAssumptionsCriticAgent",
         "DiligenceRedTeamAgent",
         "AssetMemoAgent",
+        "Agent4HumanReadableSummaryAgent",
     }
     assert any(agent_output.agent_name == "AssetMemoAgent" for agent_output in bundle.agent_outputs)
+    assert any(agent_output.agent_name == "Agent4HumanReadableSummaryAgent" for agent_output in bundle.agent_outputs)
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in bundle.agent_traces)
+    payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
+    assert payload["human_readable_summary"]["module_name"] == "due_diligence"
     assert bundle.reports
+
+
+def test_due_diligence_synthesis_agent_uses_fallback_for_wrong_section(monkeypatch) -> None:
+    fallback = DueDiligenceSynthesisOutput(
+        output_id="ip-fallback",
+        agent_name="IPLOECriticAgent",
+        section="ip_loe",
+        synthesis="Fallback IP/LOE review.",
+        source_ids=("lens:fixture",),
+        confidence=0.6,
+    )
+    wrong = DueDiligenceSynthesisOutput(
+        output_id="wrong-section",
+        agent_name="SafetyDiligenceAgent",
+        section="safety",
+        synthesis="Wrong section output.",
+        source_ids=("label:fixture",),
+        confidence=0.6,
+    )
+
+    def fake_runtime(**kwargs):
+        return due_agent._synthesis_fallback_result(
+            agent_name=kwargs["agent_name"],
+            run_id=kwargs["run_id"],
+            input_summary=kwargs["input_summary"],
+            fallback_output=wrong,
+            source_ids=kwargs["source_ids"],
+            confidence=kwargs["confidence"],
+            rationale_summary=kwargs["rationale_summary"],
+            reason="test_wrong_section",
+        )
+
+    monkeypatch.setattr(due_agent, "_run_typed_agent", fake_runtime)
+
+    result = due_agent._run_synthesis_agent(
+        agent_name="IPLOECriticAgent",
+        section="ip_loe",
+        instructions="Review IP/LOE.",
+        fallback_output=fallback,
+        run_id="RUN",
+        source_ids=("lens:fixture",),
+        confidence=0.6,
+        payload={},
+        config=due_agent.AgentRuntimeConfig(disabled=False),
+    )
+
+    assert result.output.section == "ip_loe"
+    assert result.output.agent_name == "IPLOECriticAgent"
+    assert result.output.synthesis == "Fallback IP/LOE review."
+    assert result.trace_metadata["fallback_reason"].startswith("section_or_agent_mismatch")
+
+
+def test_due_diligence_synthesis_agent_uses_fallback_for_runtime_exception(monkeypatch) -> None:
+    fallback = DueDiligenceSynthesisOutput(
+        output_id="commercial-fallback",
+        agent_name="CommercialAssumptionsCriticAgent",
+        section="commercial_assumptions",
+        synthesis="Fallback commercial review.",
+        source_ids=("pricing:fixture",),
+        confidence=0.5,
+    )
+
+    def fail_runtime(**kwargs):
+        raise RuntimeError("live call failed")
+
+    monkeypatch.setattr(due_agent, "_run_typed_agent", fail_runtime)
+
+    result = due_agent._run_synthesis_agent(
+        agent_name="CommercialAssumptionsCriticAgent",
+        section="commercial_assumptions",
+        instructions="Review commercial assumptions.",
+        fallback_output=fallback,
+        run_id="RUN",
+        source_ids=("pricing:fixture",),
+        confidence=0.5,
+        payload={},
+        config=due_agent.AgentRuntimeConfig(disabled=False),
+    )
+
+    assert result.output.section == "commercial_assumptions"
+    assert result.output.agent_name == "CommercialAssumptionsCriticAgent"
+    assert result.output.synthesis == "Fallback commercial review."
+    assert result.trace_metadata["fallback_reason"] == "runtime_exception"
 
 
 def test_due_diligence_cli_persists_report(monkeypatch, tmp_path) -> None:

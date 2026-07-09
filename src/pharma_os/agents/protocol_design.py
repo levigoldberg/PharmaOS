@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -148,7 +149,7 @@ def run_protocol_design_manager_agent(
         payload={
             **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
             "search_plan": search_plan.output.model_dump(mode="json"),
-            "analog_candidates": [candidate.model_dump(mode="json") for candidate in analog_candidates],
+            "analog_candidates": [_compact_analog_candidate(candidate) for candidate in analog_candidates],
             "top_k": top_k,
         },
         fallback_output=select_analog_trials(
@@ -178,7 +179,7 @@ def run_protocol_design_manager_agent(
         input_summary=f"Interpret deterministic benchmark bundle {benchmark_bundle.bundle_id}.",
         payload={
             **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
-            "benchmark_bundle": benchmark_bundle.model_dump(mode="json"),
+            "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
         },
         fallback_output=_fallback_benchmark_interpretation(run_id, target_trial, benchmark_bundle),
         source_ids=benchmark_bundle.source_ids,
@@ -379,7 +380,7 @@ def _run_section_agent(
         input_summary=f"Draft source-grounded strategy sections for {target_trial.nct_id}.",
         payload={
             **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
-            "benchmark_bundle": benchmark_bundle.model_dump(mode="json"),
+            "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
             "benchmark_interpretation": benchmark_interpretation.model_dump(mode="json"),
         },
         fallback_output=fallback_output,
@@ -397,24 +398,33 @@ def _base_payload(
     source_ids: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
-        "target_trial": target_trial.model_dump(mode="json"),
+        "target_trial": _compact_trial_record(target_trial),
         "agent3_context": {
+            "output_id": agent3_output.output_id,
+            "run_id": agent3_output.run_id,
             "trial_identity": agent3_output.trial_identity.model_dump(mode="json"),
             "asset_identity": agent3_output.asset_identity.model_dump(mode="json"),
-            "trial_design_features": agent3_output.trial_design_features.model_dump(mode="json"),
+            "trial_design_features": _trim_payload(agent3_output.trial_design_features.model_dump(mode="json"), max_string_chars=1200),
             "endpoint_risk_assessment": agent3_output.endpoint_risk_assessment.model_dump(mode="json"),
             "enrollment_duration_risk": agent3_output.enrollment_duration_risk.model_dump(mode="json"),
             "failure_mode_classification": agent3_output.failure_mode_classification.model_dump(mode="json"),
             "safety_context": agent3_output.safety_context.model_dump(mode="json"),
-            "missing_data_flags": [flag.model_dump(mode="json") for flag in agent3_output.missing_data_flags],
+            "missing_data_flags": [flag.model_dump(mode="json") for flag in agent3_output.missing_data_flags[:20]],
         },
         "agent4_context": {
+            "output_id": agent4_output.output_id,
+            "run_id": agent4_output.run_id,
             "asset_identity": agent4_output.asset_identity.model_dump(mode="json"),
             "clinical_risk_summary": agent4_output.clinical_risk_summary.model_dump(mode="json"),
             "competitive_landscape": agent4_output.competitive_landscape.model_dump(mode="json"),
             "safety_label_summary": agent4_output.safety_label_summary.model_dump(mode="json"),
-            "red_flags": [flag.model_dump(mode="json") for flag in agent4_output.red_flags],
-            "missing_data_flags": [flag.model_dump(mode="json") for flag in agent4_output.missing_data_flags],
+            "patent_loe_review": agent4_output.patent_loe_review.model_dump(mode="json"),
+            "pricing": agent4_output.pricing.model_dump(mode="json"),
+            "pos": agent4_output.pos.model_dump(mode="json"),
+            "commercial_model": _trim_payload(agent4_output.commercial_model.model_dump(mode="json"), max_string_chars=1200),
+            "rnpv": _trim_payload(agent4_output.rnpv.model_dump(mode="json"), max_string_chars=1200),
+            "red_flags": [flag.model_dump(mode="json") for flag in agent4_output.red_flags[:20]],
+            "missing_data_flags": [flag.model_dump(mode="json") for flag in agent4_output.missing_data_flags[:25]],
         },
         "source_ids": source_ids,
         "guardrails": (
@@ -450,6 +460,108 @@ def _fallback_manager_plan(
         rationale_summary="Coordinate ambiguous protocol reasoning through scoped subagents while preserving deterministic retrieval, math, validation, persistence, and gates.",
         confidence=0.7 if not missing_data_flags else 0.55,
     )
+
+
+def _compact_trial_record(trial: ClinicalTrialRecord, *, eligibility_chars: int = 2500, endpoint_chars: int = 700) -> dict[str, Any]:
+    locations = tuple(trial.locations)
+    countries = sorted({location.country for location in locations if location.country})
+    return {
+        "nct_id": trial.nct_id,
+        "brief_title": _trim_text(trial.brief_title, 400),
+        "official_title": _trim_text(trial.official_title, 600),
+        "overall_status": trial.overall_status,
+        "phases": trial.phases,
+        "study_type": trial.study_type,
+        "conditions": trial.conditions,
+        "interventions": [item.model_dump(mode="json") for item in trial.interventions[:8]],
+        "lead_sponsor": trial.lead_sponsor.model_dump(mode="json") if trial.lead_sponsor else None,
+        "collaborators": [item.model_dump(mode="json") for item in trial.collaborators[:5]],
+        "enrollment_count": trial.enrollment_count,
+        "enrollment_type": trial.enrollment_type,
+        "start_date": trial.start_date,
+        "primary_completion_date": trial.primary_completion_date,
+        "completion_date": trial.completion_date,
+        "results_available": trial.results_available,
+        "primary_endpoints": [_compact_endpoint(item, endpoint_chars) for item in trial.primary_endpoints[:5]],
+        "secondary_endpoints": [_compact_endpoint(item, endpoint_chars) for item in trial.secondary_endpoints[:8]],
+        "locations_summary": {
+            "site_count": len(locations),
+            "countries": countries[:30],
+            "sample_locations": [item.model_dump(mode="json") for item in locations[:8]],
+        },
+        "eligibility_criteria": _trim_text(trial.eligibility_criteria, eligibility_chars),
+        "minimum_age": trial.minimum_age,
+        "maximum_age": trial.maximum_age,
+        "sex": trial.sex,
+        "source_id": trial.source_id,
+    }
+
+
+def _compact_endpoint(endpoint: Any, max_chars: int) -> dict[str, Any]:
+    payload = endpoint.model_dump(mode="json") if hasattr(endpoint, "model_dump") else dict(endpoint)
+    return {
+        **payload,
+        "measure": _trim_text(payload.get("measure"), max_chars),
+        "description": _trim_text(payload.get("description"), max_chars),
+    }
+
+
+def _compact_analog_candidate(candidate: AnalogCandidateRecord) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "trial": _compact_trial_record(candidate.trial, eligibility_chars=900, endpoint_chars=350),
+        "query_ids": candidate.query_ids,
+        "source_ids": candidate.source_ids,
+        "provenance": candidate.provenance,
+    }
+
+
+def _compact_benchmark_bundle(bundle: AnalogBenchmarkBundle) -> dict[str, Any]:
+    payload = bundle.model_dump(mode="json")
+    for key in (
+        "inclusion_themes",
+        "exclusion_themes",
+        "biomarker_testing_themes",
+        "prior_treatment_themes",
+        "safety_exclusion_themes",
+        "limitations",
+        "missing_data_flags",
+    ):
+        if isinstance(payload.get(key), list):
+            payload[key] = payload[key][:20]
+    return _trim_payload(payload, max_string_chars=900)
+
+
+def _trim_payload(value: Any, *, max_string_chars: int) -> Any:
+    if isinstance(value, str):
+        return _trim_text(value, max_string_chars)
+    if isinstance(value, list):
+        return [_trim_payload(item, max_string_chars=max_string_chars) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_trim_payload(item, max_string_chars=max_string_chars) for item in value)
+    if isinstance(value, dict):
+        return {key: _trim_payload(item, max_string_chars=max_string_chars) for key, item in value.items()}
+    return value
+
+
+def _trim_text(value: str | None, max_chars: int) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 20].rstrip() + " ... [truncated]"
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _fallback_benchmark_interpretation(
@@ -735,6 +847,7 @@ def build_search_strategy(
     endpoint_family = _endpoint_family(target_trial)
     comparator = _comparator_hint(target_trial)
     biomarker_or_line = _biomarker_or_line(target_trial)
+    query_limit = _env_int("PHARMA_OS_CTGV_MAX_RESULTS", 25, minimum=1, maximum=100)
 
     queries = [
         CTGovSearchQuery(
@@ -744,7 +857,7 @@ def build_search_strategy(
             endpoint_family=endpoint_family,
             comparator=comparator,
             biomarker_or_line=biomarker_or_line,
-            limit=25,
+            limit=query_limit,
             expected_analog_dimension="same indication and phase",
             rationale="Primary analog search anchored to target indication and phase from CT.gov and upstream handoffs.",
         )
@@ -757,7 +870,7 @@ def build_search_strategy(
                 phase=phase,
                 target_or_moa=modality,
                 endpoint_family=endpoint_family,
-                limit=25,
+                limit=query_limit,
                 expected_analog_dimension="same indication, phase, and modality",
                 rationale="Secondary analog search adds modality when upstream asset identity provides one.",
             )
@@ -770,7 +883,7 @@ def build_search_strategy(
                 intervention=asset,
                 phase=phase,
                 endpoint_family=endpoint_family,
-                limit=25,
+                limit=query_limit,
                 expected_analog_dimension="same asset or close asset-family context",
                 rationale="Asset-name search captures same-product studies when public registry records exist.",
             )

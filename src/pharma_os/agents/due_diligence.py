@@ -384,19 +384,73 @@ def _run_synthesis_agent(
     payload: dict[str, Any],
     config: AgentRuntimeConfig,
 ) -> StructuredAgentResult:
-    return _run_typed_agent(
+    input_summary = f"Interpret Agent 4 {section} evidence."
+    rationale_summary = f"{agent_name} synthesized {section} evidence without inventing facts."
+    try:
+        result = _run_typed_agent(
+            agent_name=agent_name,
+            instructions=instructions,
+            output_type=DueDiligenceSynthesisOutput,
+            run_id=run_id,
+            input_summary=input_summary,
+            payload=payload,
+            fallback_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            config=config,
+            rationale_summary=rationale_summary,
+        )
+    except Exception:
+        return _synthesis_fallback_result(
+            agent_name=agent_name,
+            run_id=run_id,
+            input_summary=input_summary,
+            fallback_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+            reason="runtime_exception",
+        )
+
+    if result.output.section != section or result.output.agent_name != agent_name:
+        return _synthesis_fallback_result(
+            agent_name=agent_name,
+            run_id=run_id,
+            input_summary=input_summary,
+            fallback_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+            reason=f"section_or_agent_mismatch:{result.output.agent_name}:{result.output.section}",
+        )
+    return result
+
+
+def _synthesis_fallback_result(
+    *,
+    agent_name: str,
+    run_id: str,
+    input_summary: str,
+    fallback_output: DueDiligenceSynthesisOutput,
+    source_ids: tuple[str, ...],
+    confidence: float,
+    rationale_summary: str,
+    reason: str,
+) -> StructuredAgentResult:
+    result = run_structured_llm_call(
         agent_name=agent_name,
-        instructions=instructions,
+        instructions="Validate deterministic Agent 4 fallback output.",
+        payload={"fallback_reason": reason, "fallback_output": fallback_output.model_dump(mode="json")},
         output_type=DueDiligenceSynthesisOutput,
         run_id=run_id,
-        input_summary=f"Interpret Agent 4 {section} evidence.",
-        payload=payload,
-        fallback_output=fallback_output,
+        input_summary=input_summary,
+        config=AgentRuntimeConfig(disabled=True, provenance="pharma_os.agents.due_diligence.synthesis_fallback"),
+        offline_output=fallback_output,
         source_ids=source_ids,
         confidence=confidence,
-        config=config,
-        rationale_summary=f"{agent_name} synthesized {section} evidence without inventing facts.",
+        rationale_summary=rationale_summary,
     )
+    return result.model_copy(update={"trace_metadata": {**result.trace_metadata, "fallback_reason": reason}})
 
 
 def _run_typed_agent(

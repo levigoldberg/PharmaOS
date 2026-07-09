@@ -45,6 +45,7 @@ from pharma_os.schemas import (
     TrialEndpoint,
     TrialIdentity,
     TrialIntervention,
+    TrialLocation,
     TrialSponsor,
     WorkflowRun,
 )
@@ -53,6 +54,7 @@ from pharma_os.validators import validate_protocol_design_constraints
 from pharma_os.workflows import protocol_design
 from pharma_os.workflows.protocol_design import run_protocol_design_workflow
 from pharma_os.agents.protocol_design import run_protocol_design_manager_agent
+from pharma_os.agents import protocol_design as protocol_design_agents
 
 
 def _source(source_id: str, source_type: str = "fixture") -> SourceMetadata:
@@ -233,6 +235,10 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert output.human_gate is not None
     assert output.human_gate.decision == "needs_human_review"
     assert output.validation_status == "needs_human_review"
+    assert output.human_readable_summary is not None
+    assert output.human_readable_summary.module_name == "protocol_design"
+    assert "Agent 3 run" in output.human_readable_summary.handoff_summary
+    assert "Agent 4 run" in output.human_readable_summary.handoff_summary
     bundle = store.get_run_bundle(output.run_id)
     assert bundle.run is not None
     assert bundle.agent_outputs
@@ -249,8 +255,10 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
         "StatisticalSkeletonAgent",
         "RegulatoryCriticAgent",
         "ProtocolBriefWriterAgent",
+        "Agent5HumanReadableSummaryAgent",
     }
     assert any(agent_output.agent_name == "ProtocolBriefWriterAgent" for agent_output in bundle.agent_outputs)
+    assert any(agent_output.agent_name == "Agent5HumanReadableSummaryAgent" for agent_output in bundle.agent_outputs)
     assert bundle.input_json is not None
     assert bundle.input_json["cli_input"]["nct_id"] == "NCT12345678"
     assert bundle.input_json["expanded_pipeline_input"]["target_trial"]["nct_id"] == "NCT12345678"
@@ -258,11 +266,13 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert bundle.input_json["expanded_pipeline_input"]["agent4_output"]["output_id"] == agent4.output_id
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
     assert payload["analog_benchmark_bundle"]["selected_analog_ids"]
+    assert payload["human_readable_summary"]["module_name"] == "protocol_design"
 
     html_path = write_run_html(output.run_id, "/tmp/protocol-design-agent5-test.html", memory=store)
     html = html_path.read_text(encoding="utf-8")
     assert "Agent Traces" in html
     assert "ProtocolBriefWriterAgent" in html
+    assert "Human-Readable Module Summary" in html
 
 
 def test_protocol_design_cli_command(monkeypatch, tmp_path) -> None:
@@ -344,6 +354,34 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> No
     assert result.section_outputs
     assert all(output.source_ids for output in result.section_outputs)
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in result.traces)
+
+
+def test_protocol_design_llm_base_payload_is_compact() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    long_trial = _target_trial().model_copy(
+        update={
+            "eligibility_criteria": "Inclusion Criteria: " + ("long eligibility text " * 500),
+            "locations": tuple(
+                TrialLocation(facility=f"Site {index}", city="City", state="State", country=f"Country {index % 40}")
+                for index in range(125)
+            ),
+        }
+    )
+
+    payload = protocol_design_agents._base_payload(
+        long_trial,
+        agent3,
+        agent4,
+        ("ctgov:NCT12345678", "agent_output:clinical_outcome_prediction:fixture", "agent_output:due_diligence:fixture"),
+    )
+
+    assert "locations" not in payload["target_trial"]
+    assert payload["target_trial"]["locations_summary"]["site_count"] == 125
+    assert len(payload["target_trial"]["locations_summary"]["sample_locations"]) == 8
+    assert len(payload["target_trial"]["locations_summary"]["countries"]) <= 30
+    assert len(payload["target_trial"]["eligibility_criteria"]) < 2600
+    assert payload["agent3_context"]["output_id"] == agent3.output_id
+    assert payload["agent4_context"]["output_id"] == agent4.output_id
 
 
 def test_protocol_design_validator_blocks_over_final_language(monkeypatch) -> None:

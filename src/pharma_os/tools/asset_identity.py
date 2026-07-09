@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pharma_os.schemas import AssetIdentityOutput, ClinicalTrialRecord, MissingDataFlag, SourceMetadata
@@ -84,7 +85,15 @@ def resolve_asset_identity(
     if modality == "unknown":
         flags.append(missing("asset-unknown-modality", "asset_identity", "modality", "No deterministic modality rule matched.", "medium"))
 
-    aliases = tuple(dict.fromkeys([*(selected.other_names if selected else ()), *(rxnorm_match.aliases if rxnorm_match else ())]))
+    aliases = tuple(
+        dict.fromkeys(
+            [
+                *(selected.other_names if selected else ()),
+                *_title_code_aliases(trial),
+                *(rxnorm_match.aliases if rxnorm_match else ()),
+            ]
+        )
+    )
     confidence = 0.85 - min(len(flags), 4) * 0.15
     return (
         AssetIdentityOutput(
@@ -115,6 +124,18 @@ def _infer_modality(selected: Any) -> tuple[str, str | None]:
         if any(keyword in text for keyword in keywords):
             return str(rule.get("modality")), str(rule.get("id") or "modality_rule")
     return str(config.get("default", "unknown")), None
+
+
+def _title_code_aliases(trial: ClinicalTrialRecord) -> tuple[str, ...]:
+    """Extract asset-like development codes from CT.gov titles."""
+
+    text = " ".join(item for item in (trial.brief_title, trial.official_title) if item)
+    aliases = []
+    for match in re.finditer(r"\b[A-Z]{2,}[A-Z0-9]*-\d+[A-Z0-9]*\b", text):
+        alias = match.group(0)
+        if alias.casefold() != "placebo":
+            aliases.append(alias)
+    return tuple(dict.fromkeys(aliases))
 
 
 def _infer_indication(trial: ClinicalTrialRecord) -> tuple[str | None, str | None, str | None]:

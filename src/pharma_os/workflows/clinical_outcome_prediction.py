@@ -12,6 +12,7 @@ from pharma_os.agents.clinical_outcome_prediction import (
     ClinicalOutcomePredictionAgentResult,
     run_clinical_outcome_prediction_agent_result,
 )
+from pharma_os.human_readable import build_human_readable_module_output
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -123,6 +124,13 @@ def run_clinical_outcome_prediction_workflow(
             "validation_status": validation_status,
         }
     )
+    human_readable_result = build_human_readable_module_output(
+        module_name="clinical_outcome_prediction",
+        module_display_name="Agent 3 Clinical Outcome Prediction",
+        run_id=run_id,
+        typed_output=output,
+    )
+    output = output.model_copy(update={"human_readable_summary": human_readable_result.output})
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
@@ -148,6 +156,16 @@ def run_clinical_outcome_prediction_workflow(
             payload=payload,
         )
     store.save_agent_traces(agent_traces)
+    store.save_agent_trace(human_readable_result.trace)
+    store.save_agent_output(
+        _human_readable_output_envelope(
+            run_id=run_id,
+            payload=human_readable_result.output,
+            sources=output.sources,
+            validation_status=validation_status,
+        ),
+        payload=human_readable_result.output,
+    )
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
     store.save_confidence_flags(run_id, confidence_flags)
@@ -170,6 +188,7 @@ def run_clinical_outcome_prediction_workflow(
             "manager_agent": "ClinicalOutcomeManagerAgent",
             "subagent_trace_count": len(agent_traces),
             "subagent_output_count": len(subagent_payloads),
+            "human_readable_summary_output_id": human_readable_result.output.output_id,
         },
     )
     build_report(run_id, memory=store)
@@ -204,6 +223,27 @@ def _subagent_output_envelope(
         agent_name=agent_name,
         run_id=run_id,
         provenance="PharmaOS Agent 3 subagent typed output",
+        claims=(),
+        sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
+        confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
+        validation_status=validation_status,  # type: ignore[arg-type]
+    )
+
+
+def _human_readable_output_envelope(
+    *,
+    run_id: str,
+    payload: BaseModel,
+    sources: tuple[SourceMetadata, ...],
+    validation_status: str,
+) -> AgentOutput:
+    known_sources = {source.source_id: source for source in sources}
+    payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
+    return AgentOutput(
+        output_id=f"agent-output-{run_id}-{payload.output_id}",
+        agent_name="Agent3HumanReadableSummaryAgent",
+        run_id=run_id,
+        provenance="PharmaOS Agent 3 human-readable structured output",
         claims=(),
         sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
         confidence=float(getattr(payload, "confidence", 0.5) or 0.5),

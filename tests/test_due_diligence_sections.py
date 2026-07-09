@@ -41,6 +41,8 @@ from pharma_os.schemas import (
 )
 from pharma_os.tools.pubmed import PubMedClient
 from pharma_os.tools.patents_lens import search_patent_exclusivity
+from pharma_os.tools.pos import lookup_pos
+from pharma_os.tools.pricing import lookup_pricing
 
 
 def _source(source_id: str) -> SourceMetadata:
@@ -178,6 +180,106 @@ def test_lens_patent_search_with_mocked_api(monkeypatch) -> None:
     assert review.candidate_count == 1
     assert review.estimated_loe_year == 2040
     assert sources[0].source_id == "lens:examplemab"
+
+
+def test_lens_patent_search_estimates_loe_from_candidate_dates(monkeypatch) -> None:
+    monkeypatch.setenv("LENS_API_TOKEN", "test-token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "lens_id": "123-456",
+                        "biblio": {
+                            "invention_title": ["Example TYK2 inhibitor"],
+                            "application_reference": {"date": "2024-09-20"},
+                        },
+                        "jurisdiction": "US",
+                        "date_published": "2026-04-21",
+                        "legal_status": "ACTIVE",
+                    }
+                ]
+            },
+        )
+
+    patent, _sources = search_patent_exclusivity(
+        AssetIdentityOutput(nct_id="NCT12345678", asset_name="Examplemab", sponsor="Example Bio", aliases=("EX-001",), confidence=0.9),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    review = build_patent_loe_review(patent)
+
+    assert patent.estimated_loe_year == 2044
+    assert not any(flag.flag_id == "patent-loe-review-required" for flag in patent.missing_data_flags)
+    assert "Source-derived LOE year is 2044" in review.review_summary
+
+
+def test_pos_maps_sle_to_autoimmune_workbook_row() -> None:
+    pos, source = lookup_pos(
+        ClinicalTrialRecord(
+            nct_id="NCT05966480",
+            phases=("PHASE2",),
+            conditions=("SLE",),
+            interventions=(TrialIntervention(name="Envudeucitinib", type="DRUG"),),
+            lead_sponsor=TrialSponsor(name="Alumis Inc"),
+            source_id="ctgov:NCT05966480",
+        ),
+        AssetIdentityOutput(
+            nct_id="NCT05966480",
+            asset_name="Envudeucitinib",
+            aliases=("ESK-001",),
+            normalized_indication="SLE",
+            modality="small molecule",
+            confidence=0.7,
+        ),
+    )
+
+    assert source.source_id.startswith("pos_workbook:")
+    assert pos.current_phase == "Phase II"
+    assert pos.disease_area == "Autoimmune"
+    assert pos.lookup_key == "Disease Area|Autoimmune|Phase II"
+    assert pos.probability_of_success is not None
+    assert not pos.missing_data_flags
+
+
+def test_pricing_uses_sle_analog_wac_and_openfda_dosing() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = str(request.url.params.get("search", ""))
+        if "Benlysta" not in query and "belimumab" not in query:
+            return httpx.Response(404, json={})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "dosage_and_administration": [
+                            "For adult patients with active systemic lupus erythematosus, administer 200 mg subcutaneously once weekly."
+                        ]
+                    }
+                ]
+            },
+        )
+
+    pricing, sources = lookup_pricing(
+        AssetIdentityOutput(
+            nct_id="NCT05966480",
+            asset_name="Envudeucitinib",
+            aliases=("ESK-001",),
+            normalized_indication="SLE",
+            modality="small molecule",
+            confidence=0.7,
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert pricing.wac_value == 1210.63
+    assert pricing.annual_wac == 62952.76
+    assert pricing.matched_product and "Benlysta" in pricing.matched_product
+    assert pricing.dosing_summary and "once weekly" in pricing.dosing_summary
+    assert not any(flag.flag_id == "pricing-no-wac-match" for flag in pricing.missing_data_flags)
+    assert "wac:california-wac-data-xlsx" in {source.source_id for source in sources}
+    assert "openfda_label:benlysta" in {source.source_id for source in sources}
 
 
 def test_red_flags_and_memo_assembly_cover_noncalculable_sections() -> None:

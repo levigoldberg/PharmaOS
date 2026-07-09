@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Iterable
 
 import httpx
@@ -56,7 +57,7 @@ def build_clinical_evidence_summary(
     ]
     if query:
         try:
-            articles = (pubmed_client or PubMedClient()).search(query, max_results=5)
+            articles = (pubmed_client or PubMedClient()).search(query, max_results=_env_int("PHARMA_OS_PUBMED_MAX_RESULTS", 5, minimum=0, maximum=50))
             for article in articles:
                 source = article.source()
                 sources.append(source)
@@ -163,8 +164,10 @@ def build_patent_loe_review(patent: PatentExclusivityOutput) -> PatentLOEReview:
 
     if patent.estimated_loe_year is None:
         summary = "No reviewed LOE year is available; Agent 4 does not invent or default LOE."
-    elif patent.candidates:
+    elif any(source_id.startswith("human_override:loe:") for source_id in patent.source_ids):
         summary = f"Reviewed LOE year is {patent.estimated_loe_year}; {len(patent.candidates)} Lens candidates were retrieved."
+    elif patent.candidates:
+        summary = f"Source-derived LOE year is {patent.estimated_loe_year} based on Lens patent-date evidence across {len(patent.candidates)} retrieved candidates; IP counsel review is still required."
     else:
         summary = f"Reviewed LOE year is {patent.estimated_loe_year}; no Lens patent family was selected from retrieved candidates."
     return PatentLOEReview(
@@ -327,3 +330,14 @@ def _trim(value: str | None, limit: int = 1000) -> str | None:
         return None
     compact = " ".join(value.split())
     return compact[:limit]
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))

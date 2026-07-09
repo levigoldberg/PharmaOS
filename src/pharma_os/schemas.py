@@ -288,6 +288,40 @@ class ClinicalOutcomePredictionInput(StrictSchema):
     pos_workbook_path: str | None = Field(default=None, description="Optional local PoS workbook path.")
 
 
+class HumanReadableFinding(StrictSchema):
+    """One human-facing source-grounded finding from a workflow module."""
+
+    title: str = Field(..., min_length=1)
+    detail: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class HumanReadableModuleOutput(StrictSchema):
+    """Structured human-readable summary generated from a typed workflow output."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    module_name: Literal[
+        "clinical_outcome_prediction",
+        "due_diligence",
+        "protocol_design",
+        "trial_intelligence",
+    ]
+    module_display_name: str = Field(..., min_length=1)
+    source_output_id: str = Field(..., min_length=1)
+    headline: str = Field(..., min_length=1)
+    plain_language_summary: str = Field(..., min_length=1)
+    key_takeaways: tuple[str, ...] = Field(default_factory=tuple)
+    key_findings: tuple[HumanReadableFinding, ...] = Field(default_factory=tuple)
+    handoff_summary: str = Field(..., min_length=1)
+    limitations: tuple[str, ...] = Field(default_factory=tuple)
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    provenance: str = Field(..., min_length=1)
+
+
 class AssumptionRecord(StrictSchema):
     """A numeric or categorical assumption used by a deterministic calculator."""
 
@@ -616,6 +650,7 @@ class ClinicalOutcomePredictionOutput(StrictSchema):
     validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
+    human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
 
@@ -854,6 +889,7 @@ class DueDiligenceOutput(StrictSchema):
     validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
+    human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
 
@@ -1109,6 +1145,7 @@ class ProtocolDesignOutput(StrictSchema):
     validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
+    human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
 

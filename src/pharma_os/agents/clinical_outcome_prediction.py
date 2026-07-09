@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -982,7 +983,7 @@ def _comparator_benchmarks(
         landscape = search_trial_landscape(
             disease=condition,
             phase=phase,
-            limit=10,
+            limit=_env_int("PHARMA_OS_CTGV_MAX_RESULTS", 10, minimum=1, maximum=100),
             run_id=f"{run_id}-agent3-landscape",
             client=client,
         )
@@ -1449,6 +1450,17 @@ def _dedupe_missing_flags(flags: tuple[MissingDataFlag, ...]) -> tuple[MissingDa
     for flag in flags:
         deduped[flag.flag_id] = flag
     return tuple(deduped.values())
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def _first_text(value: Any) -> str | None:

@@ -54,6 +54,7 @@ def build_run_html(run_id: str, *, memory: MemoryStore | None = None) -> str:
                     "input_provenance": run.input_provenance,
                 }
             ),
+            _human_readable_summary_section(bundle.output_json),
             _json_details("Input JSON", bundle.input_json),
             _json_details("Output JSON", bundle.output_json),
             _json_details("Trace Metadata", bundle.trace_metadata_json),
@@ -78,6 +79,35 @@ def write_run_html(run_id: str, output_html: str | Path, *, memory: MemoryStore 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(build_run_html(run_id, memory=memory), encoding="utf-8")
     return output_path
+
+
+def _human_readable_summary_section(output_json: Any) -> str:
+    if not isinstance(output_json, dict):
+        return "<h2>Human-Readable Module Summary</h2><p class='muted'>None.</p>"
+    summary = output_json.get("human_readable_summary")
+    if not isinstance(summary, dict):
+        return "<h2>Human-Readable Module Summary</h2><p class='muted'>None.</p>"
+    findings = summary.get("key_findings") if isinstance(summary.get("key_findings"), list) else []
+    findings_html = "".join(
+        "<li>"
+        f"<strong>{escape(_display(finding.get('title') if isinstance(finding, dict) else 'Finding'))}</strong>: "
+        f"{escape(_display(finding.get('detail') if isinstance(finding, dict) else finding))}"
+        "</li>"
+        for finding in findings
+    )
+    takeaways = summary.get("key_takeaways") if isinstance(summary.get("key_takeaways"), list) else []
+    takeaways_html = "".join(f"<li>{escape(_display(item))}</li>" for item in takeaways)
+    limitations = summary.get("limitations") if isinstance(summary.get("limitations"), list) else []
+    limitations_html = "".join(f"<li>{escape(_display(item))}</li>" for item in limitations)
+    return (
+        "<h2>Human-Readable Module Summary</h2>"
+        f"<h3>{escape(_display(summary.get('headline')))}</h3>"
+        f"<p>{escape(_display(summary.get('plain_language_summary')))}</p>"
+        f"<p><strong>Handoff:</strong> {escape(_display(summary.get('handoff_summary')))}</p>"
+        f"<h4>Key Takeaways</h4><ul>{takeaways_html or '<li>None.</li>'}</ul>"
+        f"<h4>Key Findings</h4><ul>{findings_html or '<li>None.</li>'}</ul>"
+        f"<h4>Limitations</h4><ul>{limitations_html or '<li>None.</li>'}</ul>"
+    )
 
 
 def _table_section(title: str, rows: tuple[Any, ...], fields: tuple[str, ...]) -> str:

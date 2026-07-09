@@ -144,9 +144,70 @@ def run_structured_agent(
             max_turns=effective_max_turns,
         )
     except TypeError:
-        response = Runner.run_sync(agent, _payload_json(payload))
+        try:
+            response = Runner.run_sync(agent, _payload_json(payload))
+        except Exception as exc:
+            if offline_output is None:
+                raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
+            output = _validate_output(offline_output, output_type)
+            completed_at = datetime.now(timezone.utc)
+            return StructuredAgentResult(
+                output=output,
+                trace=_trace(
+                    run_id=run_id,
+                    agent_name=agent_name,
+                    input_summary=input_summary,
+                    output=output,
+                    started_at=started_at,
+                    completed_at=completed_at,
+                    source_ids=source_ids,
+                    confidence=confidence,
+                    rationale_summary=rationale_summary
+                    or "Agents SDK call failed; offline structured output was validated as fallback.",
+                    tool_calls=(),
+                    provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
+                ),
+                trace_metadata={
+                    "agent_name": agent_name,
+                    "model": settings.model,
+                    "max_turns": effective_max_turns,
+                    "disabled": False,
+                    "fallback": True,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc)[:500],
+                },
+            )
     except Exception as exc:
-        raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
+        if offline_output is None:
+            raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
+        output = _validate_output(offline_output, output_type)
+        completed_at = datetime.now(timezone.utc)
+        return StructuredAgentResult(
+            output=output,
+            trace=_trace(
+                run_id=run_id,
+                agent_name=agent_name,
+                input_summary=input_summary,
+                output=output,
+                started_at=started_at,
+                completed_at=completed_at,
+                source_ids=source_ids,
+                confidence=confidence,
+                rationale_summary=rationale_summary
+                or "Agents SDK call failed; offline structured output was validated as fallback.",
+                tool_calls=(),
+                provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
+            ),
+            trace_metadata={
+                "agent_name": agent_name,
+                "model": settings.model,
+                "max_turns": effective_max_turns,
+                "disabled": False,
+                "fallback": True,
+                "error_type": exc.__class__.__name__,
+                "error": str(exc)[:500],
+            },
+        )
 
     parsed = getattr(response, "final_output", response)
     output = _validate_output(parsed, output_type)

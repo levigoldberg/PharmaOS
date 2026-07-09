@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from pharma_os.agents.protocol_design import build_search_strategy, run_protocol_design_manager_agent, select_analog_trials
+from pharma_os.human_readable import build_human_readable_module_output
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -219,6 +220,13 @@ def run_protocol_design_workflow(
             "validation_status": validation_status,
         }
     )
+    human_readable_result = build_human_readable_module_output(
+        module_name="protocol_design",
+        module_display_name="Agent 5 Protocol Design",
+        run_id=run_id,
+        typed_output=output,
+    )
+    output = output.model_copy(update={"human_readable_summary": human_readable_result.output})
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
@@ -244,6 +252,16 @@ def run_protocol_design_workflow(
             payload=payload,
         )
     store.save_agent_traces(manager_result.traces)
+    store.save_agent_trace(human_readable_result.trace)
+    store.save_agent_output(
+        _human_readable_output_envelope(
+            run_id=run_id,
+            payload=human_readable_result.output,
+            sources=sources,
+            validation_status=validation_status,
+        ),
+        payload=human_readable_result.output,
+    )
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
     store.save_confidence_flags(run_id, confidence_flags)
@@ -277,6 +295,7 @@ def run_protocol_design_workflow(
             "subagent_trace_count": len(manager_result.traces),
             "subagent_output_count": len(manager_result.subagent_payloads),
             "agent_runtime_mode": _agent_runtime_mode(manager_result.traces),
+            "human_readable_summary_output_id": human_readable_result.output.output_id,
         },
     )
     build_report(run_id, memory=store)
@@ -423,11 +442,11 @@ def _expanded_protocol_design_input(
     return {
         "cli_input": input_data.model_dump(mode="json"),
         "expanded_pipeline_input": {
-            "target_trial": target_trial.model_dump(mode="json") if hasattr(target_trial, "model_dump") else str(target_trial),
+            "target_trial": _compact_trial_input(target_trial),
             "agent3_handoff": agent3_handoff.model_dump(mode="json"),
-            "agent3_output": agent3_output.model_dump(mode="json"),
+            "agent3_output": _compact_agent3_input(agent3_output),
             "agent4_handoff": agent4_handoff.model_dump(mode="json"),
-            "agent4_output": agent4_output.model_dump(mode="json"),
+            "agent4_output": _compact_agent4_input(agent4_output),
             "assumptions": [
                 assumption.model_dump(mode="json") if hasattr(assumption, "model_dump") else str(assumption)
                 for assumption in assumptions
@@ -438,6 +457,66 @@ def _expanded_protocol_design_input(
             ],
             "initial_source_ids": source_ids,
         },
+    }
+
+
+def _compact_trial_input(target_trial: object) -> dict[str, object]:
+    if not hasattr(target_trial, "model_dump"):
+        return {"summary": str(target_trial)}
+    payload = target_trial.model_dump(mode="json")
+    locations = payload.get("locations") if isinstance(payload.get("locations"), list) else []
+    countries = sorted({item.get("country") for item in locations if isinstance(item, dict) and item.get("country")})
+    return {
+        "nct_id": payload.get("nct_id"),
+        "brief_title": payload.get("brief_title"),
+        "overall_status": payload.get("overall_status"),
+        "phases": payload.get("phases"),
+        "conditions": payload.get("conditions"),
+        "enrollment_count": payload.get("enrollment_count"),
+        "primary_endpoint_count": len(payload.get("primary_endpoints") or []),
+        "secondary_endpoint_count": len(payload.get("secondary_endpoints") or []),
+        "site_count": len(locations),
+        "countries": countries[:30],
+        "source_id": payload.get("source_id"),
+    }
+
+
+def _compact_agent3_input(output: ClinicalOutcomePredictionOutput) -> dict[str, object]:
+    return {
+        "output_id": output.output_id,
+        "run_id": output.run_id,
+        "nct_id": output.input.nct_id,
+        "asset_name": output.asset_identity.asset_name,
+        "endpoint_risk_level": output.endpoint_risk_assessment.risk_level,
+        "enrollment_duration_risk_level": output.enrollment_duration_risk.risk_level,
+        "historical_pos": output.historical_pos_estimate.probability_of_success,
+        "historical_pos_lookup_key": output.historical_pos_estimate.lookup_key,
+        "missing_data_flag_ids": [flag.flag_id for flag in output.missing_data_flags],
+        "source_ids": [source.source_id for source in output.sources],
+        "confidence": output.confidence,
+        "validation_status": output.validation_status,
+    }
+
+
+def _compact_agent4_input(output: DueDiligenceOutput) -> dict[str, object]:
+    return {
+        "output_id": output.output_id,
+        "run_id": output.run_id,
+        "nct_id": output.input.nct_id,
+        "asset_name": output.asset_identity.asset_name,
+        "red_flag_ids": [flag.flag_id for flag in output.red_flags],
+        "missing_data_flag_ids": [flag.flag_id for flag in output.missing_data_flags],
+        "pos": {
+            "probability_of_success": output.pos.probability_of_success,
+            "lookup_key": output.pos.lookup_key,
+        },
+        "patent_loe_year": output.patent_exclusivity.estimated_loe_year,
+        "annual_wac": output.pricing.annual_wac,
+        "commercial_calculable": output.commercial_model.calculable,
+        "rnpv_calculable": output.rnpv.calculable,
+        "source_ids": [source.source_id for source in output.sources],
+        "confidence": output.confidence,
+        "validation_status": output.validation_status,
     }
 
 
@@ -502,6 +581,27 @@ def _subagent_output_envelope(
         agent_name=agent_name,
         run_id=run_id,
         provenance="PharmaOS Agent 5 subagent typed output",
+        claims=(),
+        sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
+        confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
+        validation_status=validation_status,  # type: ignore[arg-type]
+    )
+
+
+def _human_readable_output_envelope(
+    *,
+    run_id: str,
+    payload: object,
+    sources: tuple[SourceMetadata, ...],
+    validation_status: str,
+) -> AgentOutput:
+    known_sources = {source.source_id: source for source in sources}
+    payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
+    return AgentOutput(
+        output_id=f"agent-output-{run_id}-{getattr(payload, 'output_id', payload.__class__.__name__)}",
+        agent_name="Agent5HumanReadableSummaryAgent",
+        run_id=run_id,
+        provenance="PharmaOS Agent 5 human-readable structured output",
         claims=(),
         sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
         confidence=float(getattr(payload, "confidence", 0.5) or 0.5),

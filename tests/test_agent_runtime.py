@@ -178,6 +178,34 @@ def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> No
     assert result.trace_metadata["error_type"] == "RuntimeError"
 
 
+def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
+    class FailingRunner:
+        @staticmethod
+        def run_sync(*args, **kwargs):
+            raise RuntimeError("context_length_exceeded")
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, FailingRunner, object),
+    )
+
+    result = run_structured_agent(
+        agent=object(),
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        agent_name="fixture_agent",
+        run_id="RUN",
+        input_summary="Fixture input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert result.trace.provenance == "pharma_os.agent_runtime.openai_agents_sdk_fallback"
+    assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["error_type"] == "RuntimeError"
+
+
 def test_runtime_config_enables_live_agents_when_api_key_present(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)

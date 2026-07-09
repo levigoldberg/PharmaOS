@@ -202,6 +202,10 @@ def test_clinical_outcome_prediction_workflow_persists_bundle(monkeypatch) -> No
     assert output.comparator_benchmarking.risk_flags
     assert output.failure_mode_classification.likely_failure_modes
     assert any(flag.status == "not_implemented" for flag in output.source_availability.flags)
+    assert output.human_readable_summary is not None
+    assert output.human_readable_summary.module_name == "clinical_outcome_prediction"
+    assert output.human_readable_summary.key_findings
+    assert "Agent 4" in output.human_readable_summary.handoff_summary
     assert bundle.sources
     assert bundle.claims
     assert bundle.validation_results
@@ -214,6 +218,10 @@ def test_clinical_outcome_prediction_workflow_persists_bundle(monkeypatch) -> No
     assert "EnrollmentFeasibilityAgent" in trace_agents
     assert "SafetyContextAgent" in trace_agents
     assert "FailureModeSynthesisAgent" in trace_agents
+    assert "Agent3HumanReadableSummaryAgent" in trace_agents
+    assert any(agent_output.agent_name == "Agent3HumanReadableSummaryAgent" for agent_output in bundle.agent_outputs)
+    payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
+    assert payload["human_readable_summary"]["module_name"] == "clinical_outcome_prediction"
     assert bundle.reports
 
 
