@@ -737,6 +737,41 @@ class AssetMemo(StrictSchema):
     confidence: float = Field(default=0.0, ge=0, le=1)
 
 
+class DueDiligenceManagerPlan(StrictSchema):
+    """Manager-agent plan for coordinating Agent 4 diligence synthesis."""
+
+    output_id: str = Field(..., min_length=1)
+    nct_id: str = Field(..., min_length=1)
+    ordered_steps: tuple[str, ...] = Field(default_factory=tuple)
+    guardrail_summary: str = Field(..., min_length=1)
+    rationale_summary: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class DueDiligenceSynthesisOutput(StrictSchema):
+    """Typed output from an Agent 4 synthesis or critic subagent."""
+
+    output_id: str = Field(..., min_length=1)
+    agent_name: str = Field(..., min_length=1)
+    section: Literal[
+        "clinical_evidence",
+        "competitive_landscape",
+        "safety",
+        "ip_loe",
+        "commercial_assumptions",
+        "red_team",
+    ]
+    synthesis: str = Field(..., min_length=1)
+    limitations: tuple[str, ...] = Field(default_factory=tuple)
+    review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    red_flags: tuple[DiligenceRedFlag, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
 class DueDiligenceOutput(StrictSchema):
     """Structured PharmaOS due-diligence workflow output."""
 
@@ -933,6 +968,46 @@ class ProtocolReviewerCritique(StrictSchema):
     confidence: float = Field(default=0.5, ge=0, le=1)
 
 
+class ProtocolDesignManagerPlan(StrictSchema):
+    """Manager-agent plan for coordinating Agent 5 subagents."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    ordered_steps: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    guardrail_summary: str = Field(..., min_length=1)
+    rationale_summary: str = Field(..., min_length=1)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class BenchmarkInterpretation(StrictSchema):
+    """Agent interpretation of deterministic analog benchmark findings."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    common_design_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    target_alignment: tuple[str, ...] = Field(default_factory=tuple)
+    target_misalignment: tuple[str, ...] = Field(default_factory=tuple)
+    strategy_implications: tuple[str, ...] = Field(default_factory=tuple)
+    weak_or_incomplete_findings: tuple[str, ...] = Field(default_factory=tuple)
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ProtocolSectionAgentOutput(StrictSchema):
+    """Typed output from a section-specific protocol strategy subagent."""
+
+    output_id: str = Field(..., min_length=1)
+    agent_name: str = Field(..., min_length=1)
+    sections: tuple[ProtocolSectionDraft, ...] = Field(default_factory=tuple)
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
 class ProtocolDesignBrief(StrictSchema):
     """Source-grounded draft protocol design strategy artifact."""
 
@@ -983,6 +1058,58 @@ class ProtocolDesignOutput(StrictSchema):
     human_gate: HumanGate | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
+
+
+class AgentToolCallTrace(StrictSchema):
+    """Safe, user-readable trace for one agent tool call."""
+
+    run_id: str = Field(..., min_length=1)
+    agent_name: str = Field(..., min_length=1)
+    step_id: str = Field(..., min_length=1)
+    tool_name: str = Field(..., min_length=1)
+    input_summary: str | None = None
+    output_summary: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    provenance: str = Field(..., min_length=1)
+
+
+class AgentStepTrace(StrictSchema):
+    """Safe, user-readable trace for one agent step."""
+
+    run_id: str = Field(..., min_length=1)
+    agent_name: str = Field(..., min_length=1)
+    step_id: str = Field(..., min_length=1)
+    input_summary: str | None = None
+    output_summary: str | None = None
+    tool_calls: tuple[AgentToolCallTrace, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    provenance: str = Field(..., min_length=1)
+
+
+class AgentRunTrace(StrictSchema):
+    """Safe, reportable trace for an agent run without hidden reasoning."""
+
+    trace_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    agent_name: str = Field(..., min_length=1)
+    input_summary: str | None = None
+    output_id: str | None = None
+    output_type: str | None = None
+    output_summary: str | None = None
+    steps: tuple[AgentStepTrace, ...] = Field(default_factory=tuple)
+    tool_calls: tuple[AgentToolCallTrace, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    rationale_summary: str | None = None
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    completed_at: datetime | None = None
+    provenance: str = Field(..., min_length=1)
 
 
 class AgentOutput(StrictSchema):

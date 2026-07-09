@@ -342,7 +342,9 @@ def validate_protocol_design_constraints(
         "drugbank": r"drugbank",
         "proprietary_data": r"proprietary data",
         "fake_patient_site_enrollment": r"fake patient|fake site|invented enrollment",
-        "approval_logic": r"final approval|approve the protocol|protocol approved|submission-ready|irb-ready",
+        "approval_logic": r"final approval|approve the protocol|protocol approved|submission-ready|irb-ready|enrollment-ready|go\s*/?\s*no-go|go decision|no-go decision",
+        "final_protocol_language": r"\b(?:is|as|approved as)\s+(?:a\s+)?final protocol\b|\b(?:is|as|approved as)\s+(?:the\s+)?final design\b|\brecommended design\b|\brecommended protocol\b",
+        "invented_statistical_design": r"\b(sample size|power|effect size|alpha allocation)\s+(?:is|=|of)\s+\d",
     }
     findings: list[str] = []
     for name, pattern in disallowed_patterns.items():

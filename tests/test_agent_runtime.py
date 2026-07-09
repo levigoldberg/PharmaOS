@@ -1,37 +1,50 @@
 from __future__ import annotations
 
-from types import ModuleType, SimpleNamespace
+import pytest
+from pydantic import Field
 
-from pharma_os.agents.runtime import run_agent
-from pharma_os.schemas import ClinicalTrialIntelligenceInput, ClinicalTrialIntelligenceOutput
+from pharma_os.agent_runtime import AgentRuntimeConfig, AgentRuntimeError, run_structured_agent
+from pharma_os.schemas import StrictSchema
 
 
-def test_run_agent_validates_final_output(monkeypatch) -> None:
-    output = ClinicalTrialIntelligenceOutput(
-        output_id="output-1",
+class FixtureOutput(StrictSchema):
+    output_id: str = Field(..., min_length=1)
+    summary: str = Field(..., min_length=1)
+    confidence: float = Field(..., ge=0, le=1)
+
+
+def test_run_structured_agent_offline_validates_output_and_trace() -> None:
+    result = run_structured_agent(
+        agent=object(),
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        agent_name="fixture_agent",
         run_id="RUN",
-        input=ClinicalTrialIntelligenceInput(disease="glioblastoma"),
-        landscape_summary="No trials found.",
-        status_summary="No status values were available.",
-        phase_summary="No phase values were available.",
-        sponsor_summary="No sponsor values were available.",
-        endpoint_summary="0 primary endpoints were normalized across 0 trials.",
-        population_summary="No enrollment counts were available.",
+        input_summary="Fixture input.",
+        config=AgentRuntimeConfig(model="test-model", max_turns=3, disabled=True),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+        source_ids=("ctgov:NCT12345678",),
+        confidence=0.7,
+        rationale_summary="Fixture rationale summary.",
     )
 
-    class Runner:
-        @staticmethod
-        def run_sync(agent, payload):
-            return SimpleNamespace(final_output=output, trace_id="trace-1")
+    assert isinstance(result.output, FixtureOutput)
+    assert result.trace.agent_name == "fixture_agent"
+    assert result.trace.output_id == "OUT"
+    assert result.trace.output_type == "FixtureOutput"
+    assert result.trace.rationale_summary == "Fixture rationale summary."
+    assert result.trace_metadata["disabled"] is True
+    assert "chain" not in result.trace.model_dump_json().casefold()
 
-    module = ModuleType("agents")
-    module.Agent = object
-    module.AgentOutputSchema = object
-    module.Runner = Runner
-    module.function_tool = lambda func: func
-    monkeypatch.setitem(__import__("sys").modules, "agents", module)
 
-    result = run_agent(object(), {"input": "test"}, ClinicalTrialIntelligenceOutput)
-
-    assert result.output == output
-    assert result.trace_metadata["trace_id"] == "trace-1"
+def test_run_structured_agent_offline_requires_fixture_output() -> None:
+    with pytest.raises(AgentRuntimeError, match="disabled/offline"):
+        run_structured_agent(
+            agent=object(),
+            payload={},
+            output_type=FixtureOutput,
+            agent_name="fixture_agent",
+            run_id="RUN",
+            input_summary="Fixture input.",
+            config=AgentRuntimeConfig(disabled=True),
+        )

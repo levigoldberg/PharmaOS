@@ -6,13 +6,7 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from pharma_os.agents.protocol_design import (
-    build_eligibility_and_schedule_sections,
-    build_protocol_strategy_sections,
-    build_search_strategy,
-    review_protocol_design,
-    select_analog_trials,
-)
+from pharma_os.agents.protocol_design import build_search_strategy, run_protocol_design_manager_agent, select_analog_trials
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -30,8 +24,6 @@ from pharma_os.schemas import (
     WorkflowRun,
 )
 from pharma_os.tools.protocol_design import (
-    build_benchmark_summary,
-    build_protocol_design_brief,
     build_protocol_design_claims,
     calculate_analog_benchmark,
     execute_ctgov_search_plan,
@@ -83,77 +75,58 @@ def run_protocol_design_workflow(
         output_id=agent4_output.output_id,
         run_id=agent4_output.run_id,
     )
-    search_plan = build_search_strategy(
-        run_id=run_id,
-        target_trial=target_trial,
-        agent3_output=agent3_output,
-        agent4_output=agent4_output,
-    )
-    analog_candidates, analog_sources, retrieval_flags = execute_ctgov_search_plan(
-        search_plan=search_plan,
-        target_nct_id=target_trial.nct_id,
-    )
-    selection = select_analog_trials(
-        run_id=run_id,
-        target_trial=target_trial,
-        candidates=analog_candidates,
-        agent3_output=agent3_output,
-        agent4_output=agent4_output,
-        search_plan=search_plan,
-        top_k=input_data.analog_top_k,
-    )
-    benchmark_bundle = calculate_analog_benchmark(
-        run_id=run_id,
-        target_trial=target_trial,
-        candidates=analog_candidates,
-        selection=selection,
-        search_plan=search_plan,
-    )
-    benchmark_summary = build_benchmark_summary(benchmark_bundle)
-    source_ids = tuple(
+    initial_source_ids = tuple(
         dict.fromkeys(
             (
                 target_trial.source_id,
                 agent3_source.source_id,
                 agent4_source.source_id,
-                *benchmark_bundle.source_ids,
             )
         )
     )
-    strategy_sections = build_protocol_strategy_sections(
+    assumptions = tuple(
+        assumption
+        for assumption in (*agent3_output.assumptions, *agent4_output.assumptions)
+        if assumption.requires_human_review or assumption.assumption_type in {"calculated", "missing", "user_reviewed"}
+    )
+    upstream_missing_flags = _dedupe_missing_flags((*agent3_output.missing_data_flags, *agent4_output.missing_data_flags))
+
+    manager_result = run_protocol_design_manager_agent(
         run_id=run_id,
         target_trial=target_trial,
-        source_ids=source_ids,
-        benchmark_summary=benchmark_summary,
         agent3_output=agent3_output,
         agent4_output=agent4_output,
+        source_ids=initial_source_ids,
+        assumptions=assumptions,
+        missing_data_flags=upstream_missing_flags,
+        claims=(),
+        top_k=input_data.analog_top_k,
+        execute_search_plan=lambda search_plan, target_nct_id: execute_ctgov_search_plan(
+            search_plan=search_plan,
+            target_nct_id=target_nct_id,
+        ),
+        calculate_benchmark=lambda trial, candidates, selection, search_plan: calculate_analog_benchmark(
+            run_id=run_id,
+            target_trial=trial,
+            candidates=candidates,
+            selection=selection,
+            search_plan=search_plan,
+        ),
     )
-    eligibility_sections = build_eligibility_and_schedule_sections(
-        run_id=run_id,
-        source_ids=benchmark_bundle.source_ids or source_ids,
-        inclusion_themes=benchmark_bundle.inclusion_themes,
-        exclusion_themes=benchmark_bundle.exclusion_themes,
-        safety_themes=benchmark_bundle.safety_exclusion_themes,
-    )
-    reviewer_critique = review_protocol_design(
-        run_id=run_id,
-        source_ids=source_ids,
-        analog_limitations=benchmark_bundle.limitations,
-        agent3_output=agent3_output,
-        agent4_output=agent4_output,
-    )
+    analog_candidates = manager_result.analog_candidates
+    benchmark_bundle = manager_result.benchmark_bundle
     sources = _dedupe_sources(
         (
             target_source,
             agent3_source,
             agent4_source,
-            *analog_sources,
+            *manager_result.analog_sources,
         )
     )
     source_ids = tuple(source.source_id for source in sources)
     missing_data_flags = _dedupe_missing_flags(
         (
-            *retrieval_flags,
+            *manager_result.retrieval_flags,
             *benchmark_bundle.missing_data_flags,
             *agent3_output.missing_data_flags,
             *agent4_output.missing_data_flags,
@@ -162,7 +135,7 @@ def run_protocol_design_workflow(
     benchmark_bundle = benchmark_bundle.model_copy(
         update={
             "source_ids": tuple(source_id for source_id in benchmark_bundle.source_ids if source_id in set(source_ids)),
-            "missing_data_flags": tuple(dict.fromkeys((*retrieval_flags, *benchmark_bundle.missing_data_flags))),
+            "missing_data_flags": tuple(dict.fromkeys((*manager_result.retrieval_flags, *benchmark_bundle.missing_data_flags))),
         }
     )
     claims = build_protocol_design_claims(
@@ -170,11 +143,6 @@ def run_protocol_design_workflow(
         target_trial=target_trial,
         benchmark_bundle=benchmark_bundle,
         source_ids=benchmark_bundle.source_ids or source_ids,
-    )
-    assumptions = tuple(
-        assumption
-        for assumption in (*agent3_output.assumptions, *agent4_output.assumptions)
-        if assumption.requires_human_review or assumption.assumption_type in {"calculated", "missing", "user_reviewed"}
     )
     gate = HumanGate(
         gate_id=f"gate-{run_id}",
@@ -184,17 +152,14 @@ def run_protocol_design_workflow(
         source_ids=source_ids,
         provenance="pharma_os.workflows.protocol_design.mandatory_human_gate",
     )
-    brief = build_protocol_design_brief(
-        run_id=run_id,
-        target_trial=target_trial,
-        strategy_sections=strategy_sections,
-        eligibility_sections=eligibility_sections,
-        reviewer_critique=reviewer_critique,
-        benchmark_bundle=benchmark_bundle,
-        claims=claims,
-        assumptions=assumptions,
-        missing_data_flags=missing_data_flags,
-        source_ids=source_ids,
+    brief = manager_result.protocol_design_brief.model_copy(
+        update={
+            "source_backed_claim_ids": tuple(claim.claim_id for claim in claims),
+            "assumptions": assumptions,
+            "missing_data_flags": missing_data_flags,
+            "source_ids": source_ids,
+            "reviewer_critique": manager_result.reviewer_critique,
+        }
     )
     output = ProtocolDesignOutput(
         output_id=f"protocol-design-output-{run_id}",
@@ -254,7 +219,7 @@ def run_protocol_design_workflow(
         output_id=f"agent-output-{run_id}",
         agent_name="protocol_design_agent5_workflow",
         run_id=run_id,
-        provenance="PharmaOS deterministic protocol_design workflow",
+        provenance="PharmaOS Agent 5 protocol_design workflow with SDK-backed subagents and deterministic retrieval/math",
         claims=claims,
         sources=sources,
         confidence=output.confidence,
@@ -263,6 +228,17 @@ def run_protocol_design_workflow(
     )
     store.save_sources(run_id, sources)
     store.save_claims(run_id, claims)
+    for payload in manager_result.subagent_payloads:
+        store.save_agent_output(
+            _subagent_output_envelope(
+                run_id=run_id,
+                payload=payload,
+                sources=sources,
+                validation_status=validation_status,
+            ),
+            payload=payload,
+        )
+    store.save_agent_traces(manager_result.traces)
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
     store.save_confidence_flags(run_id, confidence_flags)
@@ -277,7 +253,16 @@ def run_protocol_design_workflow(
             "gate_reason": gate.gate_reason,
         }
     )
-    store.save_run(completed_run, input_payload=input_data, output_payload=output)
+    store.save_run(
+        completed_run,
+        input_payload=input_data,
+        output_payload=output,
+        trace_metadata={
+            "manager_agent": "ProtocolDesignManagerAgent",
+            "subagent_trace_count": len(manager_result.traces),
+            "subagent_output_count": len(manager_result.subagent_payloads),
+        },
+    )
     build_report(run_id, memory=store)
     return output
 
@@ -396,6 +381,35 @@ def _source_for_agent_output(*, source_id: str, title: str, output_id: str, run_
         provenance=f"Scientific Memory workflow output {output_id} from run {run_id}",
         source_type="agent_output",
         version="local",
+    )
+
+
+def _subagent_output_envelope(
+    *,
+    run_id: str,
+    payload: object,
+    sources: tuple[SourceMetadata, ...],
+    validation_status: str,
+) -> AgentOutput:
+    known_sources = {source.source_id: source for source in sources}
+    payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
+    agent_name = getattr(payload, "agent_name", None) or {
+        "ProtocolDesignManagerPlan": "ProtocolDesignManagerAgent",
+        "AnalogSearchPlanOutput": "AnalogSearchPlannerAgent",
+        "AnalogTrialSelectionOutput": "AnalogSelectionAgent",
+        "BenchmarkInterpretation": "AnalogBenchmarkInterpreterAgent",
+        "ProtocolReviewerCritique": "RegulatoryCriticAgent",
+        "ProtocolDesignBrief": "ProtocolBriefWriterAgent",
+    }.get(payload.__class__.__name__, payload.__class__.__name__)
+    return AgentOutput(
+        output_id=f"agent-output-{run_id}-{getattr(payload, 'output_id', getattr(payload, 'brief_id', payload.__class__.__name__))}",
+        agent_name=agent_name,
+        run_id=run_id,
+        provenance="PharmaOS Agent 5 subagent typed output",
+        claims=(),
+        sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
+        confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
+        validation_status=validation_status,  # type: ignore[arg-type]
     )
 
 

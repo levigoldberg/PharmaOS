@@ -16,6 +16,8 @@ Required for live agent runs:
 
 - `OPENAI_API_KEY`
 - `PHARMA_OS_MODEL`, defaults to `gpt-5.5`
+- `PHARMA_OS_ENABLE_LIVE_AGENTS=true` to allow Agent 5 subagents to call the OpenAI Agents SDK; otherwise Agent 5 uses deterministic offline fallbacks.
+- `PHARMA_OS_AGENT_MAX_TURNS`, defaults to `8`
 
 Optional for due diligence:
 

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from pharma_os.schemas import (
     AgentOutput,
+    AgentRunTrace,
     ConfidenceFlag,
     EvidenceClaim,
     FinalReport,
@@ -31,9 +32,13 @@ class RunBundle:
     """All persisted artifacts for one workflow run."""
 
     run: WorkflowRun | None
+    input_json: dict[str, Any] | list[Any] | None
+    output_json: dict[str, Any] | list[Any] | None
+    trace_metadata_json: dict[str, Any]
     sources: tuple[SourceMetadata, ...]
     claims: tuple[EvidenceClaim, ...]
     agent_outputs: tuple[AgentOutput, ...]
+    agent_traces: tuple[AgentRunTrace, ...]
     validation_results: tuple[ValidationResult, ...]
     confidence_flags: tuple[ConfidenceFlag, ...]
     human_gates: tuple[HumanGate, ...]
@@ -242,6 +247,42 @@ class MemoryStore:
         )
         self._connection.commit()
 
+    def save_agent_trace(self, trace: AgentRunTrace) -> None:
+        """Persist a safe, user-readable agent run trace."""
+
+        self._connection.execute(
+            """
+            INSERT OR REPLACE INTO agent_traces (
+                trace_id, run_id, agent_name, input_summary, output_id, output_type,
+                output_summary, source_ids_json, confidence, rationale_summary,
+                started_at, completed_at, provenance, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trace.trace_id,
+                trace.run_id,
+                trace.agent_name,
+                trace.input_summary,
+                trace.output_id,
+                trace.output_type,
+                trace.output_summary,
+                _json(trace.source_ids),
+                trace.confidence,
+                trace.rationale_summary,
+                _dt(trace.started_at),
+                _dt(trace.completed_at),
+                trace.provenance,
+                _json_model(trace),
+            ),
+        )
+        self._connection.commit()
+
+    def save_agent_traces(self, traces: tuple[AgentRunTrace, ...]) -> None:
+        """Persist multiple safe agent traces."""
+
+        for trace in traces:
+            self.save_agent_trace(trace)
+
     def save_validation_results(
         self, run_id: str, results: tuple[ValidationResult, ...]
     ) -> None:
@@ -357,8 +398,12 @@ class MemoryStore:
     def get_run_bundle(self, run_id: str) -> RunBundle:
         """Return all persisted objects for a run."""
 
+        run_row = self._connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         return RunBundle(
             run=self.get_run(run_id),
+            input_json=_json_loads(run_row["input_json"]) if run_row is not None else None,
+            output_json=_json_loads(run_row["output_json"]) if run_row is not None else None,
+            trace_metadata_json=_json_loads(run_row["trace_metadata_json"]) if run_row is not None else {},
             sources=tuple(
                 SourceMetadata.model_validate_json(row["payload_json"])
                 for row in self._rows("sources", run_id)
@@ -394,6 +439,10 @@ class MemoryStore:
                     gate_reason=row["gate_reason"],
                 )
                 for row in self._rows("agent_outputs", run_id)
+            ),
+            agent_traces=tuple(
+                AgentRunTrace.model_validate_json(row["payload_json"])
+                for row in self._rows("agent_traces", run_id)
             ),
             validation_results=tuple(
                 ValidationResult(
@@ -496,6 +545,22 @@ class MemoryStore:
                 gate_reason TEXT,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS agent_traces (
+                trace_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                input_summary TEXT,
+                output_id TEXT,
+                output_type TEXT,
+                output_summary TEXT,
+                source_ids_json TEXT NOT NULL,
+                confidence REAL,
+                rationale_summary TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                provenance TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS validation_results (
                 validation_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL,
@@ -563,6 +628,12 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _json_loads(value: str | None) -> Any:
+    if not value:
+        return None
+    return json.loads(value)
 
 
 def _json_model(value: Any) -> str | None:

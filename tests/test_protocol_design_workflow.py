@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timezone
 
 from pharma_os.cli import main
+from pharma_os.agent_runtime import AgentRuntimeConfig
+from pharma_os.html_report import write_run_html
 from pharma_os.memory import MemoryStore
 from pharma_os.schemas import (
     Agent3HandoffReference,
@@ -47,8 +49,10 @@ from pharma_os.schemas import (
     WorkflowRun,
 )
 from pharma_os.tools.protocol_design import calculate_analog_benchmark, execute_ctgov_search_plan
+from pharma_os.validators import validate_protocol_design_constraints
 from pharma_os.workflows import protocol_design
 from pharma_os.workflows.protocol_design import run_protocol_design_workflow
+from pharma_os.agents.protocol_design import run_protocol_design_manager_agent
 
 
 def _source(source_id: str, source_type: str = "fixture") -> SourceMetadata:
@@ -232,8 +236,28 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     bundle = store.get_run_bundle(output.run_id)
     assert bundle.run is not None
     assert bundle.agent_outputs
+    assert bundle.agent_traces
+    assert {trace.agent_name for trace in bundle.agent_traces} >= {
+        "ProtocolDesignManagerAgent",
+        "AnalogSearchPlannerAgent",
+        "AnalogSelectionAgent",
+        "AnalogBenchmarkInterpreterAgent",
+        "EndpointStrategyAgent",
+        "PopulationEligibilityAgent",
+        "ComparatorDesignAgent",
+        "SafetyMonitoringAgent",
+        "StatisticalSkeletonAgent",
+        "RegulatoryCriticAgent",
+        "ProtocolBriefWriterAgent",
+    }
+    assert any(agent_output.agent_name == "ProtocolBriefWriterAgent" for agent_output in bundle.agent_outputs)
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
     assert payload["analog_benchmark_bundle"]["selected_analog_ids"]
+
+    html_path = write_run_html(output.run_id, "/tmp/protocol-design-agent5-test.html", memory=store)
+    html = html_path.read_text(encoding="utf-8")
+    assert "Agent Traces" in html
+    assert "ProtocolBriefWriterAgent" in html
 
 
 def test_protocol_design_cli_command(monkeypatch, tmp_path) -> None:
@@ -254,13 +278,122 @@ def test_protocol_design_cli_command(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
     output_path = tmp_path / "protocol_design.json"
 
-    exit_code = main(["run", "protocol_design", "--nct-id", "NCT12345678", "--db-path", str(tmp_path / "memory.sqlite"), "--output-json", str(output_path)])
+    html_path = tmp_path / "protocol_design.html"
+
+    exit_code = main([
+        "run",
+        "protocol_design",
+        "--nct-id",
+        "NCT12345678",
+        "--db-path",
+        str(tmp_path / "memory.sqlite"),
+        "--output-json",
+        str(output_path),
+        "--output-html",
+        str(html_path),
+    ])
 
     assert exit_code == 0
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["input"]["nct_id"] == "NCT12345678"
     assert payload["protocol_design_brief"]["requires_human_review"] is True
     assert payload["human_gate"]["decision"] == "needs_human_review"
+    assert "Agent Traces" in html_path.read_text(encoding="utf-8")
+
+
+def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = _target_trial()
+
+    def fake_execute(search_plan, target_nct_id):
+        analogs = (
+            AnalogCandidateRecord(candidate_id="c1", trial=_analog("NCT00000001", enrollment=120), query_ids=("q1",), source_ids=("ctgov:NCT00000001",), provenance="test"),
+            AnalogCandidateRecord(candidate_id="c2", trial=_analog("NCT00000002", enrollment=80), query_ids=("q1",), source_ids=("ctgov:NCT00000002",), provenance="test"),
+        )
+        return analogs, (_source("ctgov:NCT00000001", "clinical_trial_registry"), _source("ctgov:NCT00000002", "clinical_trial_registry")), ()
+
+    def fake_calculate(trial, candidates, selection, search_plan):
+        return calculate_analog_benchmark(run_id="manager-run", target_trial=trial, candidates=candidates, selection=selection, search_plan=search_plan)
+
+    result = run_protocol_design_manager_agent(
+        run_id="manager-run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=(target.source_id, "agent_output:clinical_outcome_prediction:fixture", "agent_output:due_diligence:fixture"),
+        assumptions=(),
+        missing_data_flags=(),
+        claims=(),
+        top_k=10,
+        execute_search_plan=fake_execute,
+        calculate_benchmark=fake_calculate,
+        config=AgentRuntimeConfig(disabled=True),
+    )
+
+    assert result.search_plan.queries
+    assert len(result.search_plan.queries) >= 3
+    assert result.selection.selected_analogs
+    assert result.selection.excluded_candidates
+    assert all(item.reason for item in result.selection.excluded_candidates)
+    assert result.benchmark_bundle.enrollment.median == 100.0
+    assert result.section_outputs
+    assert all(output.source_ids for output in result.section_outputs)
+    assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in result.traces)
+
+
+def test_protocol_design_validator_blocks_over_final_language(monkeypatch) -> None:
+    agent3, handoff3, agent4, handoff4 = _handoffs()
+    monkeypatch.setattr(protocol_design, "_get_or_run_agent3", lambda input_data, memory: (agent3, handoff3))
+    monkeypatch.setattr(protocol_design, "_get_or_run_agent4", lambda input_data, memory: (agent4, handoff4))
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            analog = _analog("NCT00000001", enrollment=120)
+            return ClinicalTrialsSearchResult(
+                query=input_data,
+                trials=(analog,),
+                sources=(_source(analog.source_id, "clinical_trial_registry"),),
+                api_url="https://clinicaltrials.gov/api/v2/studies",
+            )
+
+    monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+    output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=MemoryStore(":memory:"))
+    bad_study_design = output.protocol_design_brief.study_design.model_copy(
+        update={"body": "This is the final design and the protocol approved path."}
+    )
+    bad_brief = output.protocol_design_brief.model_copy(update={"study_design": bad_study_design})
+    bad_output = output.model_copy(update={"protocol_design_brief": bad_brief})
+
+    results = validate_protocol_design_constraints(run_id="guardrail", output=bad_output)
+
+    assert any(result.status == "failed" and result.validator == "protocol_design_source_boundary" for result in results)
+
+
+def test_protocol_design_reuses_agent3_and_agent4_handoffs(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    agent3 = _agent3_output()
+    agent4 = _agent4_output()
+    _save_agent_output(store, "clinical_outcome_prediction", agent3, tuple(source.source_id for source in agent3.sources))
+    _save_agent_output(store, "due_diligence", agent4, tuple(source.source_id for source in agent4.sources))
+    monkeypatch.setattr(protocol_design, "run_clinical_outcome_prediction_workflow", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Agent 3 should be reused")))
+    monkeypatch.setattr(protocol_design, "run_due_diligence_workflow", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Agent 4 should be reused")))
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            analog = _analog("NCT00000001", enrollment=120)
+            return ClinicalTrialsSearchResult(
+                query=input_data,
+                trials=(analog,),
+                sources=(_source(analog.source_id, "clinical_trial_registry"),),
+                api_url="https://clinicaltrials.gov/api/v2/studies",
+            )
+
+    monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+
+    output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=store)
+
+    assert output.agent3_handoff.generated_or_reused == "reused"
+    assert output.agent4_handoff.generated_or_reused == "reused"
 
 
 def _save_agent_output(store: MemoryStore, workflow_name: str, output: object, source_ids: tuple[str, ...]) -> None:

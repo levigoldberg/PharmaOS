@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import uuid4
-
 from pharma_os.memory import MemoryStore
-from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, ProtocolDesignInput, WorkflowRun
+from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, ProtocolDesignInput
 from pharma_os.validators import validate_workflow_name
 from pharma_os.workflows.clinical_outcome_prediction import run_clinical_outcome_prediction_workflow
 from pharma_os.workflows.due_diligence import run_due_diligence_workflow
@@ -52,17 +49,4 @@ class Orchestrator:
             if not isinstance(input_data, ProtocolDesignInput):
                 raise ValueError("protocol_design requires ProtocolDesignInput")
             return run_protocol_design_workflow(input_data, memory=self.memory)
-        return self._placeholder_run(workflow_name)
-
-    def _placeholder_run(self, workflow_name: str) -> WorkflowRun:
-        now = datetime.now(timezone.utc)
-        run = WorkflowRun(
-            run_id=str(uuid4()),
-            workflow_name=workflow_name,
-            status="completed",
-            started_at=now,
-            completed_at=datetime.now(timezone.utc),
-            input_provenance="cli.workflow_name",
-            validation_status="not_run",
-        )
-        return self.memory.save_run(run)
+        raise ValueError(f"Unknown workflow: {workflow_name}")

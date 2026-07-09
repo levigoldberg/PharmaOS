@@ -56,7 +56,10 @@ def test_cli_report_reads_prior_persisted_run(tmp_path, monkeypatch, capsys) -> 
     monkeypatch.setattr(trial_intelligence, "_default_agent_runner", _mock_runner)
     db_path = tmp_path / "memory.sqlite"
     run_json = tmp_path / "run.json"
+    run_html = tmp_path / "run.html"
     report_json = tmp_path / "report.json"
+    report_html = tmp_path / "report.html"
+    view_html = tmp_path / "view.html"
 
     exit_code = main(
         [
@@ -70,10 +73,14 @@ def test_cli_report_reads_prior_persisted_run(tmp_path, monkeypatch, capsys) -> 
             str(db_path),
             "--output-json",
             str(run_json),
+            "--output-html",
+            str(run_html),
         ]
     )
 
     assert exit_code == 0
+    assert run_html.exists()
+    assert "Run Metadata" in run_html.read_text(encoding="utf-8")
     run_output = json.loads(run_json.read_text(encoding="utf-8"))
     run_id = run_output["run_id"]
 
@@ -86,13 +93,34 @@ def test_cli_report_reads_prior_persisted_run(tmp_path, monkeypatch, capsys) -> 
             str(db_path),
             "--output-json",
             str(report_json),
+            "--output-html",
+            str(report_html),
         ]
     )
 
     assert exit_code == 0
+    assert report_html.exists()
     report_output = json.loads(report_json.read_text(encoding="utf-8"))
     assert report_output["run_id"] == run_id
     assert report_output["sources"]
+
+    exit_code = main(
+        [
+            "view",
+            "--run-id",
+            run_id,
+            "--db-path",
+            str(db_path),
+            "--output-html",
+            str(view_html),
+        ]
+    )
+
+    assert exit_code == 0
+    assert view_html.exists()
+    view_text = view_html.read_text(encoding="utf-8")
+    assert "Agent Outputs" in view_text
+    assert "Raw Bundle JSON" in view_text
 
 
 def test_default_trial_intelligence_runner_uses_agent3_landscape_component(monkeypatch) -> None:

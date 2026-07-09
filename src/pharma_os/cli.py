@@ -9,6 +9,7 @@ from pathlib import Path
 from pydantic import ValidationError
 from dotenv import load_dotenv
 
+from pharma_os.html_report import write_run_html
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.report import build_report
@@ -26,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
     run_parser.add_argument("--input-json", help="Workflow input JSON file")
     run_parser.add_argument("--output-json", help="Optional output JSON path")
+    run_parser.add_argument("--output-html", help="Optional run HTML viewer output path")
     run_parser.add_argument("--disease", help="Disease or indication for Agent 3 trial-landscape mode")
     run_parser.add_argument("--drug", help="Optional drug/intervention for Agent 3 trial-landscape mode")
     run_parser.add_argument("--target", help="Optional target for Agent 3 trial-landscape mode")
@@ -50,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--run-id", required=True, help="Workflow run id")
     report_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
     report_parser.add_argument("--output-json", help="Optional report JSON path")
+    report_parser.add_argument("--output-html", help="Optional run HTML viewer output path")
+
+    view_parser = subparsers.add_parser("view", help="Generate a simple HTML run viewer")
+    view_parser.add_argument("--run-id", required=True, help="Workflow run id")
+    view_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
+    view_parser.add_argument("--output-html", required=True, help="HTML output path")
 
     return parser
 
@@ -66,6 +74,11 @@ def main(argv: list[str] | None = None) -> int:
             result = Orchestrator(memory=store).run(args.workflow, input_data)
             payload = result.model_dump_json() if hasattr(result, "model_dump_json") else json.dumps(result)
             _write_output(args.output_json, payload)
+            if args.output_html:
+                run_id = getattr(result, "run_id", None)
+                if not run_id:
+                    raise ValueError("run output does not include run_id for HTML generation")
+                write_run_html(run_id, args.output_html, memory=store)
             print(payload)
             return 0
 
@@ -74,7 +87,14 @@ def main(argv: list[str] | None = None) -> int:
             report = build_report(args.run_id, memory=store)
             payload = report.model_dump_json()
             _write_output(args.output_json, payload)
+            if args.output_html:
+                write_run_html(args.run_id, args.output_html, memory=store)
             print(payload)
+            return 0
+        if args.command == "view":
+            store = MemoryStore(args.db_path)
+            output_path = write_run_html(args.run_id, args.output_html, memory=store)
+            print(json.dumps({"run_id": args.run_id, "output_html": str(output_path)}))
             return 0
     except (OSError, RuntimeError, ValueError, ValidationError) as exc:
         print(f"error: {exc}")
