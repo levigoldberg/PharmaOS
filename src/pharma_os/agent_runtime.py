@@ -58,6 +58,24 @@ def runtime_config_from_env() -> AgentRuntimeConfig:
     )
 
 
+def runtime_config_for_live_agents(*, disabled_provenance: str) -> AgentRuntimeConfig:
+    """Resolve live/offline agent mode from environment.
+
+    Live OpenAI Agents SDK calls are enabled when an API key is present, unless
+    the operator explicitly disables agents or sets PHARMA_OS_ENABLE_LIVE_AGENTS=false.
+    """
+
+    env_config = runtime_config_from_env()
+    if env_config.disabled:
+        return env_config
+    live_setting = os.getenv("PHARMA_OS_ENABLE_LIVE_AGENTS")
+    if live_setting is not None and live_setting.strip() and not _truthy(live_setting):
+        return env_config.model_copy(update={"disabled": True, "provenance": f"{disabled_provenance}.disabled_by_env"})
+    if os.getenv("OPENAI_API_KEY"):
+        return env_config
+    return env_config.model_copy(update={"disabled": True, "provenance": f"{disabled_provenance}.missing_openai_api_key"})
+
+
 def load_agents_sdk() -> tuple[Any, Any, Any, Any]:
     """Import OpenAI Agents SDK lazily so tests can run without live calls."""
 

@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from pharma_os.agents.protocol_design import build_search_strategy, run_protocol_design_manager_agent, select_analog_trials
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
@@ -13,6 +15,8 @@ from pharma_os.schemas import (
     Agent3HandoffReference,
     Agent4HandoffReference,
     AgentOutput,
+    AnalogBenchmarkBundle,
+    BenchmarkFrequency,
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
     DueDiligenceInput,
@@ -138,6 +142,7 @@ def run_protocol_design_workflow(
             "missing_data_flags": tuple(dict.fromkeys((*manager_result.retrieval_flags, *benchmark_bundle.missing_data_flags))),
         }
     )
+    benchmark_bundle = _filter_benchmark_source_ids(benchmark_bundle, known_source_ids=set(source_ids))
     claims = build_protocol_design_claims(
         run_id=run_id,
         target_trial=target_trial,
@@ -255,12 +260,23 @@ def run_protocol_design_workflow(
     )
     store.save_run(
         completed_run,
-        input_payload=input_data,
+        input_payload=_expanded_protocol_design_input(
+            input_data=input_data,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent3_handoff=agent3_handoff,
+            agent4_output=agent4_output,
+            agent4_handoff=agent4_handoff,
+            assumptions=assumptions,
+            missing_data_flags=upstream_missing_flags,
+            source_ids=initial_source_ids,
+        ),
         output_payload=output,
         trace_metadata={
             "manager_agent": "ProtocolDesignManagerAgent",
             "subagent_trace_count": len(manager_result.traces),
             "subagent_output_count": len(manager_result.subagent_payloads),
+            "agent_runtime_mode": _agent_runtime_mode(manager_result.traces),
         },
     )
     build_report(run_id, memory=store)
@@ -278,16 +294,20 @@ def _get_or_run_agent3(
     )
     if latest is not None:
         agent3_run, payload = latest
-        output = ClinicalOutcomePredictionOutput.model_validate_json(json.dumps(payload))
-        return output, Agent3HandoffReference(
-            agent3_run_id=agent3_run.run_id,
-            agent3_output_id=output.output_id,
-            nct_id=output.input.nct_id,
-            generated_or_reused="reused",
-            retrieved_from_memory=True,
-            source_ids=tuple(source.source_id for source in output.sources),
-            confidence=output.confidence,
-        )
+        try:
+            output = ClinicalOutcomePredictionOutput.model_validate_json(json.dumps(payload))
+        except ValidationError:
+            output = None
+        if output is not None:
+            return output, Agent3HandoffReference(
+                agent3_run_id=agent3_run.run_id,
+                agent3_output_id=output.output_id,
+                nct_id=output.input.nct_id,
+                generated_or_reused="reused",
+                retrieved_from_memory=True,
+                source_ids=tuple(source.source_id for source in output.sources),
+                confidence=output.confidence,
+            )
 
     output = run_clinical_outcome_prediction_workflow(
         ClinicalOutcomePredictionInput(
@@ -318,16 +338,20 @@ def _get_or_run_agent4(
     )
     if latest is not None:
         agent4_run, payload = latest
-        output = DueDiligenceOutput.model_validate_json(json.dumps(payload))
-        return output, Agent4HandoffReference(
-            agent4_run_id=agent4_run.run_id,
-            agent4_output_id=output.output_id,
-            nct_id=output.input.nct_id,
-            generated_or_reused="reused",
-            retrieved_from_memory=True,
-            source_ids=tuple(source.source_id for source in output.sources),
-            confidence=output.confidence,
-        )
+        try:
+            output = DueDiligenceOutput.model_validate_json(json.dumps(payload))
+        except ValidationError:
+            output = None
+        if output is not None:
+            return output, Agent4HandoffReference(
+                agent4_run_id=agent4_run.run_id,
+                agent4_output_id=output.output_id,
+                nct_id=output.input.nct_id,
+                generated_or_reused="reused",
+                retrieved_from_memory=True,
+                source_ids=tuple(source.source_id for source in output.sources),
+                confidence=output.confidence,
+            )
 
     output = run_due_diligence_workflow(
         DueDiligenceInput(
@@ -381,6 +405,78 @@ def _source_for_agent_output(*, source_id: str, title: str, output_id: str, run_
         provenance=f"Scientific Memory workflow output {output_id} from run {run_id}",
         source_type="agent_output",
         version="local",
+    )
+
+
+def _expanded_protocol_design_input(
+    *,
+    input_data: ProtocolDesignInput,
+    target_trial: object,
+    agent3_output: ClinicalOutcomePredictionOutput,
+    agent3_handoff: Agent3HandoffReference,
+    agent4_output: DueDiligenceOutput,
+    agent4_handoff: Agent4HandoffReference,
+    assumptions: tuple[object, ...],
+    missing_data_flags: tuple[object, ...],
+    source_ids: tuple[str, ...],
+) -> dict[str, object]:
+    return {
+        "cli_input": input_data.model_dump(mode="json"),
+        "expanded_pipeline_input": {
+            "target_trial": target_trial.model_dump(mode="json") if hasattr(target_trial, "model_dump") else str(target_trial),
+            "agent3_handoff": agent3_handoff.model_dump(mode="json"),
+            "agent3_output": agent3_output.model_dump(mode="json"),
+            "agent4_handoff": agent4_handoff.model_dump(mode="json"),
+            "agent4_output": agent4_output.model_dump(mode="json"),
+            "assumptions": [
+                assumption.model_dump(mode="json") if hasattr(assumption, "model_dump") else str(assumption)
+                for assumption in assumptions
+            ],
+            "missing_data_flags": [
+                flag.model_dump(mode="json") if hasattr(flag, "model_dump") else str(flag)
+                for flag in missing_data_flags
+            ],
+            "initial_source_ids": source_ids,
+        },
+    }
+
+
+def _agent_runtime_mode(traces: tuple[object, ...]) -> str:
+    provenances = {getattr(trace, "provenance", "") for trace in traces}
+    if "pharma_os.agent_runtime.openai_agents_sdk" in provenances:
+        return "openai_agents_sdk"
+    if "pharma_os.agent_runtime.offline" in provenances:
+        return "offline"
+    return "unknown"
+
+
+def _filter_benchmark_source_ids(
+    bundle: AnalogBenchmarkBundle,
+    *,
+    known_source_ids: set[str],
+) -> AnalogBenchmarkBundle:
+    def filtered(source_ids: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(source_id for source_id in source_ids if source_id in known_source_ids)
+
+    def filtered_freqs(rows: tuple[BenchmarkFrequency, ...]) -> tuple[BenchmarkFrequency, ...]:
+        return tuple(row.model_copy(update={"source_ids": filtered(row.source_ids)}) for row in rows)
+
+    return bundle.model_copy(
+        update={
+            "source_ids": filtered(bundle.source_ids),
+            "enrollment": bundle.enrollment.model_copy(update={"source_ids": filtered(bundle.enrollment.source_ids)}),
+            "planned_duration_months": bundle.planned_duration_months.model_copy(update={"source_ids": filtered(bundle.planned_duration_months.source_ids)}),
+            "site_count": bundle.site_count.model_copy(update={"source_ids": filtered(bundle.site_count.source_ids)}),
+            "randomized_frequency": filtered_freqs(bundle.randomized_frequency),
+            "blinding_frequency": filtered_freqs(bundle.blinding_frequency),
+            "arm_count_distribution": filtered_freqs(bundle.arm_count_distribution),
+            "primary_endpoint_family_frequency": filtered_freqs(bundle.primary_endpoint_family_frequency),
+            "secondary_endpoint_family_frequency": filtered_freqs(bundle.secondary_endpoint_family_frequency),
+            "comparator_categories": filtered_freqs(bundle.comparator_categories),
+            "country_distribution": filtered_freqs(bundle.country_distribution),
+            "status_distribution": filtered_freqs(bundle.status_distribution),
+            "results_availability": filtered_freqs(bundle.results_availability),
+        }
     )
 
 

@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from pharma_os.agents.due_diligence import run_due_diligence_manager_agent
 from pharma_os.memory import MemoryStore
@@ -478,16 +478,20 @@ def _get_or_run_agent3(
     )
     if latest is not None:
         agent3_run, payload = latest
-        output = ClinicalOutcomePredictionOutput.model_validate_json(json.dumps(payload))
-        return output, Agent3HandoffReference(
-            agent3_run_id=agent3_run.run_id,
-            agent3_output_id=output.output_id,
-            nct_id=output.input.nct_id,
-            generated_or_reused="reused",
-            retrieved_from_memory=True,
-            source_ids=tuple(source.source_id for source in output.sources),
-            confidence=output.confidence,
-        )
+        try:
+            output = ClinicalOutcomePredictionOutput.model_validate_json(json.dumps(payload))
+        except ValidationError:
+            output = None
+        if output is not None:
+            return output, Agent3HandoffReference(
+                agent3_run_id=agent3_run.run_id,
+                agent3_output_id=output.output_id,
+                nct_id=output.input.nct_id,
+                generated_or_reused="reused",
+                retrieved_from_memory=True,
+                source_ids=tuple(source.source_id for source in output.sources),
+                confidence=output.confidence,
+            )
 
     output = run_clinical_outcome_prediction_workflow(
         ClinicalOutcomePredictionInput(

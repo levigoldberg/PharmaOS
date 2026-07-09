@@ -16,7 +16,9 @@ Required for live agent runs:
 
 - `OPENAI_API_KEY`
 - `PHARMA_OS_MODEL`, defaults to `gpt-5.5`
-- `PHARMA_OS_ENABLE_LIVE_AGENTS=true` to allow Agent 5 subagents to call the OpenAI Agents SDK; otherwise Agent 5 uses deterministic offline fallbacks.
+- Live Agent 3/4/5 subagents call the OpenAI Agents SDK when `OPENAI_API_KEY` is present.
+- `PHARMA_OS_ENABLE_LIVE_AGENTS=false` forces deterministic offline fallbacks even when an API key exists.
+- `PHARMA_OS_AGENTS_DISABLED=true` or `PHARMA_OS_OFFLINE=true` also forces deterministic offline fallbacks.
 - `PHARMA_OS_AGENT_MAX_TURNS`, defaults to `8`
 
 Optional for due diligence:

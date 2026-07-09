@@ -251,6 +251,11 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
         "ProtocolBriefWriterAgent",
     }
     assert any(agent_output.agent_name == "ProtocolBriefWriterAgent" for agent_output in bundle.agent_outputs)
+    assert bundle.input_json is not None
+    assert bundle.input_json["cli_input"]["nct_id"] == "NCT12345678"
+    assert bundle.input_json["expanded_pipeline_input"]["target_trial"]["nct_id"] == "NCT12345678"
+    assert bundle.input_json["expanded_pipeline_input"]["agent3_output"]["output_id"] == agent3.output_id
+    assert bundle.input_json["expanded_pipeline_input"]["agent4_output"]["output_id"] == agent4.output_id
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
     assert payload["analog_benchmark_bundle"]["selected_analog_ids"]
 

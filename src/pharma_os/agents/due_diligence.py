@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_from_env
+from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_for_live_agents
 from pharma_os.components.due_diligence_sections import build_asset_memo
 from pharma_os.schemas import (
     AgentRunTrace,
@@ -354,11 +353,7 @@ def run_due_diligence_manager_agent(
 def _agent4_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
     if config is not None:
         return config
-    env_config = runtime_config_from_env()
-    live_enabled = str(os.getenv("PHARMA_OS_ENABLE_LIVE_AGENTS") or "").strip().casefold() in {"1", "true", "yes", "on"}
-    if env_config.disabled or (live_enabled and os.getenv("OPENAI_API_KEY")):
-        return env_config
-    return env_config.model_copy(update={"disabled": True, "provenance": "pharma_os.agents.due_diligence.live_agents_not_enabled"})
+    return runtime_config_for_live_agents(disabled_provenance="pharma_os.agents.due_diligence")
 
 
 def _run_synthesis_agent(

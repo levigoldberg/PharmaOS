@@ -31,6 +31,3 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pharma_os"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/pharma_os/data" = "pharma_os/data"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import Field
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, AgentRuntimeError, run_structured_agent
+from pharma_os.agent_runtime import AgentRuntimeConfig, AgentRuntimeError, run_structured_agent, runtime_config_for_live_agents
 from pharma_os.schemas import StrictSchema
 
 
@@ -48,3 +48,37 @@ def test_run_structured_agent_offline_requires_fixture_output() -> None:
             input_summary="Fixture input.",
             config=AgentRuntimeConfig(disabled=True),
         )
+
+
+def test_runtime_config_enables_live_agents_when_api_key_present(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+
+    config = runtime_config_for_live_agents(disabled_provenance="test")
+
+    assert config.disabled is False
+
+
+def test_runtime_config_treats_blank_live_agent_setting_as_unset(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_ENABLE_LIVE_AGENTS", "")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+
+    config = runtime_config_for_live_agents(disabled_provenance="test")
+
+    assert config.disabled is False
+
+
+def test_runtime_config_respects_explicit_live_agent_disable(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_ENABLE_LIVE_AGENTS", "false")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+
+    config = runtime_config_for_live_agents(disabled_provenance="test")
+
+    assert config.disabled is True
+    assert config.provenance == "test.disabled_by_env"
