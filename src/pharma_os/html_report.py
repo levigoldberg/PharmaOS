@@ -82,11 +82,159 @@ def write_run_html(run_id: str, output_html: str | Path, *, memory: MemoryStore 
 def _workflow_report_section(output_json: Any, workflow_name: str) -> str:
     if not isinstance(output_json, dict):
         return ""
+    if workflow_name in {"control_tower", "control_tower_orchestration"} or output_json.get("report", {}).get("parent_run_id"):
+        return _control_tower_report(output_json)
     if workflow_name == "due_diligence" or "asset_memo" in output_json:
         return _due_diligence_report(output_json)
     if workflow_name == "protocol_design" or "protocol_design_brief" in output_json:
         return _protocol_design_report(output_json)
     return ""
+
+
+def _control_tower_report(output: dict[str, Any]) -> str:
+    report = _dict(output.get("report"))
+    request = _dict(output.get("request"))
+    plans = _list(output.get("plans") or ([output.get("plan")] if output.get("plan") else []))
+    steps = _list(output.get("step_results"))
+    replans = _list(output.get("replans"))
+    snapshots = _list(output.get("snapshots"))
+    final_snapshot = _dict(output.get("final_snapshot"))
+    unavailable = _list(report.get("unavailable_modules"))
+    unresolved = _list(report.get("unresolved_gates"))
+    return "".join(
+        [
+            _hero(
+                "Control Tower Orchestration",
+                request.get("objective") or report.get("objective") or "Control Tower objective",
+                report.get("final_state_summary") or "Memory-aware orchestration report.",
+                [
+                    ("Parent Run", output.get("run_id")),
+                    ("NCT", request.get("nct_id")),
+                    ("Plans", len(plans)),
+                    ("Steps", len(steps)),
+                    ("Unresolved Gates", len(unresolved)),
+                ],
+            ),
+            _kpi_grid(
+                [
+                    ("Executed", sum(1 for step in steps if isinstance(step, dict) and step.get("status") in {"executed", "refreshed"}), "Workflow steps executed or refreshed."),
+                    ("Reused", sum(1 for step in steps if isinstance(step, dict) and step.get("status") == "reused"), "Artifacts reused from Scientific Memory."),
+                    ("Skipped", sum(1 for step in steps if isinstance(step, dict) and step.get("status") == "skipped"), "Steps explicitly skipped by plan."),
+                    ("Blocked", sum(1 for step in steps if isinstance(step, dict) and step.get("status") == "blocked"), "Steps blocked by gates or unavailable capabilities."),
+                    ("Replans", len(replans), "Material state changes that triggered replanning."),
+                    ("Final Artifacts", len(_list(final_snapshot.get("artifacts"))), "Artifacts visible in final ScientificStateSnapshot."),
+                ]
+            ),
+            _section(
+                "Objective And State",
+                _two_col(
+                    _kv_table(
+                        {
+                            "objective": request.get("objective"),
+                            "nct_id": request.get("nct_id"),
+                            "asset_name": request.get("asset_name"),
+                            "indication": request.get("indication"),
+                            "force_refresh": ", ".join(_list(request.get("force_refresh"))),
+                        }
+                    ),
+                    _kv_table(
+                        {
+                            "initial_state": report.get("initial_state_summary"),
+                            "final_state": report.get("final_state_summary"),
+                            "initial_snapshot": report.get("initial_snapshot_id"),
+                            "final_snapshot": report.get("final_snapshot_id"),
+                        }
+                    ),
+                ),
+            ),
+            _section("Plans", _control_tower_plan_tables(plans)),
+            _section("Step Results", _control_tower_step_table(steps)),
+            _section(
+                "Replans And Blocks",
+                _cards(
+                    [
+                        ("Replans", _bullets(_list(report.get("replan_summaries")) or [item.get("reason") for item in replans if isinstance(item, dict)] or ["None."])),
+                        ("Unresolved Gates", _bullets(unresolved or ["None."])),
+                        ("Unavailable Modules", _bullets(unavailable or ["None."])),
+                    ]
+                ),
+            ),
+            _section("Final State", _control_tower_artifact_table(_list(final_snapshot.get("artifacts")))),
+            _section("Planning Snapshots", _control_tower_snapshot_table(snapshots)),
+        ]
+    )
+
+
+def _control_tower_plan_tables(plans: list[Any]) -> str:
+    rows = []
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        rows.append(
+            {
+                "plan": plan.get("output_id"),
+                "snapshot": plan.get("snapshot_id"),
+                "status": plan.get("validation_status"),
+                "blocked": plan.get("blocked"),
+                "steps": ", ".join(
+                    f"{step.get('capability_name')}:{step.get('action')}"
+                    for step in _list(plan.get("steps"))
+                    if isinstance(step, dict)
+                ),
+            }
+        )
+    return _dict_table(rows, ("plan", "snapshot", "status", "blocked", "steps"))
+
+
+def _control_tower_step_table(steps: list[Any]) -> str:
+    rows = [
+        {
+            "capability": step.get("capability_name"),
+            "action": step.get("action"),
+            "status": step.get("status"),
+            "child_run": step.get("child_run_id"),
+            "reused_run": step.get("reused_run_id"),
+            "output": step.get("output_id") or step.get("reused_output_id"),
+            "validation": step.get("validation_status"),
+            "state_changed": step.get("state_changed"),
+            "rationale": step.get("rationale"),
+        }
+        for step in steps
+        if isinstance(step, dict)
+    ]
+    return _dict_table(rows, ("capability", "action", "status", "child_run", "reused_run", "output", "validation", "state_changed", "rationale"))
+
+
+def _control_tower_artifact_table(artifacts: list[Any]) -> str:
+    rows = [
+        {
+            "artifact": artifact.get("artifact_type"),
+            "producer": artifact.get("producer_workflow"),
+            "run": artifact.get("run_id"),
+            "output": artifact.get("output_id"),
+            "validation": artifact.get("validation_status"),
+            "compatibility": artifact.get("compatibility"),
+            "freshness": artifact.get("freshness"),
+            "confidence": _percent(artifact.get("confidence")),
+        }
+        for artifact in artifacts
+        if isinstance(artifact, dict)
+    ]
+    return _dict_table(rows, ("artifact", "producer", "run", "output", "validation", "compatibility", "freshness", "confidence"))
+
+
+def _control_tower_snapshot_table(snapshots: list[Any]) -> str:
+    rows = [
+        {
+            "snapshot": snapshot.get("snapshot_id"),
+            "artifacts": len(_list(snapshot.get("artifacts"))),
+            "open_gates": len(_list(snapshot.get("open_gates"))),
+            "missing_artifacts": ", ".join(_list(snapshot.get("missing_artifacts"))),
+        }
+        for snapshot in snapshots
+        if isinstance(snapshot, dict)
+    ]
+    return _dict_table(rows, ("snapshot", "artifacts", "open_gates", "missing_artifacts"))
 
 
 def _due_diligence_report(output: dict[str, Any]) -> str:

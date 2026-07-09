@@ -406,6 +406,56 @@ class ExecutionPlan(StrictSchema):
     provenance: str = Field(..., min_length=1)
 
 
+class OrchestrationStepResult(StrictSchema):
+    """Persisted result for one Control Tower planned step."""
+
+    step_id: str = Field(..., min_length=1)
+    capability_name: str = Field(..., min_length=1)
+    action: OrchestrationAction
+    status: Literal["executed", "reused", "refreshed", "skipped", "blocked", "failed"]
+    rationale: str = Field(..., min_length=1)
+    parent_run_id: str = Field(..., min_length=1)
+    child_run_id: str | None = None
+    output_id: str | None = None
+    reused_run_id: str | None = None
+    reused_output_id: str | None = None
+    validation_status: ValidationStatus = "not_run"
+    gates: tuple[HumanGate, ...] = Field(default_factory=tuple)
+    state_changed: bool = False
+    before_snapshot_id: str = Field(..., min_length=1)
+    after_snapshot_id: str | None = None
+    plan_output_id: str = Field(..., min_length=1)
+
+
+class OrchestrationReplanRecord(StrictSchema):
+    """One replan event caused by a material state change."""
+
+    replan_id: str = Field(..., min_length=1)
+    parent_run_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    previous_plan_output_id: str = Field(..., min_length=1)
+    new_plan_output_id: str = Field(..., min_length=1)
+    before_snapshot_id: str = Field(..., min_length=1)
+    after_snapshot_id: str = Field(..., min_length=1)
+
+
+class ControlTowerReport(StrictSchema):
+    """Human-facing Control Tower report payload."""
+
+    report_id: str = Field(..., min_length=1)
+    parent_run_id: str = Field(..., min_length=1)
+    objective: str = Field(..., min_length=1)
+    initial_snapshot_id: str = Field(..., min_length=1)
+    final_snapshot_id: str = Field(..., min_length=1)
+    initial_state_summary: str = Field(..., min_length=1)
+    final_state_summary: str = Field(..., min_length=1)
+    plan_summaries: tuple[str, ...] = Field(default_factory=tuple)
+    step_summaries: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_gates: tuple[str, ...] = Field(default_factory=tuple)
+    unavailable_modules: tuple[str, ...] = Field(default_factory=tuple)
+    replan_summaries: tuple[str, ...] = Field(default_factory=tuple)
+
+
 class HumanReadableFinding(StrictSchema):
     """One human-facing source-grounded finding from a workflow module."""
 
@@ -1344,12 +1394,19 @@ class AgentRunTrace(StrictSchema):
 
 
 class OrchestrationRunRecord(StrictSchema):
-    """Persistable planning run envelope for the Control Tower."""
+    """Persistable planning or orchestration run envelope for the Control Tower."""
 
     run_id: str = Field(..., min_length=1)
     request: OrchestrationRequest
     snapshot: ScientificStateSnapshot
     plan: ExecutionPlan
+    snapshots: tuple[ScientificStateSnapshot, ...] = Field(default_factory=tuple)
+    final_snapshot: ScientificStateSnapshot | None = None
+    plans: tuple[ExecutionPlan, ...] = Field(default_factory=tuple)
+    step_results: tuple[OrchestrationStepResult, ...] = Field(default_factory=tuple)
+    replans: tuple[OrchestrationReplanRecord, ...] = Field(default_factory=tuple)
+    child_run_ids: tuple[str, ...] = Field(default_factory=tuple)
+    report: ControlTowerReport | None = None
     validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
     trace: AgentRunTrace | None = None
 

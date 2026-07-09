@@ -13,7 +13,7 @@ from pharma_os.html_report import write_run_html
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.report import build_report
-from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, ProtocolDesignInput
+from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, OrchestrationRequest, ProtocolDesignInput
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +48,27 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--refresh-agent4", action="store_true", help="Force protocol_design to generate a fresh Agent 4 handoff")
     run_parser.add_argument("--analog-top-k", type=int, default=10, help="Maximum analog trials selected for protocol_design")
 
+    orchestrate_parser = subparsers.add_parser("orchestrate", help="Run the memory-aware Control Tower orchestration loop")
+    orchestrate_parser.add_argument("--goal", help="Control Tower objective")
+    orchestrate_parser.add_argument("--nct-id", help="Optional ClinicalTrials.gov NCT identifier")
+    orchestrate_parser.add_argument("--asset-name", help="Optional asset name")
+    orchestrate_parser.add_argument("--indication", help="Optional indication")
+    orchestrate_parser.add_argument("--input-json", help="Optional OrchestrationRequest JSON file")
+    orchestrate_parser.add_argument("--force-refresh", action="append", default=(), help="Capability or artifact to refresh; may be repeated")
+    orchestrate_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
+    orchestrate_parser.add_argument("--output-json", help="Optional output JSON path")
+    orchestrate_parser.add_argument("--output-html", help="Optional Control Tower HTML report output path")
+    orchestrate_parser.add_argument("--pos-workbook-path", help="Optional PoS workbook path")
+    orchestrate_parser.add_argument("--wac-data-path", help="Optional WAC workbook path")
+    orchestrate_parser.add_argument("--annual-patients", type=float, help="Reviewed annual eligible patient assumption")
+    orchestrate_parser.add_argument("--peak-penetration", type=float, help="Reviewed peak penetration assumption")
+    orchestrate_parser.add_argument("--gross-to-net", type=float, help="Reviewed gross-to-net assumption")
+    orchestrate_parser.add_argument("--operating-margin", type=float, help="Reviewed operating margin assumption")
+    orchestrate_parser.add_argument("--discount-rate", type=float, help="Reviewed discount rate assumption")
+    orchestrate_parser.add_argument("--development-cost", type=float, help="Reviewed remaining development cost assumption")
+    orchestrate_parser.add_argument("--launch-year", type=int, help="Reviewed expected launch year")
+    orchestrate_parser.add_argument("--loe-year", type=int, help="Reviewed expected loss-of-exclusivity year")
+
     report_parser = subparsers.add_parser("report", help="Generate a run report")
     report_parser.add_argument("--run-id", required=True, help="Workflow run id")
     report_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
@@ -79,6 +100,17 @@ def main(argv: list[str] | None = None) -> int:
                 if not run_id:
                     raise ValueError("run output does not include run_id for HTML generation")
                 write_run_html(run_id, args.output_html, memory=store)
+            print(payload)
+            return 0
+
+        if args.command == "orchestrate":
+            store = MemoryStore(args.db_path)
+            request = _orchestration_request(args)
+            result = Orchestrator(memory=store).orchestrate(request)
+            payload = result.model_dump_json()
+            _write_output(args.output_json, payload)
+            if args.output_html:
+                write_run_html(result.run_id, args.output_html, memory=store)
             print(payload)
             return 0
 
@@ -177,6 +209,39 @@ def _workflow_input(
     if args.input_json:
         raise ValueError(f"{args.workflow} does not define an input schema")
     return None
+
+
+def _orchestration_request(args: argparse.Namespace) -> OrchestrationRequest:
+    if args.input_json:
+        return OrchestrationRequest.model_validate_json(
+            Path(args.input_json).read_text(encoding="utf-8")
+        )
+    if not args.goal:
+        raise ValueError("orchestrate requires --goal unless --input-json is supplied")
+    assumptions = {
+        key: value
+        for key, value in {
+            "pos_workbook_path": args.pos_workbook_path,
+            "wac_data_path": args.wac_data_path,
+            "annual_patients": args.annual_patients,
+            "peak_penetration": args.peak_penetration,
+            "gross_to_net": args.gross_to_net,
+            "operating_margin": args.operating_margin,
+            "discount_rate": args.discount_rate,
+            "development_cost": args.development_cost,
+            "launch_year": args.launch_year,
+            "loe_year": args.loe_year,
+        }.items()
+        if value is not None
+    }
+    return OrchestrationRequest(
+        objective=args.goal,
+        nct_id=args.nct_id,
+        asset_name=args.asset_name,
+        indication=args.indication,
+        assumptions=assumptions,
+        force_refresh=tuple(args.force_refresh or ()),
+    )
 
 
 def _write_output(path: str | None, payload: str) -> None:

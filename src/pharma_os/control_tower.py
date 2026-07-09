@@ -135,9 +135,8 @@ def validate_execution_plan(
 
     results: list[ValidationResult] = []
     known = set(registry.names())
-    steps_by_capability = {step.capability_name: step for step in plan.steps}
     ordered = [step.capability_name for step in plan.steps]
-    previous: set[str] = set()
+    satisfied: set[str] = _memory_satisfied_capabilities(snapshot.artifacts, registry)
     changed: set[str] = set()
 
     for index, step in enumerate(plan.steps):
@@ -146,9 +145,16 @@ def validate_execution_plan(
         if step.capability_name not in known or capability is None:
             failures.append("unknown capability")
         else:
-            missing_deps = [dep for dep in capability.dependencies if dep in ordered and dep not in previous]
-            if missing_deps:
-                failures.append(f"dependency ordering invalid: {', '.join(missing_deps)} must appear earlier")
+            if step.action != "block":
+                missing_deps = [dep for dep in capability.dependencies if dep not in satisfied]
+                if missing_deps:
+                    dep_positions = {dep: ordered.index(dep) for dep in capability.dependencies if dep in ordered}
+                    current_position = index
+                    late_deps = [dep for dep, position in dep_positions.items() if position > current_position]
+                    if late_deps:
+                        failures.append(f"dependency ordering invalid: {', '.join(late_deps)} must appear earlier")
+                    else:
+                        failures.append(f"missing dependency: {', '.join(missing_deps)}")
             if step.action in {"run", "refresh"} and (not capability.executable or capability.implementation_status != "implemented"):
                 failures.append("non-implemented capability cannot be executed")
             if step.action == "reuse" and not _has_compatible_artifact(capability, snapshot.artifacts, step):
@@ -162,7 +168,8 @@ def validate_execution_plan(
 
         if step.action in {"run", "refresh"}:
             changed.add(step.capability_name)
-        previous.add(step.capability_name)
+        if not failures and step.action in {"run", "reuse", "refresh"}:
+            satisfied.add(step.capability_name)
         results.append(_plan_validation_result(run_id, index, step, failures))
 
     if not plan.steps:
@@ -191,6 +198,18 @@ def _planned_step(
 ) -> PlannedStep:
     forced = _force_refreshes(capability, request)
     blocking_reasons = _blocking_reasons(capability, artifact)
+    if _skip_requested(capability, request):
+        return PlannedStep(
+            step_id=f"step-{uuid4()}",
+            capability_name=capability.name,
+            action="skip",
+            reason=f"Objective explicitly requested skipping {capability.name}.",
+            required_artifacts=capability.required_artifacts,
+            produced_artifacts=capability.produced_artifacts,
+            depends_on=dependencies,
+            executable=False,
+            confidence=0.75,
+        )
     if not capability.executable or capability.implementation_status != "implemented":
         return PlannedStep(
             step_id=f"step-{uuid4()}",
@@ -299,6 +318,10 @@ def _dependency_order(target_names: tuple[str, ...], registry: WorkflowRegistry)
         capability = registry.get(name)
         if capability is None:
             return
+        if not capability.executable or capability.implementation_status != "implemented":
+            if name not in ordered:
+                ordered.append(name)
+            return
         for dependency in capability.dependencies:
             visit(dependency)
         if name not in ordered:
@@ -331,6 +354,14 @@ def _has_compatible_artifact(capability: ModuleCapability, artifacts: tuple[Arti
     return True
 
 
+def _memory_satisfied_capabilities(artifacts: tuple[ArtifactStatus, ...], registry: WorkflowRegistry) -> set[str]:
+    satisfied: set[str] = set()
+    for capability in registry.capabilities():
+        if _has_compatible_artifact(capability, artifacts):
+            satisfied.add(capability.name)
+    return satisfied
+
+
 def _refresh_justified(
     step: PlannedStep,
     capability: ModuleCapability,
@@ -359,6 +390,17 @@ def _has_blocking_dependency_gate(capability: ModuleCapability, artifacts: tuple
 def _force_refreshes(capability: ModuleCapability, request: OrchestrationRequest) -> bool:
     forced = {item.strip() for item in request.force_refresh}
     return bool({capability.name, *capability.produced_artifacts} & forced)
+
+
+def _skip_requested(capability: ModuleCapability, request: OrchestrationRequest) -> bool:
+    text = request.objective.casefold()
+    name = capability.name.casefold()
+    aliases = {
+        "clinical_outcome_prediction": ("clinical risk", "agent 3", "clinical outcome prediction"),
+        "due_diligence": ("diligence", "agent 4"),
+        "protocol_design": ("protocol design", "agent 5", "next study"),
+    }.get(capability.name, (capability.name.replace("_", " "),))
+    return f"skip {name}" in text or any(f"skip {alias}" in text for alias in aliases)
 
 
 def _blocking_reasons(capability: ModuleCapability, artifact: ArtifactStatus | None) -> tuple[str, ...]:
