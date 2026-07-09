@@ -1,5 +1,7 @@
 # AI-Native PharmaOS Lean Implementation Plan
 
+Status: this is the historical lean build plan. The current implementation state is documented in `README.md`, `AGENTS.md`, and `docs/architecture_decisions.md`: Agent 3 `clinical_outcome_prediction`, Agent 4 `due_diligence`, and Agent 5 `protocol_design` are executable; discovery, tox/PK-PD, enrollment, trial execution, manufacturing, launch/PV, and regulatory/quality/audit are registered non-executable skeletons.
+
 ## 1. Recommended repo structure
 
 Keep `src/` and remove `src2/`. `src/` contains the strict shared schemas that match `AGENTS.md`; `src2/` is a conflicted duplicate with `.DS_Store` files and merge markers in `schemas.py`.

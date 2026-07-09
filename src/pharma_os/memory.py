@@ -12,6 +12,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from pharma_os.control_tower_state import (
+    assess_requirement_satisfaction,
+    blocked_capabilities,
+    contradictory_claims_from_state,
+    critical_evidence_gaps,
+    evidence_requirements_for_decision,
+    infer_pending_decision,
+    unresolved_claims_from_state,
+)
 from pharma_os.registry import WorkflowRegistry
 from pharma_os.schemas import (
     AgentOutput,
@@ -19,6 +28,7 @@ from pharma_os.schemas import (
     ArtifactStatus,
     ConfidenceFlag,
     EvidenceClaim,
+    ExecutionModeSummary,
     FinalReport,
     HumanGate,
     ModuleCapability,
@@ -204,6 +214,14 @@ class MemoryStore:
             for gate in artifact.open_gates
             if gate.decision in {"needs_human_review", "blocked", "rejected"}
         )
+        pending_decision = infer_pending_decision(request, capabilities)
+        evidence_requirements = evidence_requirements_for_decision(pending_decision, capabilities)
+        requirement_satisfaction = assess_requirement_satisfaction(evidence_requirements, artifacts)
+        stale_or_incompatible = tuple(
+            artifact
+            for artifact in artifacts
+            if artifact.freshness == "stale" or artifact.compatibility == "incompatible"
+        )
         return ScientificStateSnapshot(
             snapshot_id=f"snapshot-{uuid4()}",
             request=request,
@@ -219,6 +237,14 @@ class MemoryStore:
                     if artifact.compatibility != "compatible"
                 )
             ),
+            pending_decision=pending_decision,
+            evidence_requirements=evidence_requirements,
+            requirement_satisfaction=requirement_satisfaction,
+            unresolved_claims=unresolved_claims_from_state(artifacts, open_gates, requirement_satisfaction),
+            contradictory_claims=contradictory_claims_from_state(artifacts, requirement_satisfaction),
+            critical_evidence_gaps=critical_evidence_gaps(requirement_satisfaction, evidence_requirements),
+            stale_or_incompatible_artifacts=stale_or_incompatible,
+            blocked_capabilities=blocked_capabilities(capabilities),
         )
 
     def assess_artifact_reuse(
@@ -340,8 +366,9 @@ class MemoryStore:
             """
             INSERT OR REPLACE INTO agent_outputs (
                 output_id, run_id, agent_name, provenance, claims_json, sources_json,
-                confidence, validation_status, gate_reason, payload_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                confidence, validation_status, gate_reason, execution_mode,
+                execution_mode_summary_json, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 output.output_id,
@@ -353,6 +380,8 @@ class MemoryStore:
                 output.confidence,
                 output.validation_status,
                 output.gate_reason,
+                output.execution_mode,
+                _json_model(output.execution_mode_summary),
                 _json_model(payload or output),
             ),
         )
@@ -548,6 +577,8 @@ class MemoryStore:
                     confidence=row["confidence"],
                     validation_status=row["validation_status"],
                     gate_reason=row["gate_reason"],
+                    execution_mode=row["execution_mode"] or "deterministic_fallback",
+                    execution_mode_summary=_execution_summary_from_row(row),
                 )
                 for row in self._rows("agent_outputs", run_id)
             ),
@@ -708,6 +739,8 @@ class MemoryStore:
                 confidence REAL NOT NULL,
                 validation_status TEXT NOT NULL,
                 gate_reason TEXT,
+                execution_mode TEXT NOT NULL DEFAULT 'deterministic_fallback',
+                execution_mode_summary_json TEXT NOT NULL DEFAULT '{}',
                 payload_json TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS agent_traces (
@@ -776,7 +809,14 @@ class MemoryStore:
             );
             """
         )
+        self._ensure_column("agent_outputs", "execution_mode", "TEXT NOT NULL DEFAULT 'deterministic_fallback'")
+        self._ensure_column("agent_outputs", "execution_mode_summary_json", "TEXT NOT NULL DEFAULT '{}'")
         self._connection.commit()
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        existing = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def _dt(value: Any) -> str | None:
@@ -813,6 +853,13 @@ def _json_model(value: Any) -> str | None:
     if isinstance(value, dict):
         return json.dumps(_to_jsonable(value), ensure_ascii=False)
     return json.dumps(value, ensure_ascii=False)
+
+
+def _execution_summary_from_row(row: sqlite3.Row) -> ExecutionModeSummary:
+    payload = _json_loads(row["execution_mode_summary_json"]) or {}
+    if isinstance(payload, dict):
+        return ExecutionModeSummary.model_validate(payload)
+    return ExecutionModeSummary()
 
 
 def _to_jsonable(value: Any) -> Any:

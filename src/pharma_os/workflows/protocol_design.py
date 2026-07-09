@@ -9,6 +9,12 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from pharma_os.agents.protocol_design import build_search_strategy, run_protocol_design_manager_agent, select_analog_trials
+from pharma_os.execution_modes import (
+    execution_mode_for_payload,
+    execution_mode_summary_for_mode,
+    primary_execution_mode,
+    summarize_execution_modes,
+)
 from pharma_os.human_readable import build_human_readable_module_output
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
@@ -141,7 +147,7 @@ def run_protocol_design_workflow(
     benchmark_bundle = benchmark_bundle.model_copy(
         update={
             "source_ids": tuple(source_id for source_id in benchmark_bundle.source_ids if source_id in set(source_ids)),
-            "missing_data_flags": tuple(dict.fromkeys((*manager_result.retrieval_flags, *benchmark_bundle.missing_data_flags))),
+            "missing_data_flags": _dedupe_missing_flags((*manager_result.retrieval_flags, *benchmark_bundle.missing_data_flags)),
         }
     )
     benchmark_bundle = _filter_benchmark_source_ids(benchmark_bundle, known_source_ids=set(source_ids))
@@ -228,7 +234,24 @@ def run_protocol_design_workflow(
         run_id=run_id,
         typed_output=output,
     )
-    output = output.model_copy(update={"human_readable_summary": human_readable_result.output})
+    all_agent_traces = (*manager_result.traces, human_readable_result.trace)
+    execution_mode_summary = summarize_execution_modes(
+        all_agent_traces,
+        reused_artifacts=sum(
+            1
+            for handoff in (agent3_handoff, agent4_handoff)
+            if handoff.retrieved_from_memory
+        ),
+    )
+    human_readable_output = human_readable_result.output.model_copy(
+        update={"execution_mode": human_readable_result.trace.execution_mode}
+    )
+    output = output.model_copy(
+        update={
+            "human_readable_summary": human_readable_output,
+            "execution_mode_summary": execution_mode_summary,
+        }
+    )
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
@@ -240,6 +263,8 @@ def run_protocol_design_workflow(
         confidence=output.confidence,
         validation_status=validation_status,
         gate_reason=gate.gate_reason,
+        execution_mode=primary_execution_mode(execution_mode_summary),
+        execution_mode_summary=execution_mode_summary,
     )
     store.save_sources(run_id, sources)
     store.save_claims(run_id, claims)
@@ -250,6 +275,7 @@ def run_protocol_design_workflow(
                 payload=payload,
                 sources=sources,
                 validation_status=validation_status,
+                traces=manager_result.traces,
             ),
             payload=payload,
         )
@@ -261,8 +287,9 @@ def run_protocol_design_workflow(
             payload=human_readable_result.output,
             sources=sources,
             validation_status=validation_status,
+            execution_mode=human_readable_result.trace.execution_mode,
         ),
-        payload=human_readable_result.output,
+        payload=human_readable_output,
     )
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
@@ -298,7 +325,8 @@ def run_protocol_design_workflow(
             "subagent_trace_count": len(manager_result.traces),
             "subagent_output_count": len(manager_result.subagent_payloads),
             "agent_runtime_mode": _agent_runtime_mode(manager_result.traces),
-            "human_readable_summary_output_id": human_readable_result.output.output_id,
+            "human_readable_summary_output_id": human_readable_output.output_id,
+            "execution_mode_summary": execution_mode_summary.model_dump(mode="json"),
         },
     )
     build_report(run_id, memory=store)
@@ -570,6 +598,7 @@ def _subagent_output_envelope(
     payload: object,
     sources: tuple[SourceMetadata, ...],
     validation_status: str,
+    traces: tuple[object, ...],
 ) -> AgentOutput:
     known_sources = {source.source_id: source for source in sources}
     payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
@@ -582,6 +611,7 @@ def _subagent_output_envelope(
         "ProtocolReviewerCritique": "RegulatoryCriticAgent",
         "ProtocolDesignBrief": "ProtocolBriefWriterAgent",
     }.get(payload.__class__.__name__, payload.__class__.__name__)
+    execution_mode = execution_mode_for_payload(payload, traces)
     return AgentOutput(
         output_id=f"agent-output-{run_id}-{getattr(payload, 'output_id', getattr(payload, 'brief_id', payload.__class__.__name__))}",
         agent_name=agent_name,
@@ -591,6 +621,8 @@ def _subagent_output_envelope(
         sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
         confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
         validation_status=validation_status,  # type: ignore[arg-type]
+        execution_mode=execution_mode,
+        execution_mode_summary=execution_mode_summary_for_mode(execution_mode),
     )
 
 
@@ -600,6 +632,7 @@ def _human_readable_output_envelope(
     payload: object,
     sources: tuple[SourceMetadata, ...],
     validation_status: str,
+    execution_mode: str,
 ) -> AgentOutput:
     known_sources = {source.source_id: source for source in sources}
     payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
@@ -612,6 +645,8 @@ def _human_readable_output_envelope(
         sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
         confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
         validation_status=validation_status,  # type: ignore[arg-type]
+        execution_mode=execution_mode,  # type: ignore[arg-type]
+        execution_mode_summary=execution_mode_summary_for_mode(execution_mode),  # type: ignore[arg-type]
     )
 
 

@@ -40,7 +40,10 @@ def test_run_structured_agent_offline_validates_output_and_trace() -> None:
     assert result.trace.output_id == "OUT"
     assert result.trace.output_type == "FixtureOutput"
     assert result.trace.rationale_summary == "Fixture rationale summary."
+    assert result.trace.execution_mode == "deterministic_fallback"
+    assert result.trace.steps[0].execution_mode == "deterministic_fallback"
     assert result.trace_metadata["disabled"] is True
+    assert result.trace_metadata["execution_mode"] == "deterministic_fallback"
     assert "chain" not in result.trace.model_dump_json().casefold()
 
 
@@ -78,6 +81,7 @@ def test_run_structured_llm_call_offline_validates_output_and_trace() -> None:
     assert result.trace.output_type == "FixtureOutput"
     assert result.trace.provenance == "pharma_os.agent_runtime.offline"
     assert result.trace.steps[0].provenance == "pharma_os.agent_runtime.offline"
+    assert result.trace.execution_mode == "deterministic_fallback"
     assert result.trace_metadata["direct_api"] is True
     assert result.trace_metadata["disabled"] is True
 
@@ -147,7 +151,9 @@ def test_run_structured_llm_call_live_path_returns_structured_result(monkeypatch
     assert isinstance(result.output, FixtureOutput)
     assert result.output.output_id == "OUT"
     assert result.trace.provenance == "pharma_os.agent_runtime.openai_api_structured_output"
+    assert result.trace.execution_mode == "direct_llm"
     assert result.trace_metadata["last_response_id"] == "resp_123"
+    assert result.trace_metadata["execution_mode"] == "direct_llm"
 
 
 def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> None:
@@ -175,7 +181,9 @@ def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> No
 
     assert isinstance(result.output, FixtureOutput)
     assert result.trace.provenance == "pharma_os.agent_runtime.direct_openai_api_fallback"
+    assert result.trace.execution_mode == "deterministic_fallback"
     assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["execution_mode"] == "deterministic_fallback"
     assert result.trace_metadata["error_type"] == "RuntimeError"
 
 
@@ -204,6 +212,37 @@ def test_run_structured_llm_call_can_disable_api_failure_fallback(monkeypatch) -
         )
 
 
+def test_run_structured_agent_live_path_marks_live_agent(monkeypatch) -> None:
+    class Response:
+        final_output = {"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7}
+
+    class SuccessRunner:
+        @staticmethod
+        def run_sync(*args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, SuccessRunner, object),
+    )
+
+    result = run_structured_agent(
+        agent=object(),
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        agent_name="fixture_agent",
+        run_id="RUN",
+        input_summary="Fixture input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OFFLINE", "summary": "Offline summary.", "confidence": 0.5},
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert result.output.output_id == "OUT"
+    assert result.trace.execution_mode == "live_agent"
+    assert result.trace_metadata["execution_mode"] == "live_agent"
+
+
 def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
     monkeypatch.delenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", raising=False)
 
@@ -230,7 +269,9 @@ def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
 
     assert isinstance(result.output, FixtureOutput)
     assert result.trace.provenance == "pharma_os.agent_runtime.openai_agents_sdk_fallback"
+    assert result.trace.execution_mode == "deterministic_fallback"
     assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["execution_mode"] == "deterministic_fallback"
     assert result.trace_metadata["error_type"] == "RuntimeError"
 
 

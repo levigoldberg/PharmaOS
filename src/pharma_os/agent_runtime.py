@@ -1,8 +1,8 @@
 """Reusable OpenAI Agents SDK runtime foundation for PharmaOS.
 
-This module is intentionally not wired into Agent 3, Agent 4, Agent 5, or
-trial_intelligence yet. It provides a safe, testable layer for future agent
-adoption while preserving deterministic workflow control.
+Agent 3, Agent 4, Agent 5, the compatibility trial-landscape route, and the
+Control Tower all use this shared layer to run structured SDK calls when live
+agents are enabled and validated deterministic fallbacks when offline.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from pharma_os.schemas import AgentRunTrace, AgentStepTrace, AgentToolCallTrace, StrictSchema
+from pharma_os.schemas import AgentRunTrace, AgentStepTrace, AgentToolCallTrace, ExecutionMode, StrictSchema
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -26,7 +26,7 @@ class AgentRuntimeError(RuntimeError):
 
 
 class AgentRuntimeConfig(StrictSchema):
-    """Runtime settings for future OpenAI Agents SDK usage."""
+    """Runtime settings for OpenAI Agents SDK-backed workflow components."""
 
     model: str = Field(default="gpt-5.5", min_length=1)
     max_turns: int = Field(default=8, ge=1, le=50)
@@ -127,12 +127,14 @@ def run_structured_agent(
                 rationale_summary=rationale_summary or "Offline structured output was validated without a live agent call.",
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.offline",
+                execution_mode="deterministic_fallback",
             ),
             trace_metadata={
                 "agent_name": agent_name,
                 "model": settings.model,
                 "max_turns": effective_max_turns,
                 "disabled": True,
+                "execution_mode": "deterministic_fallback",
             },
         )
 
@@ -168,6 +170,7 @@ def run_structured_agent(
                     or "Agents SDK call failed; offline structured output was validated as fallback.",
                     tool_calls=(),
                     provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
+                    execution_mode="deterministic_fallback",
                 ),
                 trace_metadata={
                     "agent_name": agent_name,
@@ -175,6 +178,7 @@ def run_structured_agent(
                     "max_turns": effective_max_turns,
                     "disabled": False,
                     "fallback": True,
+                    "execution_mode": "deterministic_fallback",
                     "error_type": exc.__class__.__name__,
                     "error": str(exc)[:500],
                 },
@@ -201,6 +205,7 @@ def run_structured_agent(
                 or "Agents SDK call failed; offline structured output was validated as fallback.",
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
+                execution_mode="deterministic_fallback",
             ),
             trace_metadata={
                 "agent_name": agent_name,
@@ -208,6 +213,7 @@ def run_structured_agent(
                 "max_turns": effective_max_turns,
                 "disabled": False,
                 "fallback": True,
+                "execution_mode": "deterministic_fallback",
                 "error_type": exc.__class__.__name__,
                 "error": str(exc)[:500],
             },
@@ -237,6 +243,7 @@ def run_structured_agent(
             rationale_summary=rationale_summary or "Structured agent output was validated; hidden reasoning was not stored.",
             tool_calls=tool_calls,
             provenance="pharma_os.agent_runtime.openai_agents_sdk",
+            execution_mode="live_agent",
         ),
         trace_metadata={
             **_response_metadata(response),
@@ -244,6 +251,7 @@ def run_structured_agent(
             "model": settings.model,
             "max_turns": effective_max_turns,
             "disabled": False,
+            "execution_mode": "live_agent",
         },
     )
 
@@ -314,6 +322,7 @@ def run_structured_llm_call(
                 or "Direct OpenAI call failed; offline structured output was validated as fallback.",
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.direct_openai_api_fallback",
+                execution_mode="deterministic_fallback",
             ),
             trace_metadata={
                 "agent_name": agent_name,
@@ -321,6 +330,7 @@ def run_structured_llm_call(
                 "disabled": False,
                 "direct_api": True,
                 "fallback": True,
+                "execution_mode": "deterministic_fallback",
                 "error_type": exc.__class__.__name__,
                 "error": str(exc)[:500],
             },
@@ -342,6 +352,7 @@ def run_structured_llm_call(
             rationale_summary=rationale_summary or "Structured direct OpenAI output was validated; hidden reasoning was not stored.",
             tool_calls=(),
             provenance="pharma_os.agent_runtime.openai_api_structured_output",
+            execution_mode="direct_llm",
         ),
         trace_metadata={
             **response_metadata,
@@ -349,6 +360,7 @@ def run_structured_llm_call(
             "model": settings.model,
             "disabled": False,
             "direct_api": True,
+            "execution_mode": "direct_llm",
         },
     )
 
@@ -366,6 +378,7 @@ def _trace(
     rationale_summary: str,
     tool_calls: tuple[AgentToolCallTrace, ...],
     provenance: str,
+    execution_mode: ExecutionMode,
 ) -> AgentRunTrace:
     output_id = getattr(output, "output_id", None) or getattr(output, "brief_id", None)
     output_summary = _summarize_model(output)
@@ -381,6 +394,7 @@ def _trace(
         started_at=started_at,
         completed_at=completed_at,
         provenance=provenance,
+        execution_mode=execution_mode,
     )
     return AgentRunTrace(
         trace_id=f"trace-{uuid4()}",
@@ -398,6 +412,7 @@ def _trace(
         started_at=started_at,
         completed_at=completed_at,
         provenance=provenance,
+        execution_mode=execution_mode,
     )
 
 
@@ -433,12 +448,14 @@ def _offline_structured_result(
             rationale_summary=rationale_summary,
             tool_calls=(),
             provenance="pharma_os.agent_runtime.offline",
+            execution_mode="deterministic_fallback",
         ),
         trace_metadata={
             "agent_name": agent_name,
             "model": settings.model,
             "max_turns": settings.max_turns,
             "disabled": True,
+            "execution_mode": "deterministic_fallback",
             **(trace_metadata or {}),
         },
     )
@@ -472,6 +489,7 @@ def _extract_tool_calls(
                 started_at=started_at,
                 completed_at=completed_at,
                 provenance="pharma_os.agent_runtime.tool_call_summary",
+                execution_mode="live_agent",
             )
         )
     return tuple(calls)

@@ -1,4 +1,4 @@
-"""Planning-only Control Tower orchestration foundation."""
+"""Control Tower planning primitives for memory-aware orchestration."""
 
 from __future__ import annotations
 
@@ -56,6 +56,13 @@ def run_control_tower_agent(
         payload={
             "request": request.model_dump(mode="json"),
             "scientific_state_snapshot": snapshot.model_dump(mode="json"),
+            "pending_decision": snapshot.pending_decision.model_dump(mode="json") if snapshot.pending_decision else None,
+            "evidence_requirements": [requirement.model_dump(mode="json") for requirement in snapshot.evidence_requirements],
+            "requirement_satisfaction": [item.model_dump(mode="json") for item in snapshot.requirement_satisfaction],
+            "critical_evidence_gaps": snapshot.critical_evidence_gaps,
+            "unresolved_claims": snapshot.unresolved_claims,
+            "contradictory_claims": snapshot.contradictory_claims,
+            "human_gates": [gate.model_dump(mode="json") for gate in snapshot.open_gates],
             "workflow_registry": [capability.model_dump(mode="json") for capability in effective_registry.capabilities()],
             "constraint": "Return only an ExecutionPlan. Do not execute workflows or fabricate unavailable module outputs.",
         },
@@ -67,7 +74,7 @@ def run_control_tower_agent(
         offline_output=fallback,
         source_ids=(),
         confidence=fallback.confidence,
-        rationale_summary="Planning-only Control Tower agent produced a typed ExecutionPlan.",
+        rationale_summary="Control Tower produced a typed ExecutionPlan for the orchestration loop.",
     )
 
 
@@ -80,7 +87,7 @@ def build_deterministic_execution_plan(
 ) -> ExecutionPlan:
     """Build an offline plan from registry and memory state."""
 
-    target_names = _infer_target_capabilities(request, registry)
+    target_names = _infer_target_capabilities(request, registry, snapshot=snapshot)
     ordered_names = _dependency_order(target_names, registry)
     steps: list[PlannedStep] = []
     changed_capabilities: set[str] = set()
@@ -95,6 +102,7 @@ def build_deterministic_execution_plan(
         step = _planned_step(
             capability=capability,
             request=request,
+            snapshot=snapshot,
             artifact=artifact,
             dependency_changed=dependency_changed,
             dependencies=dependencies,
@@ -131,7 +139,7 @@ def validate_execution_plan(
     snapshot: ScientificStateSnapshot,
     registry: WorkflowRegistry,
 ) -> tuple[ValidationResult, ...]:
-    """Validate a planning-only execution plan against deterministic rules."""
+    """Validate a Control Tower execution plan against deterministic rules."""
 
     results: list[ValidationResult] = []
     known = set(registry.names())
@@ -145,6 +153,8 @@ def validate_execution_plan(
         if step.capability_name not in known or capability is None:
             failures.append("unknown capability")
         else:
+            relevant_requirements = _requirements_for_capability(snapshot, capability)
+            unsatisfied_requirements = _unsatisfied_requirements_for_capability(snapshot, capability)
             if step.action != "block":
                 missing_deps = [dep for dep in capability.dependencies if dep not in satisfied]
                 if missing_deps:
@@ -157,14 +167,24 @@ def validate_execution_plan(
                         failures.append(f"missing dependency: {', '.join(missing_deps)}")
             if step.action in {"run", "refresh"} and (not capability.executable or capability.implementation_status != "implemented"):
                 failures.append("non-implemented capability cannot be executed")
+            if step.action in {"run", "refresh"} and snapshot.evidence_requirements and not relevant_requirements:
+                failures.append("capability does not address pending decision requirements")
+            if step.action in {"run", "refresh"} and relevant_requirements and not set(step.requirements_addressed):
+                failures.append("execution step does not cite decision evidence requirements")
+            if step.action in {"run", "refresh"} and relevant_requirements and not unsatisfied_requirements and not _refresh_justified(step, capability, plan.request, snapshot.artifacts, changed):
+                failures.append("capability does not address unmet decision requirements")
             if step.action == "reuse" and not _has_compatible_artifact(capability, snapshot.artifacts, step):
                 failures.append("reuse references missing or incompatible artifact")
+            if step.action == "reuse" and relevant_requirements and not _reuse_satisfies_addressed_requirements(step, snapshot):
+                failures.append("reuse does not satisfy cited decision evidence requirements")
             if step.action == "refresh" and not _refresh_justified(step, capability, plan.request, snapshot.artifacts, changed):
                 failures.append("refresh is not justified by force_refresh, incompatibility, staleness, or dependency changes")
             if step.action in {"run", "refresh"} and _has_blocking_dependency_gate(capability, snapshot.artifacts):
                 failures.append("execution would proceed through a blocking human gate")
             if step.action in {"run", "refresh"} and _has_compatible_artifact(capability, snapshot.artifacts, step) and not _refresh_justified(step, capability, plan.request, snapshot.artifacts, changed):
                 failures.append("unnecessary rerun when a compatible artifact is available")
+            if snapshot.contradictory_claims and step.action not in {"block", "refresh", "run"} and not step.human_gate_required:
+                failures.append("plan does not address unresolved contradictory claims")
 
         if step.action in {"run", "refresh"}:
             changed.add(step.capability_name)
@@ -192,12 +212,16 @@ def _planned_step(
     *,
     capability: ModuleCapability,
     request: OrchestrationRequest,
+    snapshot: ScientificStateSnapshot,
     artifact: ArtifactStatus | None,
     dependency_changed: bool,
     dependencies: tuple[str, ...],
 ) -> PlannedStep:
     forced = _force_refreshes(capability, request)
     blocking_reasons = _blocking_reasons(capability, artifact)
+    requirements = _requirements_for_capability(snapshot, capability)
+    unsatisfied = _unsatisfied_requirements_for_capability(snapshot, capability)
+    requirements_addressed = tuple(requirement.requirement_id for requirement in (unsatisfied or requirements))
     if _skip_requested(capability, request):
         return PlannedStep(
             step_id=f"step-{uuid4()}",
@@ -209,6 +233,9 @@ def _planned_step(
             depends_on=dependencies,
             executable=False,
             confidence=0.75,
+            requirements_addressed=requirements_addressed,
+            decision_rationale="Explicit user-requested skip; skipped requirements remain unsatisfied.",
+            stop_reason="Skipped by objective.",
         )
     if not capability.executable or capability.implementation_status != "implemented":
         return PlannedStep(
@@ -223,6 +250,9 @@ def _planned_step(
             human_gate_required=True,
             executable=False,
             confidence=0.85,
+            requirements_addressed=requirements_addressed,
+            decision_rationale=f"{capability.name} is in the registry but cannot execute without required connectors/data.",
+            stop_reason=f"{capability.name} remains blocked until missing connectors are available.",
         )
     if artifact and artifact.compatibility == "compatible" and not forced and not dependency_changed:
         return PlannedStep(
@@ -239,6 +269,10 @@ def _planned_step(
             human_gate_required=bool(artifact.open_gates),
             executable=False,
             confidence=artifact.confidence or 0.65,
+            requirements_addressed=requirements_addressed,
+            decision_rationale=f"Compatible artifacts satisfy current decision requirements for {capability.name}.",
+            expected_state_change="No state change; reuse existing Scientific Memory artifact.",
+            stop_reason="Human review remains required for reused artifact gates." if artifact.open_gates else None,
         )
     if blocking_reasons:
         return PlannedStep(
@@ -255,6 +289,9 @@ def _planned_step(
             human_gate_required=True,
             executable=False,
             confidence=0.8,
+            requirements_addressed=requirements_addressed,
+            decision_rationale=f"{capability.name} cannot safely close decision requirements until blocking issues are resolved.",
+            stop_reason="Blocked by gates, incompatible upstream artifacts, or unavailable connectors.",
         )
     if artifact:
         reason = "Refresh because requested force_refresh applies." if forced else "Refresh because dependency outputs will change." if dependency_changed else "Refresh incompatible or stale artifact."
@@ -272,7 +309,11 @@ def _planned_step(
             human_gate_required=False,
             executable=True,
             confidence=0.68,
+            requirements_addressed=requirements_addressed,
+            decision_rationale=f"Refresh {capability.name} to satisfy stale, incompatible, forced, or dependency-changed requirements.",
+            expected_state_change=f"Updated {', '.join(capability.produced_artifacts)} artifacts.",
         )
+    mandatory_review = "mandatory" in capability.human_gate_policy.casefold()
     return PlannedStep(
         step_id=f"step-{uuid4()}",
         capability_name=capability.name,
@@ -282,15 +323,21 @@ def _planned_step(
         produced_artifacts=capability.produced_artifacts,
         depends_on=dependencies,
         blocked_by=(),
-        human_gate_required=False,
+        human_gate_required=mandatory_review,
         executable=True,
         confidence=0.7,
+        requirements_addressed=requirements_addressed,
+        decision_rationale=f"Run {capability.name} because required decision evidence is missing.",
+        expected_state_change=f"New {', '.join(capability.produced_artifacts)} artifacts.",
+        stop_reason=capability.human_gate_policy if mandatory_review else None,
     )
 
 
-def _infer_target_capabilities(request: OrchestrationRequest, registry: WorkflowRegistry) -> tuple[str, ...]:
+def _infer_target_capabilities(request: OrchestrationRequest, registry: WorkflowRegistry, *, snapshot: ScientificStateSnapshot | None = None) -> tuple[str, ...]:
     text = f"{request.objective} {' '.join(request.identifiers.values())}".casefold()
     targets: list[str] = []
+    if snapshot and snapshot.pending_decision and snapshot.pending_decision.target_capability_name in registry.names():
+        targets.append(snapshot.pending_decision.target_capability_name)
     keyword_map = (
         ("protocol_design", ("protocol", "next study", "next-study", "study design", "agent 5", "phase ii", "phase iii")),
         ("due_diligence", ("diligence", "asset memo", "commercial", "rnpv", "pricing", "agent 4")),
@@ -385,6 +432,39 @@ def _has_blocking_dependency_gate(capability: ModuleCapability, artifacts: tuple
         if artifact.artifact_type in required and any(gate.decision in {"blocked", "rejected"} for gate in artifact.open_gates):
             return True
     return False
+
+
+def _requirements_for_capability(snapshot: ScientificStateSnapshot, capability: ModuleCapability) -> tuple[object, ...]:
+    return tuple(
+        requirement
+        for requirement in snapshot.evidence_requirements
+        if capability.name in requirement.accepted_producers
+    )
+
+
+def _unsatisfied_requirements_for_capability(snapshot: ScientificStateSnapshot, capability: ModuleCapability) -> tuple[object, ...]:
+    satisfaction = {result.requirement_id: result for result in snapshot.requirement_satisfaction}
+    return tuple(
+        requirement
+        for requirement in _requirements_for_capability(snapshot, capability)
+        if satisfaction.get(requirement.requirement_id) is None
+        or satisfaction[requirement.requirement_id].status != "satisfied"
+    )
+
+
+def _reuse_satisfies_addressed_requirements(step: PlannedStep, snapshot: ScientificStateSnapshot) -> bool:
+    if not step.requirements_addressed:
+        return True
+    satisfaction = {result.requirement_id: result for result in snapshot.requirement_satisfaction}
+    for requirement_id in step.requirements_addressed:
+        result = satisfaction.get(requirement_id)
+        if result is None or result.status != "satisfied":
+            return False
+        if step.reuse_output_id and step.reuse_output_id not in result.satisfying_artifact_output_ids:
+            return False
+        if step.reuse_run_id and step.reuse_run_id not in result.satisfying_run_ids:
+            return False
+    return True
 
 
 def _force_refreshes(capability: ModuleCapability, request: OrchestrationRequest) -> bool:

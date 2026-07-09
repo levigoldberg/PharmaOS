@@ -51,18 +51,19 @@ def build_run_html(run_id: str, *, memory: MemoryStore | None = None) -> str:
                 ),
             ),
             _workflow_report_section(bundle.output_json, run.workflow_name),
+            _execution_mode_summary_section(bundle),
             _human_readable_summary_section(bundle.output_json),
             _section("Source-Backed Claims", _claims_cards(bundle.claims)),
             _json_details("Input JSON", bundle.input_json),
             _json_details("Output JSON", bundle.output_json),
             _json_details("Trace Metadata", bundle.trace_metadata_json),
-            _table_section("Agent Outputs", bundle.agent_outputs, ("output_id", "agent_name", "confidence", "validation_status", "gate_reason")),
+            _table_section("Agent Outputs", bundle.agent_outputs, ("output_id", "agent_name", "execution_mode", "confidence", "validation_status", "gate_reason")),
             _table_section("Sources", bundle.sources, ("source_id", "title", "source_type", "provenance", "url")),
             _table_section("Claims", bundle.claims, ("claim_id", "claim_text", "source_ids", "confidence", "confidence_level")),
             _table_section("Validation Results", bundle.validation_results, ("validation_id", "target_id", "status", "validator", "message")),
             _table_section("Confidence Flags", bundle.confidence_flags, ("flag_id", "target_id", "severity", "reason", "confidence")),
             _table_section("Human Gates", bundle.human_gates, ("gate_id", "decision", "gate_reason", "required_roles", "reviewer")),
-            _table_section("Agent Traces", bundle.agent_traces, ("trace_id", "agent_name", "output_id", "output_type", "confidence", "rationale_summary")),
+            _table_section("Agent Traces", bundle.agent_traces, ("trace_id", "agent_name", "execution_mode", "output_id", "output_type", "confidence", "rationale_summary")),
             _json_details("Raw Bundle JSON", _bundle_json(bundle)),
             "</main></body></html>",
         ]
@@ -89,6 +90,39 @@ def _workflow_report_section(output_json: Any, workflow_name: str) -> str:
     if workflow_name == "protocol_design" or "protocol_design_brief" in output_json:
         return _protocol_design_report(output_json)
     return ""
+
+
+def _execution_mode_summary_section(bundle: Any) -> str:
+    summary = None
+    if isinstance(bundle.output_json, dict):
+        summary = bundle.output_json.get("execution_mode_summary")
+        report = _dict(bundle.output_json.get("report"))
+        summary = summary or report.get("execution_mode_summary")
+    if not summary and bundle.reports:
+        latest = bundle.reports[-1]
+        summary = latest.execution_mode_summary.model_dump(mode="json")
+    if not isinstance(summary, dict):
+        return ""
+    return _section(
+        "AI Execution Mode",
+        _two_col(
+            _kv_table(
+                {
+                    "summary": summary.get("summary"),
+                    "requested_reasoning_steps": summary.get("requested_reasoning_steps"),
+                    "live_ai_calls_completed": summary.get("live_ai_calls_completed"),
+                    "deterministic_fallbacks_used": summary.get("deterministic_fallbacks_used"),
+                }
+            ),
+            _kv_table(
+                {
+                    "live_agent_calls_completed": summary.get("live_agent_calls_completed"),
+                    "direct_llm_calls_completed": summary.get("direct_llm_calls_completed"),
+                    "reused_artifacts_used": summary.get("reused_artifacts_used"),
+                }
+            ),
+        ),
+    )
 
 
 def _control_tower_report(output: dict[str, Any]) -> str:
@@ -147,6 +181,17 @@ def _control_tower_report(output: dict[str, Any]) -> str:
                     ),
                 ),
             ),
+            _section(
+                "Decision Evidence",
+                _cards(
+                    [
+                        ("Pending Decision", _paragraphs([report.get("pending_decision_summary") or "No pending decision was recorded."])),
+                        ("Evidence Requirements", _bullets(_list(report.get("evidence_requirement_summaries")) or ["None recorded."])),
+                        ("Critical Gaps", _bullets(_list(report.get("critical_evidence_gaps")) or ["None recorded."])),
+                        ("Unresolved Or Contradictory Claims", _bullets([*_list(report.get("unresolved_claims")), *_list(report.get("contradictory_claims"))] or ["None recorded."])),
+                    ]
+                ),
+            ),
             _section("Plans", _control_tower_plan_tables(plans)),
             _section("Step Results", _control_tower_step_table(steps)),
             _section(
@@ -196,13 +241,14 @@ def _control_tower_step_table(steps: list[Any]) -> str:
             "reused_run": step.get("reused_run_id"),
             "output": step.get("output_id") or step.get("reused_output_id"),
             "validation": step.get("validation_status"),
+            "mode": step.get("execution_mode"),
             "state_changed": step.get("state_changed"),
             "rationale": step.get("rationale"),
         }
         for step in steps
         if isinstance(step, dict)
     ]
-    return _dict_table(rows, ("capability", "action", "status", "child_run", "reused_run", "output", "validation", "state_changed", "rationale"))
+    return _dict_table(rows, ("capability", "action", "status", "mode", "child_run", "reused_run", "output", "validation", "state_changed", "rationale"))
 
 
 def _control_tower_artifact_table(artifacts: list[Any]) -> str:

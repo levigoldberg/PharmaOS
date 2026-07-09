@@ -4,27 +4,70 @@
 
 Build a lean AI-native pharma operating system prototype.
 
-The system coordinates specialized agents across the pharma lifecycle: discovery, tox/PKPD, trial intelligence, due diligence, protocol writing, enrollment, trial execution, BioFactory/manufacturing, launch/PV, and regulatory/audit.
+PharmaOS coordinates specialized agents and deterministic tools across the pharma lifecycle. The current executable clinical-development slice is Agent 3 clinical outcome prediction, Agent 4 due diligence, and Agent 5 protocol design, governed by Scientific Memory and the Control Tower.
 
-The goal is multiple real-data vertical slices sharing one architecture.
+## Current Architecture
 
-## Core lifecycle
+The current orchestration architecture is:
 
-Every workflow should follow:
+Objective -> Scientific Memory -> Control Tower -> Capability Registry -> run/reuse/refresh/skip/block -> specialist workflow -> validation/human gates -> memory update -> replan.
+
+The Control Tower must choose the minimum justified path for the objective. It should reason over the typed Scientific State Snapshot: pending downstream decision, evidence requirements, requirement satisfaction, unresolved or contradictory claims, critical gaps, stale or incompatible artifacts, human gates, and blocked capabilities. It should reuse compatible Scientific Memory artifacts, refresh stale or invalidated artifacts, skip explicitly skipped capabilities, block unavailable modules with missing connectors, and replan after material state changes.
+
+Control Tower prompting is not the source of truth for evidence logic. Deterministic code builds Scientific State, assesses freshness and compatibility, detects evidence gaps and gates, validates plans, and blocks skeleton modules. The live Control Tower uses the OpenAI Agents SDK for planning/replanning over that state. The deterministic fallback planner exists for offline operation and tests and should stay minimal.
+
+AI execution mode must be impossible to miss. Important reasoning traces, agent-output envelopes, workflow outputs, Control Tower records, and reports must surface one of: `live_agent`, `direct_llm`, `deterministic_fallback`, or `reused_artifact`. Do not rely only on trace metadata for fallback visibility.
+
+Implemented executable workflows:
+
+- `clinical_outcome_prediction`: Agent 3 clinical outcome/risk context for one NCT ID.
+- `due_diligence`: Agent 4 clinical-stage due diligence using Agent 3 handoff plus public/source-backed diligence tools.
+- `protocol_design`: Agent 5 draft next-study protocol design brief using Agent 3/4 handoffs and analog benchmarking.
+
+Compatibility route:
+
+- `trial_intelligence`: legacy CLI route over the internal Agent 3 trial-landscape component. It is not a separate top-level LLM agent.
+
+Registered non-executable skeletons:
+
+- `discovery`
+- `tox_pkpd_safety`
+- `enrollment_feasibility`
+- `trial_execution`
+- `manufacturing_biofactory`
+- `launch_pv`
+- `regulatory_quality_audit`
+
+Skeleton capabilities are registry entries with evidence requirements. They allow the Scientific State and Control Tower to explain unavailable modules and missing connectors; they must not be executed or filled with fake data.
+
+## Core Lifecycle
+
+Executable workflows should follow:
 
 input
-→ deterministic tools/API retrieval
-→ specialist agent reasoning
-→ typed Pydantic output
-→ validation/confidence scoring
-→ Scientific Memory write
-→ report/audit output
+-> deterministic tools/API retrieval
+-> specialist agent reasoning
+-> typed Pydantic output
+-> validation/confidence scoring
+-> Scientific Memory write
+-> report/audit output
 
-Automate by default. Add human gates only for high-risk scientific, clinical, regulatory, safety, consent, GMP, promotional, or major capital-allocation decisions.
+Control Tower orchestration wraps those workflows with planning, artifact reuse, refresh decisions, blocking, and replanning.
 
-## Framework decisions
+Automate by default. Add human gates for high-risk scientific, clinical, regulatory, safety, consent, GMP, promotional, or major capital-allocation decisions.
 
-- Use OpenAI Agents SDK for agents and orchestration.
+## Documentation Currency Rule
+
+Whenever a change affects architecture, workflows, capabilities, runtime behavior, CLI commands, implementation status, data contracts, validation behavior, or agent/tool boundaries, update the relevant documentation in the same change.
+
+`AGENTS.md`, `README.md`, and architecture docs must not knowingly remain stale after implementation changes. If implementation and docs disagree, fix the docs or explicitly document the temporary gap before finishing the change.
+
+## Framework Decisions
+
+- Use OpenAI Agents SDK for bounded agent reasoning and Control Tower planning.
+- Use direct structured OpenAI calls only for narrow one-shot reasoning where agentic coordination is unnecessary.
+- Preserve deterministic fallbacks when configured or when live execution fails, and surface fallback counts in typed outputs and reports.
+- Keep Python workflow functions as the deterministic control plane.
 - Use Pydantic v2 for typed schemas.
 - Use SQLite for Scientific Memory.
 - Use httpx for API clients.
@@ -33,58 +76,39 @@ Automate by default. Add human gates only for high-risk scientific, clinical, re
 - Streamlit or another UI may be added only after CLI workflows work.
 - Do not add LangChain, LangGraph, Neo4j, FastAPI, React, Docker, Postgres, or a vector database unless explicitly justified.
 
-## Repo layout
+## Repo Layout
 
-- `docs/`: project brief, architecture decisions, source prompt, build plan.
+- `docs/`: project brief, architecture decisions, and historical lean build plan.
 - `src/pharma_os/cli.py`: command-line entry point.
-- `src/pharma_os/orchestrator.py`: control tower orchestration.
+- `src/pharma_os/orchestrator.py`: direct workflow runs plus Control Tower orchestration.
+- `src/pharma_os/control_tower.py`: Control Tower planning primitives and plan validation.
+- `src/pharma_os/control_tower_state.py`: deterministic Scientific State decision, requirement, gap, and blocking helpers.
+- `src/pharma_os/registry.py`: Capability Registry for implemented workflows and skeleton modules.
 - `src/pharma_os/schemas.py`: Pydantic models.
 - `src/pharma_os/memory.py`: SQLite Scientific Memory.
 - `src/pharma_os/validators.py`: validation and confidence scoring.
-- `src/pharma_os/report.py`: final reports.
-- `src/pharma_os/agents/`: specialist agents.
-- `src/pharma_os/tools/`: deterministic API clients and calculators.
-- `src/pharma_os/workflows/`: vertical slices.
+- `src/pharma_os/report.py` and `src/pharma_os/html_report.py`: reports and run viewers.
+- `src/pharma_os/agents/`: specialist agents and SDK-backed bounded reasoning.
+- `src/pharma_os/tools/`: deterministic API clients, adapters, and calculators.
+- `src/pharma_os/components/`: reusable deterministic workflow components.
+- `src/pharma_os/workflows/`: executable vertical slices.
 - `tests/`: unit and workflow tests.
 
-## Priority workflows
+## Existing Reusable Repo
 
-Implement multiple workflows where real data is available:
+The old `levigoldberg/ClinicalTrialIntel` project is reusable source material for clinical trial intelligence and due diligence only. Do not copy its whole NCT-centered architecture into PharmaOS.
 
-1. Discovery / target landscape
-2. Tox / PKPD / safety screen
-3. Trial intelligence + due diligence
-4. Protocol + enrollment feasibility
-5. Launch / RWE / pharmacovigilance
-6. BioFactory only if real public tools/data make it feasible
+Reusable pieces include ClinicalTrials.gov, RxNorm, PubMed/Europe PMC, asset identity, patent/LOE, PoS, pricing, commercial model, rNPV, report aggregation, and test patterns.
 
-## Existing reusable repo
-
-Before implementing the Trial Intelligence / Due Diligence workflow, inspect:
-
-- `levigoldberg/ClinicalTrialIntel`
-
-Use it as reusable source material for that workflow only. Do not copy its whole NCT-centered architecture into this project.
-
-Likely reusable pieces:
-
-- ClinicalTrials.gov client
-- RxNorm normalization
-- PubMed / Europe PMC retrieval
-- asset identity logic
-- patent / LOE workflow
-- PoS classification + deterministic lookup
-- pricing, commercial model, and rNPV calculators
-- report aggregation and test patterns
-
-Adapt reused code to this project’s architecture:
+Adapt reused code to this architecture:
 
 - deterministic retrieval/calculation belongs in `tools/`
 - bounded reasoning belongs in `agents/`
 - workflow sequencing belongs in `workflows/`
+- shared reusable logic belongs in `components/`
 - outputs, evidence claims, validation results, confidence flags, and human gates must be saved to Scientific Memory
 
-## API/tool rules
+## API/Tool Rules
 
 API tools must:
 
@@ -109,7 +133,7 @@ Priority APIs:
 - RxNorm
 - FDA / EMA / ICH regulatory documents where feasible
 
-## Agent rules
+## Agent Rules
 
 Each agent must:
 
@@ -139,7 +163,7 @@ Scientific Memory stores:
 
 Do not store unsupported free text as fact. Store claims with source metadata, confidence, and validation status.
 
-## Validation rules
+## Validation Rules
 
 After each workflow or agent output:
 
@@ -153,11 +177,11 @@ After each workflow or agent output:
 
 Failed validation should be visible in reports.
 
-## Data policy
+## Data Policy
 
 Prefer real API data and open-source tools.
 
-Do not create fake patient, site, batch, EHR, CTMS, EDC, MES, LIMS, or manufacturing data by default. If a module requires unavailable regulated data or physical systems, return a typed `not_implemented` result with the missing connector or required system.
+Do not create fake patient, site, batch, EHR, CTMS, EDC, MES, LIMS, or manufacturing data by default. If a module requires unavailable regulated data or physical systems, return a typed `not_implemented` result or a blocked skeleton capability with the missing connector or required system.
 
 ## Shared Artifact Reuse Rule
 
@@ -180,5 +204,6 @@ Use these commands when available:
 ```bash
 python -m pytest
 python -m pharma_os run <workflow> [args]
+python -m pharma_os orchestrate --goal "<objective>" [args]
 python -m pharma_os report --run-id <RUN_ID>
 ```

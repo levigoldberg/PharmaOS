@@ -34,6 +34,72 @@ def test_search_trials_normalizes_fixture() -> None:
     assert result.sources[0].source_id == "ctgov:NCT01234567"
 
 
+def test_search_trials_normalizes_structured_design_and_arm_fields() -> None:
+    payload = {
+        "studies": [
+            {
+                "hasResults": False,
+                "protocolSection": {
+                    "identificationModule": {"nctId": "NCT01234567", "briefTitle": "Structured design trial"},
+                    "statusModule": {},
+                    "designModule": {
+                        "studyType": "INTERVENTIONAL",
+                        "allocation": "RANDOMIZED",
+                        "interventionModel": "PARALLEL",
+                        "maskingInfo": {"masking": "DOUBLE"},
+                        "observationalModel": "COHORT",
+                        "numberOfArms": 2,
+                    },
+                    "conditionsModule": {"conditions": ["Glioblastoma"]},
+                    "armsInterventionsModule": {
+                        "armGroups": [
+                            {
+                                "label": "Experimental Arm",
+                                "type": "EXPERIMENTAL",
+                                "description": "Examplemab arm",
+                                "interventionNames": ["Drug: Examplemab"],
+                            },
+                            {
+                                "label": "Placebo Control",
+                                "type": "PLACEBO_COMPARATOR",
+                                "description": "Placebo arm",
+                                "interventionNames": ["Drug: Placebo"],
+                            },
+                        ],
+                        "interventions": [
+                            {
+                                "name": "Examplemab",
+                                "type": "DRUG",
+                                "armGroupLabels": ["Experimental Arm"],
+                            },
+                            {
+                                "name": "Placebo",
+                                "type": "DRUG",
+                                "armGroupLabels": ["Placebo Control"],
+                            },
+                        ],
+                    },
+                },
+            }
+        ]
+    }
+
+    client = ClinicalTrialsGovClient(
+        client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+    )
+    result = client.search_trials(ClinicalTrialIntelligenceInput(disease="glioblastoma"))
+    trial = result.trials[0]
+
+    assert trial.allocation == "RANDOMIZED"
+    assert trial.intervention_model == "PARALLEL"
+    assert trial.masking == "DOUBLE"
+    assert trial.observational_model == "COHORT"
+    assert trial.number_of_arms == 2
+    assert trial.arm_groups[1].label == "Placebo Control"
+    assert trial.arm_groups[1].intervention_names == ("Drug: Placebo",)
+    assert trial.interventions[0].arm_group_labels == ("Experimental Arm",)
+
+
 def test_fetch_trial_rejects_missing_protocol_section() -> None:
     client = ClinicalTrialsGovClient(
         client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))

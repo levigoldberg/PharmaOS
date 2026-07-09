@@ -12,6 +12,8 @@ from pharma_os.schemas import (
     Agent4HandoffReference,
     AgentOutput,
     AnalogCandidateRecord,
+    AnalogSearchPlanOutput,
+    AnalogTrialSelectionOutput,
     ApprovalLikelihoodProxy,
     AssetIdentityOutput,
     AssetMemo,
@@ -24,6 +26,7 @@ from pharma_os.schemas import (
     CommercialModelOutput,
     ComparatorBenchmarkBundle,
     CompetitiveLandscapeSummary,
+    CTGovSearchQuery,
     DueDiligenceInput,
     DueDiligenceOutput,
     EndpointRiskAssessment,
@@ -39,8 +42,10 @@ from pharma_os.schemas import (
     RNPVOutput,
     SafetyContext,
     SafetyLabelSummary,
+    SelectedAnalogTrial,
     SourceAvailabilityReport,
     SourceMetadata,
+    TrialArmGroup,
     TrialDesignFeatures,
     TrialEndpoint,
     TrialIdentity,
@@ -103,6 +108,54 @@ def _analog(nct_id: str, *, enrollment: int | None = 100, status: str = "COMPLET
         eligibility_criteria="Inclusion Criteria: diagnosis; measurable disease; biomarker testing. Exclusion Criteria: infection; cardiac disease; prior therapy.",
         locations=(),
         source_id=f"ctgov:{nct_id}",
+    )
+
+
+def _benchmark_for_trials(trials: tuple[ClinicalTrialRecord, ...]):
+    plan = AnalogSearchPlanOutput(
+        output_id="search-plan",
+        target_nct_id="NCT12345678",
+        queries=(
+            CTGovSearchQuery(
+                query_id="q1",
+                condition="Glioblastoma",
+                expected_analog_dimension="structured design fixture",
+                rationale="Fixture query.",
+            ),
+        ),
+        rationale="Fixture search plan.",
+    )
+    candidates = tuple(
+        AnalogCandidateRecord(
+            candidate_id=f"candidate-{trial.nct_id}",
+            trial=trial,
+            query_ids=("q1",),
+            source_ids=(trial.source_id,),
+            provenance="test",
+        )
+        for trial in trials
+    )
+    selection = AnalogTrialSelectionOutput(
+        output_id="selection",
+        target_nct_id="NCT12345678",
+        selected_analogs=tuple(
+            SelectedAnalogTrial(
+                nct_id=trial.nct_id,
+                match_score=0.9,
+                match_confidence="high",
+                reasoning="Fixture selected analog.",
+                source_ids=(trial.source_id,),
+            )
+            for trial in trials
+        ),
+        confidence=0.9,
+    )
+    return calculate_analog_benchmark(
+        run_id="run",
+        target_trial=_target_trial(),
+        candidates=candidates,
+        selection=selection,
+        search_plan=plan,
     )
 
 
@@ -207,6 +260,52 @@ def test_calculate_analog_benchmark_handles_missing_values() -> None:
     assert bundle.enrollment.missing_count == 1
     assert bundle.primary_endpoint_family_frequency
     assert any(flag.field == "enrollment" for flag in bundle.missing_data_flags)
+
+
+def test_analog_benchmark_prefers_structured_design_fields() -> None:
+    structured_trial = _analog("NCT00000001").model_copy(
+        update={
+            "brief_title": "Dose exploration without design keywords",
+            "allocation": "RANDOMIZED",
+            "masking": "DOUBLE",
+            "number_of_arms": 2,
+            "arm_groups": (
+                TrialArmGroup(label="Experimental", type="EXPERIMENTAL", intervention_names=("Drug: Analogmab",)),
+                TrialArmGroup(label="Placebo Control", type="PLACEBO_COMPARATOR", intervention_names=("Drug: Placebo",)),
+            ),
+            "interventions": (
+                TrialIntervention(name="Analogmab", type="DRUG", arm_group_labels=("Experimental",)),
+                TrialIntervention(name="Comparator Without Placebo Keyword", type="DRUG", arm_group_labels=("Placebo Control",)),
+            ),
+        }
+    )
+
+    bundle = _benchmark_for_trials((structured_trial,))
+
+    assert bundle.randomized_frequency[0].label == "randomized"
+    assert bundle.blinding_frequency[0].label == "blinded_or_masked"
+    assert bundle.arm_count_distribution[0].label == "2"
+    assert bundle.comparator_categories[0].label == "placebo_control"
+
+
+def test_analog_benchmark_uses_heuristics_when_structured_fields_missing() -> None:
+    heuristic_trial = _analog("NCT00000001").model_copy(
+        update={
+            "brief_title": "Randomized open-label analog study",
+            "allocation": None,
+            "masking": None,
+            "number_of_arms": None,
+            "arm_groups": (),
+            "interventions": (TrialIntervention(name="Analogmab", type="DRUG"), TrialIntervention(name="Placebo", type="DRUG")),
+        }
+    )
+
+    bundle = _benchmark_for_trials((heuristic_trial,))
+
+    assert bundle.randomized_frequency[0].label == "randomized"
+    assert bundle.blinding_frequency[0].label == "open_label"
+    assert bundle.arm_count_distribution[0].label == "2"
+    assert bundle.comparator_categories[0].label == "placebo_control"
 
 
 def test_next_study_intent_does_not_blindly_increment_phase() -> None:
@@ -463,6 +562,39 @@ def test_protocol_design_llm_base_payload_is_compact() -> None:
     assert len(payload["target_trial"]["eligibility_criteria"]) < 2600
     assert payload["agent3_context"]["output_id"] == agent3.output_id
     assert payload["agent4_context"]["output_id"] == agent4.output_id
+
+
+def test_protocol_design_workflow_dedupes_unhashable_missing_flags(monkeypatch) -> None:
+    agent3, handoff3, agent4, handoff4 = _handoffs()
+    monkeypatch.setattr(protocol_design, "_get_or_run_agent3", lambda input_data, memory: (agent3, handoff3))
+    monkeypatch.setattr(protocol_design, "_get_or_run_agent4", lambda input_data, memory: (agent4, handoff4))
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            analog = _analog("NCT00000001", enrollment=None)
+            return ClinicalTrialsSearchResult(
+                query=input_data,
+                trials=(analog,),
+                sources=(_source(analog.source_id, "clinical_trial_registry"),),
+                api_url="https://clinicaltrials.gov/api/v2/studies",
+            )
+
+    monkeypatch.setattr(
+        protocol_design,
+        "execute_ctgov_search_plan",
+        lambda search_plan, target_nct_id: execute_ctgov_search_plan(
+            search_plan=search_plan,
+            target_nct_id=target_nct_id,
+            client=FakeClient(),
+        ),
+    )
+
+    output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=MemoryStore(":memory:"))
+
+    flag_ids = [flag.flag_id for flag in output.analog_benchmark_bundle.missing_data_flags]
+    assert flag_ids
+    assert len(flag_ids) == len(set(flag_ids))
+    assert any(flag.field == "enrollment" for flag in output.analog_benchmark_bundle.missing_data_flags)
 
 
 def test_protocol_design_validator_blocks_over_final_language(monkeypatch) -> None:

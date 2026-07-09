@@ -8,6 +8,20 @@ The system should use a control tower plus specialist agents. Workflows should b
 
 Do not use LangChain or LangGraph unless the current orchestrator becomes too hard to maintain.
 
+The current Control Tower flow is:
+
+Objective -> Scientific Memory -> Control Tower -> Capability Registry -> run/reuse/refresh/skip/block -> specialist workflow -> validation/human gates -> memory update -> replan.
+
+The Control Tower chooses the minimum justified path. It reuses compatible artifacts from Scientific Memory, refreshes stale or invalidated artifacts, blocks registered skeleton capabilities with missing connector reasons, and replans after material state changes.
+
+The Control Tower plans over a typed Scientific State Snapshot rather than keyword routing alone. Deterministic code infers the pending downstream decision, selects registry evidence requirements, assesses which artifacts satisfy each requirement, marks stale or incompatible artifacts, surfaces unresolved or contradictory claims, records critical evidence gaps and human gates, and lists blocked capabilities. The live Control Tower uses the OpenAI Agents SDK to plan and replan over this state. The offline deterministic fallback planner remains intentionally minimal for tests and offline operation.
+
+Execution-plan validation is deterministic. It checks dependency ordering, missing dependencies, skeleton-module execution attempts, reuse of missing or incompatible artifacts, unjustified refresh/rerun requests, blocking human gates, unrelated run/refresh steps that do not address pending decision requirements, and reuse steps that cite requirements their artifact does not satisfy.
+
+The current Capability Registry includes three implemented executable workflows: Agent 3 `clinical_outcome_prediction`, Agent 4 `due_diligence`, and Agent 5 `protocol_design`. It also includes registered non-executable skeletons for discovery, tox/PK-PD, enrollment feasibility, trial execution, manufacturing/biofactory, launch/PV, and regulatory/quality/audit.
+
+AI execution mode is a typed audit field, not hidden metadata. The allowed modes are `live_agent` for Agents SDK coordination, `direct_llm` for narrow direct structured OpenAI calls, `deterministic_fallback` for offline/configured or failure fallbacks, and `reused_artifact` for compatible Scientific Memory reuse. Reports and human-readable audit views must summarize execution counts.
+
 ## Scientific Memory
 
 Use SQLite first.
@@ -122,6 +136,8 @@ The Clinical Stage Due Diligence Agent expands Agent 4 with deterministic sectio
 
 Agent 5 is built around analog trial benchmarking. Bounded helper subagents create a CT.gov search plan, select analog trials, draft strategy/eligibility/schedule sections, and review gaps. Deterministic tools execute CT.gov retrieval, deduplicate and normalize candidates, calculate benchmark statistics, assemble template sections, validate source/numeric support, persist Scientific Memory artifacts, and create the human gate.
 
+Agent 5 analog benchmarking must prefer structured ClinicalTrials.gov design and arm fields, including allocation, intervention model, masking, observational model, number of arms, arm groups, and intervention-to-arm mappings. Free-text trial-title, intervention-name, and eligibility heuristics are fallback logic only when structured CT.gov fields are missing or insufficient.
+
 Allowed Agent 5 data sources are Agent 3 output, Agent 4 output, ClinicalTrials.gov, PubMed abstracts/metadata, openFDA label context, and local protocol templates/config checklists. Agent 5 must not add EHR, claims, OMOP, FHIR, patient matching, AACT, Trialtrove, GlobalData, SEC, EMA EPARs, Orange Book, DrugBank, proprietary data, fake patient/site/enrollment data, or final approval logic. Missing values become flags. The `AnalogBenchmarkBundle` is a first-class field in `ProtocolDesignOutput` and is persisted in Scientific Memory for later agents.
 
 ## Due-Diligence Data Layers
@@ -132,4 +148,4 @@ Agent 4 due diligence is organized only around real data layers currently implem
 - Discovery / IP-adjacent data: `tools/patents_lens.py` contains the Lens-only patent/LOE workflow and reviewed LOE fallback flags.
 - Commercial and safety data: `tools/pos.py`, `tools/pricing.py`, `tools/commercial_model.py`, and `tools/rnpv.py` contain the local PoS workbook lookup, local WAC/openFDA pricing evidence, deterministic commercial model, and deterministic rNPV.
 
-`tools/due_diligence.py` is a compatibility facade, not the implementation home. Do not create empty folders or stubs for Discovery, Safety/Translational, RWD, Manufacturing, broader Commercial/Safety, proprietary databases, or other future sources until real data/tools exist.
+`tools/due_diligence.py` is a compatibility facade, not the implementation home. Future capabilities may be registered as non-executable skeletons in the Capability Registry so the Control Tower can block them explicitly, but do not create executable tools, fake connectors, or empty implementation packages for Discovery, Safety/Translational, RWD, Manufacturing, broader Commercial/Safety, proprietary databases, or other future sources until real data/tools exist.

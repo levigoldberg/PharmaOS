@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from pharma_os.cli import main
+
+
+def test_top_level_help_includes_orchestrate(capsys):
+    """The source CLI exposes the Control Tower orchestration command."""
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+
+    assert exc_info.value.code == 0
+    assert "orchestrate" in capsys.readouterr().out
 
 
 def test_unknown_workflow_does_not_complete_successfully(capsys, tmp_path):

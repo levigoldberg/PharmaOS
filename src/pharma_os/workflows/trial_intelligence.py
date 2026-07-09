@@ -13,6 +13,7 @@ from pharma_os.schemas import (
     AgentOutput,
     ClinicalTrialIntelligenceInput,
     ClinicalTrialIntelligenceOutput,
+    ExecutionModeSummary,
     WorkflowRun,
 )
 from pharma_os.validators import (
@@ -100,6 +101,15 @@ def run_trial_intelligence_workflow(
     validation_status = aggregate_validation_status(validation_results)
     if human_gate and validation_status == "passed":
         validation_status = "needs_human_review"
+    execution_mode_summary = ExecutionModeSummary(
+        requested_reasoning_steps=1,
+        live_agent_calls_completed=0,
+        direct_llm_calls_completed=0,
+        live_ai_calls_completed=0,
+        deterministic_fallbacks_used=1,
+        reused_artifacts_used=0,
+        summary="1 reasoning steps requested, 0 live AI calls completed, 1 deterministic fallbacks used.",
+    )
 
     output = output.model_copy(
         update={
@@ -108,6 +118,7 @@ def run_trial_intelligence_workflow(
             "human_gate": human_gate,
             "validation_status": validation_status,
             "trace_metadata": trace_metadata,
+            "execution_mode_summary": execution_mode_summary,
         }
     )
 
@@ -121,6 +132,8 @@ def run_trial_intelligence_workflow(
         confidence=output.confidence,
         validation_status=validation_status,
         gate_reason=human_gate.gate_reason if human_gate else None,
+        execution_mode="deterministic_fallback",
+        execution_mode_summary=execution_mode_summary,
     )
 
     store.save_sources(run_id, output.sources)

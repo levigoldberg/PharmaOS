@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pharma_os.execution_modes import reused_artifacts_from_output, summarize_execution_modes
 from pharma_os.memory import MemoryStore
 from pharma_os.schemas import FinalReport
 from pharma_os.validators import aggregate_validation_status
@@ -27,7 +28,17 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
     latest_gate = bundle.human_gates[-1] if bundle.human_gates else None
     if latest_gate is not None and validation_status == "passed":
         validation_status = "needs_human_review"
-    summary = _summary(bundle)
+    execution_mode_summary = summarize_execution_modes(
+        bundle.agent_traces,
+        reused_artifacts=reused_artifacts_from_output(bundle.output_json),
+    )
+    if execution_mode_summary.requested_reasoning_steps == 0 and isinstance(bundle.output_json, dict):
+        output_summary = bundle.output_json.get("execution_mode_summary")
+        if isinstance(output_summary, dict):
+            from pharma_os.schemas import ExecutionModeSummary
+
+            execution_mode_summary = ExecutionModeSummary.model_validate(output_summary)
+    summary = _summary(bundle, execution_mode_summary.summary)
     confidence = _confidence(validation_status, bool(latest_gate), len(bundle.confidence_flags))
     report = FinalReport(
         report_id=f"report-{run_id}",
@@ -42,17 +53,19 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
         confidence=confidence,
         validation_status=validation_status,
         provenance="pharma_os.report.build_report",
+        execution_mode_summary=execution_mode_summary,
     )
     return store.save_report(report)
 
 
-def _summary(bundle: object) -> str:
+def _summary(bundle: object, execution_mode_summary: str) -> str:
     run = bundle.run
     if run is None:
         return "No persisted workflow details are available yet."
     parts = [
         f"Workflow {run.workflow_name} completed with status {run.status}.",
         f"Scientific Memory contains {len(bundle.sources)} sources and {len(bundle.claims)} claims.",
+        execution_mode_summary,
     ]
     if bundle.validation_results:
         parts.append(

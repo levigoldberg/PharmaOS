@@ -18,6 +18,7 @@ ValidationStatus = Literal["not_run", "passed", "failed", "warning", "needs_huma
 GateDecision = Literal["approved", "rejected", "needs_human_review", "blocked"]
 WorkflowStatus = Literal["pending", "running", "completed", "failed", "blocked"]
 MetadataValue = str | int | float | bool | None | list[str] | list[int] | list[float] | list[bool]
+ExecutionMode = Literal["live_agent", "direct_llm", "deterministic_fallback", "reused_artifact"]
 
 
 class StrictSchema(BaseModel):
@@ -29,6 +30,18 @@ class StrictSchema(BaseModel):
         validate_assignment=True,
         populate_by_name=True,
     )
+
+
+class ExecutionModeSummary(StrictSchema):
+    """Visible audit summary of how AI reasoning was executed."""
+
+    requested_reasoning_steps: int = Field(default=0, ge=0)
+    live_agent_calls_completed: int = Field(default=0, ge=0)
+    direct_llm_calls_completed: int = Field(default=0, ge=0)
+    live_ai_calls_completed: int = Field(default=0, ge=0)
+    deterministic_fallbacks_used: int = Field(default=0, ge=0)
+    reused_artifacts_used: int = Field(default=0, ge=0)
+    summary: str = "0 reasoning steps requested, 0 live AI calls completed, 0 deterministic fallbacks used."
 
 
 class SourceMetadata(StrictSchema):
@@ -134,6 +147,16 @@ class TrialIntervention(StrictSchema):
     type: str | None = None
     description: str | None = None
     other_names: tuple[str, ...] = Field(default_factory=tuple)
+    arm_group_labels: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class TrialArmGroup(StrictSchema):
+    """Normalized ClinicalTrials.gov arm group and intervention mapping."""
+
+    label: str = Field(..., min_length=1)
+    type: str | None = None
+    description: str | None = None
+    intervention_names: tuple[str, ...] = Field(default_factory=tuple)
 
 
 class TrialSponsor(StrictSchema):
@@ -171,8 +194,14 @@ class ClinicalTrialRecord(StrictSchema):
     overall_status: str | None = None
     phases: tuple[str, ...] = Field(default_factory=tuple)
     study_type: str | None = None
+    allocation: str | None = None
+    intervention_model: str | None = None
+    masking: str | None = None
+    observational_model: str | None = None
+    number_of_arms: int | None = Field(default=None, ge=0)
     conditions: tuple[str, ...] = Field(default_factory=tuple)
     interventions: tuple[TrialIntervention, ...] = Field(default_factory=tuple)
+    arm_groups: tuple[TrialArmGroup, ...] = Field(default_factory=tuple)
     lead_sponsor: TrialSponsor | None = None
     collaborators: tuple[TrialSponsor, ...] = Field(default_factory=tuple)
     enrollment_count: int | None = None
@@ -243,6 +272,7 @@ class ClinicalTrialIntelligenceOutput(StrictSchema):
     confidence: float = Field(default=0.75, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
     trace_metadata: dict[str, MetadataValue] = Field(default_factory=dict)
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class DueDiligenceInput(StrictSchema):
@@ -301,10 +331,65 @@ CapabilityLifecycleStage = Literal[
 CapabilityImplementationStatus = Literal["implemented", "skeleton", "planned", "deprecated"]
 ArtifactCompatibility = Literal["compatible", "incompatible", "unknown"]
 ArtifactFreshness = Literal["fresh", "stale", "unknown"]
+DecisionType = Literal[
+    "clinical_risk_assessment",
+    "clinical_stage_due_diligence",
+    "phase_transition",
+    "protocol_design",
+    "enrollment_feasibility",
+    "trial_execution",
+    "manufacturing_control",
+    "launch_pv",
+    "regulatory_quality_audit",
+    "discovery_prioritization",
+    "tox_pkpd_safety",
+    "unknown",
+]
+RequirementCriticality = Literal["low", "medium", "high", "critical"]
+RequirementSatisfactionStatus = Literal["satisfied", "partially_satisfied", "missing", "contradicted", "stale", "blocked"]
+
+
+class PendingDecision(StrictSchema):
+    """Decision context the Control Tower is planning toward."""
+
+    decision_id: str = Field(..., min_length=1)
+    decision_type: DecisionType
+    lifecycle_stage: CapabilityLifecycleStage
+    target_capability_name: str = Field(..., min_length=1)
+    requested_decision: str = Field(..., min_length=1)
+    rationale: str = Field(..., min_length=1)
+
+
+class EvidenceRequirement(StrictSchema):
+    """Decision-critical evidence requirement that artifacts may satisfy."""
+
+    requirement_id: str = Field(..., min_length=1)
+    decision_type: DecisionType
+    capability_name: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+    satisfying_artifact_types: tuple[str, ...] = Field(default_factory=tuple)
+    accepted_producers: tuple[str, ...] = Field(default_factory=tuple)
+    criticality: RequirementCriticality = "medium"
+    freshness_required: bool = True
+    validation_statuses: tuple[ValidationStatus, ...] = ("passed", "needs_human_review", "warning")
+    human_gate_must_be_clear: bool = False
+
+
+class RequirementSatisfaction(StrictSchema):
+    """Deterministic assessment of whether existing state satisfies a requirement."""
+
+    requirement_id: str = Field(..., min_length=1)
+    status: RequirementSatisfactionStatus
+    satisfying_artifact_output_ids: tuple[str, ...] = Field(default_factory=tuple)
+    satisfying_run_ids: tuple[str, ...] = Field(default_factory=tuple)
+    gaps: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_claims: tuple[str, ...] = Field(default_factory=tuple)
+    gates: tuple[HumanGate, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
 
 
 class OrchestrationRequest(StrictSchema):
-    """Planning-only request for the global Control Tower."""
+    """Request for the global Control Tower planning or orchestration loop."""
 
     objective: str = Field(..., min_length=1)
     nct_id: str | None = Field(default=None, pattern=r"^NCT\d{8}$")
@@ -313,6 +398,7 @@ class OrchestrationRequest(StrictSchema):
     identifiers: dict[str, str] = Field(default_factory=dict)
     assumptions: dict[str, MetadataValue] = Field(default_factory=dict)
     force_refresh: tuple[str, ...] = Field(default_factory=tuple)
+    decision_type: DecisionType | None = None
 
 
 class ModuleCapability(StrictSchema):
@@ -329,6 +415,7 @@ class ModuleCapability(StrictSchema):
     missing_connectors: tuple[str, ...] = Field(default_factory=tuple)
     human_gate_policy: str = Field(..., min_length=1)
     description: str = Field(..., min_length=1)
+    evidence_requirements: tuple[EvidenceRequirement, ...] = Field(default_factory=tuple)
 
 
 class WorkflowSpec(ModuleCapability):
@@ -369,10 +456,18 @@ class ScientificStateSnapshot(StrictSchema):
     open_gates: tuple[HumanGate, ...] = Field(default_factory=tuple)
     missing_artifacts: tuple[str, ...] = Field(default_factory=tuple)
     notes: tuple[str, ...] = Field(default_factory=tuple)
+    pending_decision: PendingDecision | None = None
+    evidence_requirements: tuple[EvidenceRequirement, ...] = Field(default_factory=tuple)
+    requirement_satisfaction: tuple[RequirementSatisfaction, ...] = Field(default_factory=tuple)
+    unresolved_claims: tuple[str, ...] = Field(default_factory=tuple)
+    contradictory_claims: tuple[str, ...] = Field(default_factory=tuple)
+    critical_evidence_gaps: tuple[str, ...] = Field(default_factory=tuple)
+    stale_or_incompatible_artifacts: tuple[ArtifactStatus, ...] = Field(default_factory=tuple)
+    blocked_capabilities: tuple[str, ...] = Field(default_factory=tuple)
 
 
 class PlannedStep(StrictSchema):
-    """One planning-only Control Tower action."""
+    """One Control Tower action in a plan."""
 
     step_id: str = Field(..., min_length=1)
     capability_name: str = Field(..., min_length=1)
@@ -387,10 +482,14 @@ class PlannedStep(StrictSchema):
     human_gate_required: bool = False
     executable: bool = False
     confidence: float = Field(default=0.5, ge=0, le=1)
+    requirements_addressed: tuple[str, ...] = Field(default_factory=tuple)
+    decision_rationale: str | None = None
+    expected_state_change: str | None = None
+    stop_reason: str | None = None
 
 
 class ExecutionPlan(StrictSchema):
-    """Planning-only output from the Control Tower agent."""
+    """Typed plan produced by the Control Tower agent."""
 
     output_id: str = Field(..., min_length=1)
     run_id: str = Field(..., min_length=1)
@@ -425,6 +524,7 @@ class OrchestrationStepResult(StrictSchema):
     before_snapshot_id: str = Field(..., min_length=1)
     after_snapshot_id: str | None = None
     plan_output_id: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "deterministic_fallback"
 
 
 class OrchestrationReplanRecord(StrictSchema):
@@ -449,11 +549,17 @@ class ControlTowerReport(StrictSchema):
     final_snapshot_id: str = Field(..., min_length=1)
     initial_state_summary: str = Field(..., min_length=1)
     final_state_summary: str = Field(..., min_length=1)
+    pending_decision_summary: str | None = None
+    evidence_requirement_summaries: tuple[str, ...] = Field(default_factory=tuple)
+    critical_evidence_gaps: tuple[str, ...] = Field(default_factory=tuple)
+    unresolved_claims: tuple[str, ...] = Field(default_factory=tuple)
+    contradictory_claims: tuple[str, ...] = Field(default_factory=tuple)
     plan_summaries: tuple[str, ...] = Field(default_factory=tuple)
     step_summaries: tuple[str, ...] = Field(default_factory=tuple)
     unresolved_gates: tuple[str, ...] = Field(default_factory=tuple)
     unavailable_modules: tuple[str, ...] = Field(default_factory=tuple)
     replan_summaries: tuple[str, ...] = Field(default_factory=tuple)
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class HumanReadableFinding(StrictSchema):
@@ -488,6 +594,7 @@ class HumanReadableModuleOutput(StrictSchema):
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.5, ge=0, le=1)
     provenance: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "deterministic_fallback"
 
 
 class AssumptionRecord(StrictSchema):
@@ -821,6 +928,7 @@ class ClinicalOutcomePredictionOutput(StrictSchema):
     human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class PricingOutput(StrictSchema):
@@ -1061,6 +1169,7 @@ class DueDiligenceOutput(StrictSchema):
     human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class Agent4HandoffReference(StrictSchema):
@@ -1339,6 +1448,7 @@ class ProtocolDesignOutput(StrictSchema):
     human_readable_summary: HumanReadableModuleOutput | None = None
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class AgentToolCallTrace(StrictSchema):
@@ -1355,6 +1465,7 @@ class AgentToolCallTrace(StrictSchema):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     provenance: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "live_agent"
 
 
 class AgentStepTrace(StrictSchema):
@@ -1371,6 +1482,7 @@ class AgentStepTrace(StrictSchema):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     provenance: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "deterministic_fallback"
 
 
 class AgentRunTrace(StrictSchema):
@@ -1391,6 +1503,7 @@ class AgentRunTrace(StrictSchema):
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
     provenance: str = Field(..., min_length=1)
+    execution_mode: ExecutionMode = "deterministic_fallback"
 
 
 class OrchestrationRunRecord(StrictSchema):
@@ -1409,6 +1522,7 @@ class OrchestrationRunRecord(StrictSchema):
     report: ControlTowerReport | None = None
     validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
     trace: AgentRunTrace | None = None
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
 class AgentOutput(StrictSchema):
@@ -1423,6 +1537,8 @@ class AgentOutput(StrictSchema):
     confidence: float = Field(..., ge=0.0, le=1.0, description="Overall output confidence.")
     validation_status: ValidationStatus = Field(default="not_run", description="Output validation status.")
     gate_reason: str | None = Field(default=None, description="Reason this output needs human review.")
+    execution_mode: ExecutionMode = Field(default="deterministic_fallback", description="How this output's reasoning was executed.")
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary, description="Visible AI execution mode counts for this output.")
 
 
 class FinalReport(StrictSchema):
@@ -1440,6 +1556,7 @@ class FinalReport(StrictSchema):
     confidence: float = Field(..., ge=0.0, le=1.0, description="Overall report confidence.")
     validation_status: ValidationStatus = Field(default="not_run", description="Aggregate report validation status.")
     provenance: str = Field(..., min_length=1, description="Assembly and review provenance.")
+    execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary, description="Visible AI execution mode counts for this report.")
 
 
 class NotImplementedOutput(StrictSchema):

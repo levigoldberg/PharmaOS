@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from pharma_os.control_tower import run_control_tower_agent, validate_execution_plan
+from pharma_os.execution_modes import primary_execution_mode, summarize_execution_modes
 from pharma_os.memory import MemoryStore
 from pharma_os.registry import WorkflowRegistry
 from pharma_os.schemas import (
@@ -48,7 +49,7 @@ _INPUT_TYPES = {
 
 
 class Orchestrator:
-    """Coordinates workflow runs and planning-only Control Tower requests."""
+    """Coordinates direct workflow runs, Control Tower planning, and bounded orchestration."""
 
     def __init__(self, memory: MemoryStore | None = None, registry: WorkflowRegistry | None = None) -> None:
         self.memory = memory or MemoryStore()
@@ -120,10 +121,13 @@ class Orchestrator:
                 confidence=plan.confidence,
                 validation_status=validation_status,
                 gate_reason=run.gate_reason,
+                execution_mode=agent_result.trace.execution_mode,
+                execution_mode_summary=summarize_execution_modes((agent_result.trace,)),
             ),
             payload=plan,
         )
         self.memory.save_validation_results(run_id, validation_results)
+        execution_mode_summary = summarize_execution_modes((agent_result.trace,))
         return OrchestrationRunRecord(
             run_id=run_id,
             request=request,
@@ -134,6 +138,7 @@ class Orchestrator:
             plans=(plan,),
             validation_results=validation_results,
             trace=agent_result.trace,
+            execution_mode_summary=execution_mode_summary,
         )
 
     def orchestrate(
@@ -154,6 +159,7 @@ class Orchestrator:
         step_results: list[OrchestrationStepResult] = []
         replans: list[OrchestrationReplanRecord] = []
         child_run_ids: list[str] = []
+        control_tower_traces = []
         completed_capabilities: set[str] = set()
         current_snapshot = initial_snapshot
         current_plan: ExecutionPlan | None = None
@@ -170,6 +176,7 @@ class Orchestrator:
                     registry=self.registry,
                 )
                 self.memory.save_agent_trace(agent_result.trace)
+                control_tower_traces.append(agent_result.trace)
                 plan_results = validate_execution_plan(
                     run_id=f"{parent_run_id}-plan-{len(plans) + 1}",
                     plan=agent_result.output,
@@ -190,6 +197,8 @@ class Orchestrator:
                         confidence=current_plan.confidence,
                         validation_status=plan_status,
                         gate_reason="; ".join(current_plan.block_reasons) if current_plan.block_reasons else None,
+                        execution_mode=agent_result.trace.execution_mode,
+                        execution_mode_summary=summarize_execution_modes((agent_result.trace,)),
                     ),
                     payload=current_plan,
                 )
@@ -257,6 +266,10 @@ class Orchestrator:
 
         final_snapshot = current_snapshot
         replans = _fill_replan_new_plan_ids(tuple(replans), tuple(plans))
+        execution_mode_summary = summarize_execution_modes(
+            tuple(control_tower_traces),
+            reused_artifacts=sum(1 for result in step_results if result.status == "reused"),
+        )
         report = _build_control_tower_report(
             parent_run_id=parent_run_id,
             request=request,
@@ -265,6 +278,7 @@ class Orchestrator:
             plans=tuple(plans),
             step_results=tuple(step_results),
             replans=replans,
+            execution_mode_summary=execution_mode_summary,
         )
         failed = plan_validation_failed or any(result.status == "failed" for result in step_results)
         blocked = any(result.status == "blocked" for result in step_results) or any(plan.blocked for plan in plans)
@@ -293,6 +307,7 @@ class Orchestrator:
             child_run_ids=tuple(dict.fromkeys(child_run_ids)),
             report=report,
             validation_results=tuple(validation_results),
+            execution_mode_summary=execution_mode_summary,
         )
         self.memory.save_run(
             run,
@@ -303,6 +318,7 @@ class Orchestrator:
                 "max_replans": max_replans,
                 "step_count": len(step_results),
                 "replan_count": len(replans),
+                "execution_mode_summary": execution_mode_summary.model_dump(mode="json"),
             },
         )
         self.memory.save_validation_results(parent_run_id, tuple(validation_results))
@@ -362,6 +378,7 @@ class Orchestrator:
                     reused_output_id=step.reuse_output_id,
                     validation_status="needs_human_review" if gates else "passed",
                     gates=gates,
+                    execution_mode="reused_artifact",
                 ),
                 None,
             )
@@ -398,6 +415,7 @@ class Orchestrator:
         output_id = getattr(output, "output_id", None)
         gates = (getattr(output, "human_gate", None),)
         gates = tuple(gate for gate in gates if gate is not None)
+        child_execution_summary = getattr(output, "execution_mode_summary", None)
         return (
             _step_result(
                 parent_run_id,
@@ -412,6 +430,7 @@ class Orchestrator:
                 validation_status=getattr(output, "validation_status", "passed"),
                 gates=gates,
                 state_changed=_snapshot_material_signature(before_snapshot) != _snapshot_material_signature(after_snapshot),
+                execution_mode=primary_execution_mode(child_execution_summary) if child_execution_summary is not None else "deterministic_fallback",
             ),
             after_snapshot,
         )
@@ -517,6 +536,7 @@ def _step_result(
     validation_status: str = "passed",
     gates: tuple[object, ...] = (),
     state_changed: bool = False,
+    execution_mode: str = "deterministic_fallback",
 ) -> OrchestrationStepResult:
     return OrchestrationStepResult(
         step_id=step.step_id,
@@ -535,6 +555,7 @@ def _step_result(
         before_snapshot_id=before_snapshot.snapshot_id,
         after_snapshot_id=after_snapshot.snapshot_id if after_snapshot else None,
         plan_output_id=plan.output_id,
+        execution_mode=execution_mode,  # type: ignore[arg-type]
     )
 
 
@@ -583,6 +604,7 @@ def _build_control_tower_report(
     plans: tuple[ExecutionPlan, ...],
     step_results: tuple[OrchestrationStepResult, ...],
     replans: tuple[OrchestrationReplanRecord, ...],
+    execution_mode_summary: object,
 ) -> ControlTowerReport:
     unavailable = tuple(
         dict.fromkeys(
@@ -607,11 +629,17 @@ def _build_control_tower_report(
         final_snapshot_id=final_snapshot.snapshot_id,
         initial_state_summary=_state_summary(initial_snapshot),
         final_state_summary=_state_summary(final_snapshot),
+        pending_decision_summary=_pending_decision_summary(final_snapshot),
+        evidence_requirement_summaries=_evidence_requirement_summaries(final_snapshot),
+        critical_evidence_gaps=final_snapshot.critical_evidence_gaps,
+        unresolved_claims=final_snapshot.unresolved_claims,
+        contradictory_claims=final_snapshot.contradictory_claims,
         plan_summaries=tuple(_plan_summary(plan) for plan in plans),
         step_summaries=tuple(_step_summary(result) for result in step_results),
         unresolved_gates=unresolved_gates,
         unavailable_modules=unavailable,
         replan_summaries=tuple(replan.reason for replan in replans),
+        execution_mode_summary=execution_mode_summary,  # type: ignore[arg-type]
     )
 
 
@@ -619,6 +647,24 @@ def _state_summary(snapshot: ScientificStateSnapshot) -> str:
     compatible = sum(1 for artifact in snapshot.artifacts if artifact.compatibility == "compatible")
     incompatible = sum(1 for artifact in snapshot.artifacts if artifact.compatibility == "incompatible")
     return f"{len(snapshot.artifacts)} artifacts observed: {compatible} compatible, {incompatible} incompatible, {len(snapshot.open_gates)} open gates."
+
+
+def _pending_decision_summary(snapshot: ScientificStateSnapshot) -> str | None:
+    decision = snapshot.pending_decision
+    if decision is None:
+        return None
+    return f"{decision.decision_type} via {decision.target_capability_name}: {decision.requested_decision}"
+
+
+def _evidence_requirement_summaries(snapshot: ScientificStateSnapshot) -> tuple[str, ...]:
+    satisfaction = {result.requirement_id: result for result in snapshot.requirement_satisfaction}
+    summaries: list[str] = []
+    for requirement in snapshot.evidence_requirements:
+        result = satisfaction.get(requirement.requirement_id)
+        status = result.status if result else "missing"
+        gaps = "; ".join(result.gaps) if result and result.gaps else "no open gap"
+        summaries.append(f"{requirement.requirement_id} ({requirement.criticality}): {status} - {gaps}")
+    return tuple(summaries)
 
 
 def _plan_summary(plan: ExecutionPlan) -> str:

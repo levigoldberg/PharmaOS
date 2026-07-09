@@ -14,6 +14,7 @@ from pharma_os.schemas import (
     ClinicalTrialRecord,
     ClinicalTrialsSearchResult,
     SourceMetadata,
+    TrialArmGroup,
     TrialEndpoint,
     TrialIntervention,
     TrialLocation,
@@ -146,8 +147,14 @@ def _normalize_study(payload: dict[str, Any]) -> ClinicalTrialRecord:
         overall_status=status.get("overallStatus"),
         phases=tuple(str(value) for value in design.get("phases") or ()),
         study_type=design.get("studyType"),
+        allocation=design.get("allocation"),
+        intervention_model=design.get("interventionModel"),
+        masking=_masking_value(design),
+        observational_model=design.get("observationalModel"),
+        number_of_arms=_int(design.get("numberOfArms")),
         conditions=tuple(str(value) for value in conditions_module.get("conditions") or ()),
         interventions=tuple(_intervention(item) for item in arms_module.get("interventions") or ()),
+        arm_groups=tuple(_arm_group(item) for item in arms_module.get("armGroups") or ()),
         lead_sponsor=_sponsor(sponsor_module.get("leadSponsor")),
         collaborators=tuple(
             sponsor
@@ -198,7 +205,27 @@ def _intervention(item: dict[str, Any]) -> TrialIntervention:
         type=item.get("type"),
         description=item.get("description"),
         other_names=tuple(str(value) for value in item.get("otherNames") or ()),
+        arm_group_labels=tuple(str(value) for value in item.get("armGroupLabels") or ()),
     )
+
+
+def _arm_group(item: dict[str, Any]) -> TrialArmGroup:
+    return TrialArmGroup(
+        label=str(item.get("label") or "Unknown arm"),
+        type=item.get("type"),
+        description=item.get("description"),
+        intervention_names=tuple(str(value) for value in item.get("interventionNames") or ()),
+    )
+
+
+def _masking_value(design: dict[str, Any]) -> str | None:
+    masking_info = design.get("maskingInfo")
+    if isinstance(masking_info, dict):
+        masking = masking_info.get("masking")
+        if masking:
+            return str(masking)
+    masking = design.get("masking")
+    return str(masking) if masking else None
 
 
 def _sponsor(item: dict[str, Any] | None) -> TrialSponsor | None:

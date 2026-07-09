@@ -412,12 +412,20 @@ def _parse_date(value: str | None) -> date | None:
 
 
 def _arm_count(trial: ClinicalTrialRecord) -> int:
+    if trial.number_of_arms is not None:
+        return trial.number_of_arms
+    if trial.arm_groups:
+        return len(trial.arm_groups)
     return max(1, len(trial.interventions)) if trial.interventions else 0
 
 
 def _design_labels(selected: tuple[AnalogCandidateRecord, ...], field: str) -> tuple[str, ...]:
     labels = []
     for candidate in selected:
+        structured_label = _structured_design_label(candidate.trial, field)
+        if structured_label:
+            labels.append(structured_label)
+            continue
         text = _trial_text(candidate.trial)
         if field == "randomized":
             labels.append("randomized" if "randomized" in text else "single_arm_or_not_detected")
@@ -429,6 +437,27 @@ def _design_labels(selected: tuple[AnalogCandidateRecord, ...], field: str) -> t
             else:
                 labels.append("not_detected")
     return tuple(labels)
+
+
+def _structured_design_label(trial: ClinicalTrialRecord, field: str) -> str | None:
+    if field == "randomized":
+        allocation = (trial.allocation or "").casefold()
+        if not allocation:
+            return None
+        if "non" in allocation or "not random" in allocation:
+            return "non_randomized"
+        if "random" in allocation:
+            return "randomized"
+        return None
+
+    masking = (trial.masking or "").casefold()
+    if not masking:
+        return None
+    if "none" in masking or "open" in masking:
+        return "open_label"
+    if any(term in masking for term in ("single", "double", "triple", "quadruple", "mask", "blind")):
+        return "blinded_or_masked"
+    return None
 
 
 def _endpoint_family(measure: str) -> str:
@@ -447,6 +476,9 @@ def _endpoint_family(measure: str) -> str:
 
 
 def _comparator_category(trial: ClinicalTrialRecord) -> str:
+    structured = _structured_comparator_category(trial)
+    if structured:
+        return structured
     text = " ".join(intervention.name for intervention in trial.interventions).casefold()
     if "placebo" in text:
         return "placebo_control"
@@ -457,6 +489,42 @@ def _comparator_category(trial: ClinicalTrialRecord) -> str:
     if len(trial.interventions) > 1:
         return "active_comparator_or_combination"
     return "single_arm_or_uncontrolled"
+
+
+def _structured_comparator_category(trial: ClinicalTrialRecord) -> str | None:
+    arm_texts = [
+        " ".join(
+            value
+            for value in (arm.label, arm.type or "", arm.description or "", " ".join(arm.intervention_names))
+            if value
+        ).casefold()
+        for arm in trial.arm_groups
+    ]
+    mapped_interventions = {
+        intervention.name.casefold()
+        for intervention in trial.interventions
+        if intervention.arm_group_labels
+    }
+    mapping_texts = [
+        " ".join((intervention.name, " ".join(intervention.arm_group_labels))).casefold()
+        for intervention in trial.interventions
+        if intervention.arm_group_labels
+    ]
+    texts = tuple(text for text in (*arm_texts, *mapping_texts) if text.strip())
+    if not texts and not trial.arm_groups:
+        return None
+    combined = " ".join(texts)
+    if "placebo" in combined:
+        return "placebo_control"
+    if "standard of care" in combined or "best supportive" in combined:
+        return "standard_of_care"
+    if "control" in combined or "comparator" in combined:
+        return "control"
+    if len(trial.arm_groups) == 1 or trial.number_of_arms == 1:
+        return "single_arm_or_uncontrolled"
+    if len(trial.arm_groups) > 1 or len(mapped_interventions) > 1 or (trial.number_of_arms or 0) > 1:
+        return "active_comparator_or_combination"
+    return None
 
 
 def _named_comparators(selected: tuple[AnalogCandidateRecord, ...]) -> tuple[str, ...]:

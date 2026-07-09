@@ -4,8 +4,10 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pharma_os.orchestrator as orchestrator_module
+import pharma_os.control_tower as control_tower_module
 from pharma_os.cli import main
-from pharma_os.control_tower import build_deterministic_execution_plan, validate_execution_plan
+from pharma_os.agent_runtime import AgentRuntimeConfig
+from pharma_os.control_tower import build_deterministic_execution_plan, run_control_tower_agent, validate_execution_plan
 from pharma_os.memory import MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.registry import WorkflowRegistry
@@ -60,6 +62,80 @@ def test_control_tower_reuses_handoffs_for_next_study_design() -> None:
 
     assert [step.capability_name for step in plan.steps] == ["clinical_outcome_prediction", "due_diligence", "protocol_design"]
     assert [step.action for step in plan.steps] == ["reuse", "reuse", "run"]
+
+
+def test_scientific_state_includes_pending_decision_and_requirements() -> None:
+    store = MemoryStore(":memory:")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(
+        objective="Phase II to Phase III decision for this trial",
+        nct_id="NCT12345678",
+    )
+
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+
+    assert snapshot.pending_decision is not None
+    assert snapshot.pending_decision.decision_type == "phase_transition"
+    assert snapshot.pending_decision.target_capability_name == "protocol_design"
+    assert {requirement.requirement_id for requirement in snapshot.evidence_requirements} >= {
+        "agent3-agent4-handoffs",
+        "phase-transition-analog-evidence",
+    }
+    assert snapshot.critical_evidence_gaps
+
+
+def test_phase_transition_reuses_handoffs_and_identifies_agent5_gap() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
+    _save_completed_run(store, "due_diligence", "NCT12345678", "agent4-output")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(
+        objective="Phase II to Phase III decision for this trial",
+        nct_id="NCT12345678",
+    )
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+
+    statuses = {item.requirement_id: item.status for item in snapshot.requirement_satisfaction}
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+
+    assert statuses["agent3-agent4-handoffs"] == "satisfied"
+    assert statuses["phase-transition-analog-evidence"] == "missing"
+    assert [step.action for step in plan.steps] == ["reuse", "reuse", "run"]
+    assert plan.steps[-1].capability_name == "protocol_design"
+
+
+def test_live_control_tower_payload_contains_decision_state(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(
+        objective="Phase II to Phase III decision for this trial",
+        nct_id="NCT12345678",
+    )
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    captured: dict[str, object] = {}
+
+    def fake_run_structured_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(output=kwargs["offline_output"], trace=SimpleNamespace(execution_mode="deterministic_fallback"), trace_metadata={})
+
+    monkeypatch.setattr(control_tower_module, "run_structured_agent", fake_run_structured_agent)
+
+    run_control_tower_agent(
+        run_id="run",
+        request=request,
+        snapshot=snapshot,
+        registry=registry,
+        config=AgentRuntimeConfig(disabled=True),
+    )
+
+    payload = captured["payload"]
+    assert isinstance(payload, dict)
+    assert payload["pending_decision"]["decision_type"] == "phase_transition"
+    assert payload["critical_evidence_gaps"]
+    assert {item["requirement_id"] for item in payload["evidence_requirements"]} >= {
+        "agent3-agent4-handoffs",
+        "phase-transition-analog-evidence",
+    }
 
 
 def test_control_tower_blocks_unavailable_future_module() -> None:
@@ -250,6 +326,65 @@ def test_plan_validator_rejects_unjustified_refresh_and_unnecessary_rerun() -> N
     assert any(result.status == "failed" and "unnecessary rerun" in result.message for result in results)
 
 
+def test_plan_validator_rejects_unrelated_requirement_execution() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
+    _save_completed_run(store, "due_diligence", "NCT12345678", "agent4-output")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Assess clinical risk", nct_id="NCT12345678")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    protocol_request = OrchestrationRequest(objective="Draft the next-study protocol design", nct_id="NCT12345678")
+    protocol_snapshot = store.build_scientific_state_snapshot(protocol_request, registry=registry)
+    protocol_plan = build_deterministic_execution_plan(run_id="run", request=protocol_request, snapshot=protocol_snapshot, registry=registry)
+    protocol_step = next(step for step in protocol_plan.steps if step.capability_name == "protocol_design")
+    bad_step = protocol_step.model_copy(
+        update={
+            "action": "run",
+            "executable": True,
+            "requirements_addressed": (),
+            "reuse_run_id": None,
+            "reuse_output_id": None,
+        }
+    )
+    bad_plan = protocol_plan.model_copy(update={"request": request, "steps": (bad_step,)})
+
+    results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(result.status == "failed" and "pending decision requirements" in result.message for result in results)
+
+
+def test_plan_validator_rejects_reuse_that_does_not_satisfy_requirement() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Assess clinical risk", nct_id="NCT12345678")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+    bad_step = plan.steps[0].model_copy(update={"reuse_output_id": "wrong-output"})
+    bad_plan = plan.model_copy(update={"steps": (bad_step,)})
+
+    results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(result.status == "failed" and "reuse does not satisfy cited decision evidence requirements" in result.message for result in results)
+
+
+def test_skeleton_requirements_are_present_and_blocked() -> None:
+    store = MemoryStore(":memory:")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Create a manufacturing CMC control plan for this asset")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+
+    assert snapshot.pending_decision is not None
+    assert snapshot.pending_decision.decision_type == "manufacturing_control"
+    assert snapshot.pending_decision.target_capability_name == "manufacturing_biofactory"
+    assert "manufacturing-control-evidence" in {requirement.requirement_id for requirement in snapshot.evidence_requirements}
+    assert "manufacturing_biofactory" in snapshot.blocked_capabilities
+    assert plan.steps[-1].capability_name == "manufacturing_biofactory"
+    assert plan.steps[-1].action == "block"
+
+
 def test_plan_validator_rejects_execution_through_blocking_gate() -> None:
     store = MemoryStore(":memory:")
     _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output", gate_decision="blocked")
@@ -291,6 +426,8 @@ def test_orchestrate_reuses_existing_artifact_without_rerun(monkeypatch) -> None
 
     assert [result.status for result in record.step_results] == ["reused"]
     assert record.step_results[0].reused_output_id == "agent3-output"
+    assert record.step_results[0].execution_mode == "reused_artifact"
+    assert record.execution_mode_summary.reused_artifacts_used == 1
     assert calls == {}
 
 
