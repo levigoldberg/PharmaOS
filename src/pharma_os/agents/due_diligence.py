@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
     StructuredAgentResult,
+    AgentRuntimeError,
+    agent_fallbacks_disabled,
     load_agents_sdk,
     run_structured_agent,
     run_structured_llm_call,
@@ -400,7 +402,11 @@ def _run_synthesis_agent(
             config=config,
             rationale_summary=rationale_summary,
         )
-    except Exception:
+    except Exception as exc:
+        if agent_fallbacks_disabled():
+            if isinstance(exc, AgentRuntimeError):
+                raise
+            raise AgentRuntimeError(f"{agent_name} failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
         return _synthesis_fallback_result(
             agent_name=agent_name,
             run_id=run_id,
@@ -413,6 +419,11 @@ def _run_synthesis_agent(
         )
 
     if result.output.section != section or result.output.agent_name != agent_name:
+        if agent_fallbacks_disabled():
+            raise AgentRuntimeError(
+                f"{agent_name} returned mismatched section or agent with fallbacks disabled: "
+                f"{result.output.agent_name}:{result.output.section}"
+            )
         return _synthesis_fallback_result(
             agent_name=agent_name,
             run_id=run_id,
@@ -437,6 +448,8 @@ def _synthesis_fallback_result(
     rationale_summary: str,
     reason: str,
 ) -> StructuredAgentResult:
+    if agent_fallbacks_disabled():
+        raise AgentRuntimeError(f"{agent_name} fallback requested with fallbacks disabled: {reason}")
     result = run_structured_llm_call(
         agent_name=agent_name,
         instructions="Validate deterministic Agent 4 fallback output.",

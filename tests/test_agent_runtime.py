@@ -155,6 +155,7 @@ def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> No
     monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
     monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
     monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    monkeypatch.delenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", raising=False)
 
     def fail_call(**kwargs):
         raise RuntimeError("boom")
@@ -178,7 +179,34 @@ def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> No
     assert result.trace_metadata["error_type"] == "RuntimeError"
 
 
+def test_run_structured_llm_call_can_disable_api_failure_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", "true")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+
+    def fail_call(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fail_call)
+
+    with pytest.raises(AgentRuntimeError, match="fallbacks disabled"):
+        run_structured_llm_call(
+            agent_name="fixture_direct_agent",
+            instructions="Return FixtureOutput.",
+            payload={"prompt": "fixture"},
+            output_type=FixtureOutput,
+            run_id="RUN",
+            input_summary="Fixture direct input.",
+            config=AgentRuntimeConfig(model="test-model", disabled=False),
+            offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+        )
+
+
 def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
+    monkeypatch.delenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", raising=False)
+
     class FailingRunner:
         @staticmethod
         def run_sync(*args, **kwargs):
@@ -204,6 +232,32 @@ def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
     assert result.trace.provenance == "pharma_os.agent_runtime.openai_agents_sdk_fallback"
     assert result.trace_metadata["fallback"] is True
     assert result.trace_metadata["error_type"] == "RuntimeError"
+
+
+def test_run_structured_agent_can_disable_sdk_failure_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", "true")
+
+    class FailingRunner:
+        @staticmethod
+        def run_sync(*args, **kwargs):
+            raise RuntimeError("context_length_exceeded")
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, FailingRunner, object),
+    )
+
+    with pytest.raises(AgentRuntimeError, match="fallbacks disabled"):
+        run_structured_agent(
+            agent=object(),
+            payload={"prompt": "fixture"},
+            output_type=FixtureOutput,
+            agent_name="fixture_agent",
+            run_id="RUN",
+            input_summary="Fixture input.",
+            config=AgentRuntimeConfig(model="test-model", disabled=False),
+            offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+        )
 
 
 def test_runtime_config_enables_live_agents_when_api_key_present(monkeypatch) -> None:

@@ -147,6 +147,8 @@ def run_structured_agent(
         try:
             response = Runner.run_sync(agent, _payload_json(payload))
         except Exception as exc:
+            if _agent_fallbacks_disabled():
+                raise AgentRuntimeError(f"Agent run failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
             if offline_output is None:
                 raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
             output = _validate_output(offline_output, output_type)
@@ -178,6 +180,8 @@ def run_structured_agent(
                 },
             )
     except Exception as exc:
+        if _agent_fallbacks_disabled():
+            raise AgentRuntimeError(f"Agent run failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
         if offline_output is None:
             raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
         output = _validate_output(offline_output, output_type)
@@ -285,6 +289,10 @@ def run_structured_llm_call(
             output_type=output_type,
         )
     except Exception as exc:
+        if _agent_fallbacks_disabled():
+            if isinstance(exc, AgentRuntimeError):
+                raise
+            raise AgentRuntimeError(f"Direct OpenAI structured output call failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
         if offline_output is None:
             if isinstance(exc, AgentRuntimeError):
                 raise
@@ -594,3 +602,13 @@ def _safe_summary(value: Any) -> str | None:
 
 def _truthy(value: str | None) -> bool:
     return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def agent_fallbacks_disabled() -> bool:
+    """Return whether live agent fallback paths should fail closed."""
+
+    return _truthy(os.getenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS"))
+
+
+def _agent_fallbacks_disabled() -> bool:
+    return agent_fallbacks_disabled()

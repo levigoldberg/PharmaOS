@@ -26,6 +26,14 @@ class PricingSearchTerm:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class AnnualizedWAC:
+    """Deterministic annual WAC calculation details."""
+
+    annual_wac: float
+    details: dict[str, str | int | float | bool | None]
+
+
 def lookup_pricing(
     asset: AssetIdentityOutput,
     *,
@@ -112,11 +120,15 @@ def lookup_pricing(
                 flags.append(missing("pricing-no-openfda-label", "pricing", "dosing_summary", "openFDA returned no label match.", "medium"))
         except Exception as exc:
             flags.append(missing("pricing-openfda-error", "pricing", "dosing_summary", f"openFDA lookup failed: {exc.__class__.__name__}.", "medium"))
-    annual_wac = _annualize_wac(wac_value, matched_product, dosing_summary)
+    annualized = _annualize_wac(wac_value, matched_product, dosing_summary)
+    annual_wac = annualized.annual_wac if annualized is not None else None
+    annualization_details = annualized.details if annualized is not None else {}
     if wac_value is not None and dosing_summary is None:
         flags.append(missing("pricing-dosing-review-required", "pricing", "annual_wac", "WAC was found but annualization lacks sourced dosing.", "high"))
     elif wac_value is not None and annual_wac is None:
         flags.append(missing("pricing-annualization-review-required", "pricing", "annual_wac", "WAC and dosing were found, but package/frequency annualization requires review.", "high"))
+    elif annualized is not None and not annualized.details.get("formula_check_passed"):
+        flags.append(missing("pricing-annualization-formula-check", "pricing", "annual_wac", "Annualized WAC failed internal formula validation.", "critical"))
     label_source = (
         SourceMetadata(
             source_id=f"openfda_label:{slug(selected_label_term)}",
@@ -137,6 +149,7 @@ def lookup_pricing(
             wac_unit_basis="package" if wac_value is not None else None,
             matched_product=matched_product,
             dosing_summary=dosing_summary,
+            annualization_details=annualization_details,
             source_ids=tuple(source.source_id for source in sources),
             missing_data_flags=tuple(flags),
             confidence=0.8 if annual_wac is not None else 0.45 if wac_value is not None else 0.2,
@@ -235,7 +248,7 @@ def _wac_selection_key(match: tuple[dict[str, Any], PricingSearchTerm]) -> tuple
     )
 
 
-def _annualize_wac(wac_value: float | None, matched_product: str | None, dosing_summary: str | None) -> float | None:
+def _annualize_wac(wac_value: float | None, matched_product: str | None, dosing_summary: str | None) -> AnnualizedWAC | None:
     if wac_value is None or not matched_product or not dosing_summary:
         return None
     administrations_per_year = _administrations_per_year(dosing_summary)
@@ -247,19 +260,38 @@ def _annualize_wac(wac_value: float | None, matched_product: str | None, dosing_
     units_per_administration = _units_per_administration(matched_product, dosing_summary)
     if units_per_administration is None:
         return None
-    return round(float(wac_value) * administrations_per_year * units_per_administration / units_per_package, 2)
+    package_units_per_year = administrations_per_year * units_per_administration
+    packages_per_year = package_units_per_year / units_per_package
+    annual_wac = round(float(wac_value) * packages_per_year, 2)
+    expected = round(float(wac_value) * administrations_per_year * units_per_administration / units_per_package, 2)
+    details: dict[str, str | int | float | bool | None] = {
+        "formula": "annual_wac = wac_value * administrations_per_year * units_per_administration / units_per_package",
+        "wac_value": float(wac_value),
+        "wac_unit_basis": "package",
+        "administrations_per_year": administrations_per_year,
+        "units_per_administration": units_per_administration,
+        "units_per_package": units_per_package,
+        "package_units_per_year": round(package_units_per_year, 4),
+        "packages_per_year": round(packages_per_year, 4),
+        "annual_wac": annual_wac,
+        "formula_check_expected_annual_wac": expected,
+        "formula_check_passed": abs(annual_wac - expected) <= 0.01,
+    }
+    return AnnualizedWAC(annual_wac=annual_wac, details=details)
 
 
 def _administrations_per_year(dosing_summary: str) -> float | None:
     text = _word_text(dosing_summary)
-    if any(term in text for term in ("once weekly", "once a week", "every week", "weekly")):
-        return 52.0
     if "twice weekly" in text or "two times weekly" in text:
         return 104.0
+    if any(term in text for term in ("once weekly", "once a week", "every week", "weekly")):
+        return 52.0
     if any(term in text for term in ("every 2 weeks", "every two weeks", "every other week", "once every 2 weeks")):
         return 26.0
     if any(term in text for term in ("every 4 weeks", "monthly", "once monthly", "once every month")):
         return 13.0
+    if any(term in text for term in ("three times daily", "three times a day", "thrice daily")):
+        return 1095.0
     if any(term in text for term in ("twice daily", "twice a day", "two times daily")):
         return 730.0
     if any(term in text for term in ("once daily", "once a day", "daily")):

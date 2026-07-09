@@ -663,6 +663,7 @@ class PricingOutput(StrictSchema):
     wac_unit_basis: str | None = None
     matched_product: str | None = None
     dosing_summary: str | None = None
+    annualization_details: dict[str, MetadataValue] = Field(default_factory=dict)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.0, ge=0, le=1)
