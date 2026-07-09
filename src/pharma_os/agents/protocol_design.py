@@ -7,7 +7,14 @@ from typing import Any, Callable
 
 from pydantic import BaseModel
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_for_live_agents
+from pharma_os.agent_runtime import (
+    AgentRuntimeConfig,
+    StructuredAgentResult,
+    load_agents_sdk,
+    run_structured_agent,
+    run_structured_llm_call,
+    runtime_config_for_live_agents,
+)
 from pharma_os.schemas import (
     AnalogCandidateRecord,
     AnalogBenchmarkBundle,
@@ -30,6 +37,17 @@ from pharma_os.schemas import (
 )
 from pharma_os.tools._due_diligence_common import norm
 from pharma_os.tools.protocol_design import build_benchmark_summary, build_protocol_design_brief
+
+
+_DIRECT_LLM_AGENT_NAMES = frozenset(
+    {
+        "EndpointStrategyAgent",
+        "PopulationEligibilityAgent",
+        "ComparatorDesignAgent",
+        "SafetyMonitoringAgent",
+        "StatisticalSkeletonAgent",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -300,6 +318,21 @@ def _run_typed_agent(
     config: AgentRuntimeConfig,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    if agent_name in _DIRECT_LLM_AGENT_NAMES:
+        return run_structured_llm_call(
+            agent_name=agent_name,
+            instructions=instructions,
+            payload=payload,
+            output_type=output_type,
+            run_id=run_id,
+            input_summary=input_summary,
+            config=config,
+            offline_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+        )
+
     agent = object()
     if not config.disabled:
         Agent, _, _, _ = load_agents_sdk()

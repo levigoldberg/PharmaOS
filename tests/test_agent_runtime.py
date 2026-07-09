@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import Field
+from pydantic import Field, ValidationError
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, AgentRuntimeError, run_structured_agent, runtime_config_for_live_agents
+from pharma_os.agent_runtime import (
+    AgentRuntimeConfig,
+    AgentRuntimeError,
+    StructuredAgentResult,
+    run_structured_agent,
+    run_structured_llm_call,
+    runtime_config_for_live_agents,
+)
 from pharma_os.schemas import StrictSchema
 
 
@@ -48,6 +55,127 @@ def test_run_structured_agent_offline_requires_fixture_output() -> None:
             input_summary="Fixture input.",
             config=AgentRuntimeConfig(disabled=True),
         )
+
+
+def test_run_structured_llm_call_offline_validates_output_and_trace() -> None:
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=True),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+        source_ids=("ctgov:NCT12345678",),
+        confidence=0.7,
+        rationale_summary="Fixture direct rationale summary.",
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert result.trace.agent_name == "fixture_direct_agent"
+    assert result.trace.output_id == "OUT"
+    assert result.trace.output_type == "FixtureOutput"
+    assert result.trace.provenance == "pharma_os.agent_runtime.offline"
+    assert result.trace.steps[0].provenance == "pharma_os.agent_runtime.offline"
+    assert result.trace_metadata["direct_api"] is True
+    assert result.trace_metadata["disabled"] is True
+
+
+def test_run_structured_llm_call_uses_offline_output_when_api_key_missing(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output=FixtureOutput(output_id="OUT", summary="Fixture summary.", confidence=0.7),
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert result.trace_metadata["disabled"] is True
+    assert result.trace_metadata["direct_api"] is True
+
+
+def test_run_structured_llm_call_validates_output_type() -> None:
+    with pytest.raises(ValidationError):
+        run_structured_llm_call(
+            agent_name="fixture_direct_agent",
+            instructions="Return FixtureOutput.",
+            payload={"prompt": "fixture"},
+            output_type=FixtureOutput,
+            run_id="RUN",
+            input_summary="Fixture direct input.",
+            config=AgentRuntimeConfig(disabled=True),
+            offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 3.0},
+        )
+
+
+def test_run_structured_llm_call_live_path_returns_structured_result(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+
+    def fake_call(**kwargs):
+        assert kwargs["model"] == "test-model"
+        assert kwargs["instructions"] == "Return FixtureOutput."
+        return {"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7}, {"last_response_id": "resp_123"}
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fake_call)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OFFLINE", "summary": "Offline summary.", "confidence": 0.5},
+        source_ids=("ctgov:NCT12345678",),
+    )
+
+    assert isinstance(result, StructuredAgentResult)
+    assert isinstance(result.output, FixtureOutput)
+    assert result.output.output_id == "OUT"
+    assert result.trace.provenance == "pharma_os.agent_runtime.openai_api_structured_output"
+    assert result.trace_metadata["last_response_id"] == "resp_123"
+
+
+def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+
+    def fail_call(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fail_call)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert result.trace.provenance == "pharma_os.agent_runtime.direct_openai_api_fallback"
+    assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["error_type"] == "RuntimeError"
 
 
 def test_runtime_config_enables_live_agents_when_api_key_present(monkeypatch) -> None:

@@ -10,7 +10,14 @@ from typing import Any
 import httpx
 from pydantic import BaseModel
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_for_live_agents
+from pharma_os.agent_runtime import (
+    AgentRuntimeConfig,
+    StructuredAgentResult,
+    load_agents_sdk,
+    run_structured_agent,
+    run_structured_llm_call,
+    runtime_config_for_live_agents,
+)
 from pharma_os.schemas import (
     AgentRunTrace,
     ApprovalLikelihoodProxy,
@@ -46,6 +53,17 @@ from pharma_os.tools.pos import lookup_pos
 
 
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
+
+_DIRECT_LLM_AGENT_NAMES = frozenset(
+    {
+        "AssetIdentityAdjudicatorAgent",
+        "EndpointRiskAgent",
+        "ComparatorRelevanceAgent",
+        "EnrollmentFeasibilityAgent",
+        "SafetyContextAgent",
+        "FailureModeSynthesisAgent",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -456,6 +474,21 @@ def _run_typed_agent(
     config: AgentRuntimeConfig,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    if agent_name in _DIRECT_LLM_AGENT_NAMES:
+        return run_structured_llm_call(
+            agent_name=agent_name,
+            instructions=instructions,
+            payload=payload,
+            output_type=output_type,
+            run_id=run_id,
+            input_summary=input_summary,
+            config=config,
+            offline_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+        )
+
     agent = object()
     if not config.disabled:
         Agent, _, _, _ = load_agents_sdk()

@@ -350,7 +350,7 @@ def test_mock_agent_runtime_endpoint_output_is_used(monkeypatch) -> None:
         )
         return StructuredAgentResult(output=output, trace=trace)
 
-    monkeypatch.setattr(cop_agent, "run_structured_agent", fake_runtime)
+    monkeypatch.setattr(cop_agent, "run_structured_llm_call", fake_runtime)
 
     output = run_clinical_outcome_prediction_workflow(
         ClinicalOutcomePredictionInput(nct_id="NCT12345678"),

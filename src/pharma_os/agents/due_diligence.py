@@ -7,7 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_for_live_agents
+from pharma_os.agent_runtime import (
+    AgentRuntimeConfig,
+    StructuredAgentResult,
+    load_agents_sdk,
+    run_structured_agent,
+    run_structured_llm_call,
+    runtime_config_for_live_agents,
+)
 from pharma_os.components.due_diligence_sections import build_asset_memo
 from pharma_os.schemas import (
     AgentRunTrace,
@@ -27,6 +34,15 @@ from pharma_os.schemas import (
     PricingOutput,
     RNPVOutput,
     SafetyLabelSummary,
+)
+
+
+_DIRECT_LLM_AGENT_NAMES = frozenset(
+    {
+        "ClinicalEvidenceSynthesisAgent",
+        "CompetitiveLandscapeAgent",
+        "SafetyDiligenceAgent",
+    }
 )
 
 
@@ -397,6 +413,21 @@ def _run_typed_agent(
     config: AgentRuntimeConfig,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    if agent_name in _DIRECT_LLM_AGENT_NAMES:
+        return run_structured_llm_call(
+            agent_name=agent_name,
+            instructions=instructions,
+            payload=payload,
+            output_type=output_type,
+            run_id=run_id,
+            input_summary=input_summary,
+            config=config,
+            offline_output=fallback_output,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+        )
+
     agent = object()
     if not config.disabled:
         Agent, _, _, _ = load_agents_sdk()

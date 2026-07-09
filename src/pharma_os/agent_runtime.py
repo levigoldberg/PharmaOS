@@ -183,6 +183,107 @@ def run_structured_agent(
     )
 
 
+def run_structured_llm_call(
+    *,
+    agent_name: str,
+    instructions: str,
+    payload: BaseModel | dict[str, Any],
+    output_type: type[T],
+    run_id: str,
+    input_summary: str,
+    config: AgentRuntimeConfig | None = None,
+    offline_output: T | dict[str, Any] | None = None,
+    source_ids: tuple[str, ...] = (),
+    confidence: float | None = None,
+    rationale_summary: str | None = None,
+) -> StructuredAgentResult:
+    """Run one direct OpenAI structured-output call with PharmaOS tracing."""
+
+    settings = _direct_llm_runtime_config(config)
+    started_at = datetime.now(timezone.utc)
+    if settings.disabled:
+        return _offline_structured_result(
+            offline_output=offline_output,
+            output_type=output_type,
+            run_id=run_id,
+            agent_name=agent_name,
+            input_summary=input_summary,
+            started_at=started_at,
+            settings=settings,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary or "Offline structured output was validated without a live direct OpenAI call.",
+            trace_metadata={"direct_api": True},
+        )
+
+    try:
+        parsed, response_metadata = _call_openai_structured_output(
+            model=settings.model,
+            instructions=instructions,
+            payload=payload,
+            output_type=output_type,
+        )
+    except Exception as exc:
+        if offline_output is None:
+            if isinstance(exc, AgentRuntimeError):
+                raise
+            raise AgentRuntimeError(f"Direct OpenAI structured output call failed: {exc.__class__.__name__}: {exc}") from exc
+        output = _validate_output(offline_output, output_type)
+        completed_at = datetime.now(timezone.utc)
+        return StructuredAgentResult(
+            output=output,
+            trace=_trace(
+                run_id=run_id,
+                agent_name=agent_name,
+                input_summary=input_summary,
+                output=output,
+                started_at=started_at,
+                completed_at=completed_at,
+                source_ids=source_ids,
+                confidence=confidence,
+                rationale_summary=rationale_summary
+                or "Direct OpenAI call failed; offline structured output was validated as fallback.",
+                tool_calls=(),
+                provenance="pharma_os.agent_runtime.direct_openai_api_fallback",
+            ),
+            trace_metadata={
+                "agent_name": agent_name,
+                "model": settings.model,
+                "disabled": False,
+                "direct_api": True,
+                "fallback": True,
+                "error_type": exc.__class__.__name__,
+                "error": str(exc)[:500],
+            },
+        )
+
+    output = _validate_output(parsed, output_type)
+    completed_at = datetime.now(timezone.utc)
+    return StructuredAgentResult(
+        output=output,
+        trace=_trace(
+            run_id=run_id,
+            agent_name=agent_name,
+            input_summary=input_summary,
+            output=output,
+            started_at=started_at,
+            completed_at=completed_at,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary or "Structured direct OpenAI output was validated; hidden reasoning was not stored.",
+            tool_calls=(),
+            provenance="pharma_os.agent_runtime.openai_api_structured_output",
+        ),
+        trace_metadata={
+            **response_metadata,
+            "agent_name": agent_name,
+            "model": settings.model,
+            "disabled": False,
+            "direct_api": True,
+        },
+    )
+
+
 def _trace(
     *,
     run_id: str,
@@ -228,6 +329,49 @@ def _trace(
         started_at=started_at,
         completed_at=completed_at,
         provenance=provenance,
+    )
+
+
+def _offline_structured_result(
+    *,
+    offline_output: T | dict[str, Any] | None,
+    output_type: type[T],
+    run_id: str,
+    agent_name: str,
+    input_summary: str,
+    started_at: datetime,
+    settings: AgentRuntimeConfig,
+    source_ids: tuple[str, ...],
+    confidence: float | None,
+    rationale_summary: str,
+    trace_metadata: dict[str, str | int | float | bool | None] | None = None,
+) -> StructuredAgentResult:
+    if offline_output is None:
+        raise AgentRuntimeError("Agent runtime is disabled/offline and no offline_output was supplied.")
+    output = _validate_output(offline_output, output_type)
+    completed_at = datetime.now(timezone.utc)
+    return StructuredAgentResult(
+        output=output,
+        trace=_trace(
+            run_id=run_id,
+            agent_name=agent_name,
+            input_summary=input_summary,
+            output=output,
+            started_at=started_at,
+            completed_at=completed_at,
+            source_ids=source_ids,
+            confidence=confidence,
+            rationale_summary=rationale_summary,
+            tool_calls=(),
+            provenance="pharma_os.agent_runtime.offline",
+        ),
+        trace_metadata={
+            "agent_name": agent_name,
+            "model": settings.model,
+            "max_turns": settings.max_turns,
+            "disabled": True,
+            **(trace_metadata or {}),
+        },
     )
 
 
@@ -277,6 +421,82 @@ def _response_metadata(response: Any) -> dict[str, str | int | float | bool | No
             if isinstance(value, (int, float)):
                 metadata[f"usage_{name}"] = value
     return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _direct_llm_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
+    env_config = runtime_config_for_live_agents(disabled_provenance="pharma_os.agent_runtime.direct_openai_api")
+    if config is None:
+        return env_config
+    if config.disabled:
+        return config
+    if env_config.disabled:
+        return config.model_copy(update={"disabled": True, "provenance": env_config.provenance})
+    return config
+
+
+def _call_openai_structured_output(
+    *,
+    model: str,
+    instructions: str,
+    payload: BaseModel | dict[str, Any],
+    output_type: type[T],
+) -> tuple[Any, dict[str, str | int | float | bool | None]]:
+    try:
+        from openai import OpenAI
+    except ModuleNotFoundError as exc:
+        raise AgentRuntimeError("OpenAI Python SDK is not installed. Install project dependencies before live LLM calls.") from exc
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    payload_text = _payload_json(payload)
+
+    if hasattr(client, "responses") and hasattr(client.responses, "parse"):
+        response = client.responses.parse(
+            model=model,
+            instructions=instructions,
+            input=payload_text,
+            text_format=output_type,
+        )
+        parsed = getattr(response, "output_parsed", None)
+        if parsed is None:
+            raise AgentRuntimeError("Direct OpenAI structured output response did not include parsed output.")
+        return parsed, _response_metadata(response)
+
+    beta = getattr(client, "beta", None)
+    chat = getattr(beta, "chat", None)
+    completions = getattr(chat, "completions", None)
+    if completions is not None and hasattr(completions, "parse"):
+        response = completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": payload_text},
+            ],
+            response_format=output_type,
+        )
+        parsed = getattr(response.choices[0].message, "parsed", None)
+        if parsed is None:
+            raise AgentRuntimeError("Direct OpenAI chat structured output response did not include parsed output.")
+        return parsed, _response_metadata(response)
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": payload_text},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": output_type.__name__,
+                "schema": output_type.model_json_schema(),
+                "strict": True,
+            },
+        },
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise AgentRuntimeError("Direct OpenAI structured output response was empty.")
+    return json.loads(content), _response_metadata(response)
 
 
 def _validate_output(value: T | dict[str, Any] | Any, output_type: type[T]) -> T:
