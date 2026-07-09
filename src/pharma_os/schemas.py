@@ -288,6 +288,124 @@ class ClinicalOutcomePredictionInput(StrictSchema):
     pos_workbook_path: str | None = Field(default=None, description="Optional local PoS workbook path.")
 
 
+OrchestrationAction = Literal["run", "reuse", "refresh", "skip", "block"]
+CapabilityLifecycleStage = Literal[
+    "discovery",
+    "preclinical",
+    "clinical_development",
+    "clinical_operations",
+    "manufacturing",
+    "launch_postmarketing",
+    "quality_regulatory",
+]
+CapabilityImplementationStatus = Literal["implemented", "skeleton", "planned", "deprecated"]
+ArtifactCompatibility = Literal["compatible", "incompatible", "unknown"]
+ArtifactFreshness = Literal["fresh", "stale", "unknown"]
+
+
+class OrchestrationRequest(StrictSchema):
+    """Planning-only request for the global Control Tower."""
+
+    objective: str = Field(..., min_length=1)
+    nct_id: str | None = Field(default=None, pattern=r"^NCT\d{8}$")
+    asset_name: str | None = None
+    indication: str | None = None
+    identifiers: dict[str, str] = Field(default_factory=dict)
+    assumptions: dict[str, MetadataValue] = Field(default_factory=dict)
+    force_refresh: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class ModuleCapability(StrictSchema):
+    """Registry metadata describing a Control Tower capability."""
+
+    name: str = Field(..., min_length=1)
+    lifecycle_stage: CapabilityLifecycleStage
+    implementation_status: CapabilityImplementationStatus
+    accepted_inputs: tuple[str, ...] = Field(default_factory=tuple)
+    required_artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    produced_artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    dependencies: tuple[str, ...] = Field(default_factory=tuple)
+    executable: bool = False
+    missing_connectors: tuple[str, ...] = Field(default_factory=tuple)
+    human_gate_policy: str = Field(..., min_length=1)
+    description: str = Field(..., min_length=1)
+
+
+class WorkflowSpec(ModuleCapability):
+    """Concrete workflow capability, including its Python implementation when present."""
+
+    workflow_name: str = Field(..., min_length=1)
+    input_schema: str | None = None
+    output_schema: str | None = None
+    implementation_path: str | None = None
+
+
+class ArtifactStatus(StrictSchema):
+    """Memory-derived status for one reusable workflow artifact."""
+
+    artifact_type: str = Field(..., min_length=1)
+    producer_workflow: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    output_id: str | None = None
+    validation_status: ValidationStatus
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    freshness: ArtifactFreshness = "unknown"
+    compatibility: ArtifactCompatibility = "unknown"
+    open_gates: tuple[HumanGate, ...] = Field(default_factory=tuple)
+    upstream_references: tuple[str, ...] = Field(default_factory=tuple)
+    input_fingerprint: str | None = None
+    completed_at: datetime | None = None
+    reasons: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class ScientificStateSnapshot(StrictSchema):
+    """Current memory state relevant to a Control Tower planning request."""
+
+    snapshot_id: str = Field(..., min_length=1)
+    request: OrchestrationRequest
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    artifacts: tuple[ArtifactStatus, ...] = Field(default_factory=tuple)
+    capabilities: tuple[ModuleCapability, ...] = Field(default_factory=tuple)
+    open_gates: tuple[HumanGate, ...] = Field(default_factory=tuple)
+    missing_artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    notes: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class PlannedStep(StrictSchema):
+    """One planning-only Control Tower action."""
+
+    step_id: str = Field(..., min_length=1)
+    capability_name: str = Field(..., min_length=1)
+    action: OrchestrationAction
+    reason: str = Field(..., min_length=1)
+    required_artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    produced_artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    reuse_run_id: str | None = None
+    reuse_output_id: str | None = None
+    depends_on: tuple[str, ...] = Field(default_factory=tuple)
+    blocked_by: tuple[str, ...] = Field(default_factory=tuple)
+    human_gate_required: bool = False
+    executable: bool = False
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ExecutionPlan(StrictSchema):
+    """Planning-only output from the Control Tower agent."""
+
+    output_id: str = Field(..., min_length=1)
+    run_id: str = Field(..., min_length=1)
+    request: OrchestrationRequest
+    snapshot_id: str = Field(..., min_length=1)
+    objective_interpretation: str = Field(..., min_length=1)
+    steps: tuple[PlannedStep, ...] = Field(default_factory=tuple)
+    blocked: bool = False
+    block_reasons: tuple[str, ...] = Field(default_factory=tuple)
+    validation_status: ValidationStatus = "not_run"
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    provenance: str = Field(..., min_length=1)
+
+
 class HumanReadableFinding(StrictSchema):
     """One human-facing source-grounded finding from a workflow module."""
 
@@ -1223,6 +1341,17 @@ class AgentRunTrace(StrictSchema):
     started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
     provenance: str = Field(..., min_length=1)
+
+
+class OrchestrationRunRecord(StrictSchema):
+    """Persistable planning run envelope for the Control Tower."""
+
+    run_id: str = Field(..., min_length=1)
+    request: OrchestrationRequest
+    snapshot: ScientificStateSnapshot
+    plan: ExecutionPlan
+    validation_results: tuple[ValidationResult, ...] = Field(default_factory=tuple)
+    trace: AgentRunTrace | None = None
 
 
 class AgentOutput(StrictSchema):

@@ -5,21 +5,28 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel
 
+from pharma_os.registry import WorkflowRegistry
 from pharma_os.schemas import (
     AgentOutput,
     AgentRunTrace,
+    ArtifactStatus,
     ConfidenceFlag,
     EvidenceClaim,
     FinalReport,
     HumanGate,
+    ModuleCapability,
+    OrchestrationRequest,
+    ScientificStateSnapshot,
     SourceMetadata,
     ValidationResult,
+    WorkflowSpec,
     WorkflowRun,
 )
 
@@ -166,6 +173,110 @@ class MemoryStore:
                 output_payload,
             )
         return None
+
+    def build_scientific_state_snapshot(
+        self,
+        request: OrchestrationRequest,
+        *,
+        registry: WorkflowRegistry | None = None,
+    ) -> ScientificStateSnapshot:
+        """Build a memory-derived state snapshot for Control Tower planning."""
+
+        effective_registry = registry or WorkflowRegistry.default()
+        capabilities = effective_registry.capabilities()
+        artifacts = tuple(
+            artifact
+            for capability in capabilities
+            if isinstance(capability, WorkflowSpec)
+            for artifact in self.assess_artifact_reuse(request=request, capability=capability)
+        )
+        present_artifact_types = {artifact.artifact_type for artifact in artifacts}
+        required_artifacts = {
+            artifact_type
+            for capability in capabilities
+            for artifact_type in capability.required_artifacts
+            if not _artifact_satisfied_by_request(artifact_type, request)
+        }
+        missing_artifacts = tuple(sorted(required_artifacts - present_artifact_types))
+        open_gates = tuple(
+            gate
+            for artifact in artifacts
+            for gate in artifact.open_gates
+            if gate.decision in {"needs_human_review", "blocked", "rejected"}
+        )
+        return ScientificStateSnapshot(
+            snapshot_id=f"snapshot-{uuid4()}",
+            request=request,
+            artifacts=artifacts,
+            capabilities=capabilities,
+            open_gates=open_gates,
+            missing_artifacts=missing_artifacts,
+            notes=tuple(
+                dict.fromkeys(
+                    reason
+                    for artifact in artifacts
+                    for reason in artifact.reasons
+                    if artifact.compatibility != "compatible"
+                )
+            ),
+        )
+
+    def assess_artifact_reuse(
+        self,
+        *,
+        request: OrchestrationRequest,
+        capability: WorkflowSpec,
+    ) -> tuple[ArtifactStatus, ...]:
+        """Assess reusable artifacts for one workflow capability."""
+
+        rows = self._candidate_run_rows(workflow_name=capability.workflow_name, request=request)
+        artifacts: list[ArtifactStatus] = []
+        for row in rows:
+            input_payload = _json_loads(row["input_json"]) or {}
+            output_payload = _json_loads(row["output_json"]) or {}
+            completed_at = _parse_dt(row["completed_at"]) or _parse_dt(row["started_at"])
+            run = WorkflowRun(
+                run_id=row["run_id"],
+                workflow_name=row["workflow_name"],
+                status=row["status"],
+                started_at=_parse_dt(row["started_at"]) or datetime.now(timezone.utc),
+                completed_at=completed_at,
+                input_provenance=row["input_provenance"],
+                source_ids=tuple(json.loads(row["source_ids_json"] or "[]")),
+                validation_status=row["validation_status"],
+                gate_reason=row["gate_reason"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+            )
+            gates = self._human_gates_for_run(run.run_id)
+            freshness = self._run_freshness(run.run_id, completed_at=completed_at)
+            compatibility, reasons = _artifact_compatibility(
+                request=request,
+                capability=capability,
+                run=run,
+                input_payload=input_payload,
+                output_payload=output_payload,
+                gates=gates,
+                freshness=freshness,
+            )
+            for artifact_type in capability.produced_artifacts:
+                artifacts.append(
+                    ArtifactStatus(
+                        artifact_type=artifact_type,
+                        producer_workflow=capability.workflow_name,
+                        run_id=run.run_id,
+                        output_id=_extract_output_id(output_payload),
+                        validation_status=run.validation_status,
+                        confidence=_extract_confidence(output_payload),
+                        freshness=freshness,
+                        compatibility=compatibility,
+                        open_gates=gates,
+                        upstream_references=_extract_upstream_references(output_payload),
+                        input_fingerprint=_input_fingerprint(input_payload),
+                        completed_at=completed_at,
+                        reasons=reasons,
+                    )
+                )
+        return tuple(artifacts)
 
     def save_sources(self, run_id: str, sources: tuple[SourceMetadata, ...]) -> None:
         """Persist source metadata for a run."""
@@ -492,6 +603,60 @@ class MemoryStore:
     def _rows(self, table: str, run_id: str) -> list[sqlite3.Row]:
         return list(self._connection.execute(f"SELECT * FROM {table} WHERE run_id = ?", (run_id,)))
 
+    def _candidate_run_rows(self, *, workflow_name: str, request: OrchestrationRequest) -> list[sqlite3.Row]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM runs
+            WHERE workflow_name = ?
+              AND output_json IS NOT NULL
+            ORDER BY COALESCE(completed_at, started_at) DESC, started_at DESC
+            """,
+            (workflow_name,),
+        ).fetchall()
+        if not request.nct_id:
+            return list(rows)
+        normalized_nct = request.nct_id.strip().upper()
+        matches = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"] or "{}") or {}
+            input_payload = _json_loads(row["input_json"]) or {}
+            output_payload = _json_loads(row["output_json"]) or {}
+            if _payload_nct(metadata, input_payload, output_payload) == normalized_nct:
+                matches.append(row)
+        return matches
+
+    def _human_gates_for_run(self, run_id: str) -> tuple[HumanGate, ...]:
+        return tuple(
+            HumanGate(
+                gate_id=row["gate_id"],
+                decision=row["decision"],
+                gate_reason=row["gate_reason"],
+                required_roles=tuple(json.loads(row["required_roles_json"] or "[]")),
+                reviewer=row["reviewer"],
+                reviewed_at=_parse_dt(row["reviewed_at"]),
+                source_ids=tuple(json.loads(row["source_ids_json"] or "[]")),
+                provenance=row["provenance"],
+            )
+            for row in self._rows("human_gates", run_id)
+        )
+
+    def _run_freshness(self, run_id: str, *, completed_at: datetime | None) -> str:
+        source_rows = self._rows("sources", run_id)
+        reference_dates = [
+            _parse_dt(row["retrieved_at"])
+            for row in source_rows
+            if _parse_dt(row["retrieved_at"]) is not None
+        ]
+        if not reference_dates and completed_at is not None:
+            reference_dates = [completed_at]
+        if not reference_dates:
+            return "unknown"
+        newest = max(reference_dates)
+        if newest.tzinfo is None:
+            newest = newest.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - newest).days
+        return "stale" if age_days > 180 else "fresh"
+
     def _init_schema(self) -> None:
         self._connection.executescript(
             """
@@ -658,3 +823,133 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(item) for item in value]
     return value
+
+
+def _payload_nct(metadata: dict[str, Any], input_payload: Any, output_payload: Any) -> str | None:
+    candidate = None
+    if isinstance(metadata, dict):
+        candidate = metadata.get("nct_id")
+    if candidate is None and isinstance(input_payload, dict):
+        candidate = input_payload.get("nct_id") or (input_payload.get("cli_input") or {}).get("nct_id")
+    if candidate is None and isinstance(output_payload, dict):
+        candidate = (
+            (output_payload.get("input") or {}).get("nct_id")
+            or (output_payload.get("target_trial") or {}).get("nct_id")
+            or (output_payload.get("trial_identity") or {}).get("nct_id")
+        )
+    if candidate is None:
+        return None
+    return str(candidate).strip().upper()
+
+
+def _artifact_compatibility(
+    *,
+    request: OrchestrationRequest,
+    capability: WorkflowSpec,
+    run: WorkflowRun,
+    input_payload: Any,
+    output_payload: Any,
+    gates: tuple[HumanGate, ...],
+    freshness: str,
+) -> tuple[str, tuple[str, ...]]:
+    reasons: list[str] = []
+    forced = {item.strip() for item in request.force_refresh}
+    if capability.name in forced or capability.workflow_name in forced or set(capability.produced_artifacts) & forced:
+        reasons.append("request explicitly forced refresh for this capability or artifact")
+    if run.status != "completed":
+        reasons.append(f"run status is {run.status}, not completed")
+    if run.validation_status == "failed":
+        reasons.append("run validation failed")
+    if request.nct_id:
+        observed_nct = _payload_nct(run.metadata, input_payload, output_payload)
+        if observed_nct != request.nct_id.strip().upper():
+            reasons.append("artifact NCT identifier does not match request")
+    assumption_mismatches = _assumption_mismatches(request.assumptions, input_payload)
+    reasons.extend(assumption_mismatches)
+    blocked_gates = [gate for gate in gates if gate.decision in {"blocked", "rejected"}]
+    if blocked_gates:
+        reasons.append("artifact has blocking or rejected human gate")
+    if freshness == "stale":
+        reasons.append("artifact sources or run timestamp are stale")
+    if not output_payload:
+        reasons.append("artifact output payload is missing")
+
+    if reasons:
+        return "incompatible", tuple(dict.fromkeys(reasons))
+    if gates:
+        return "compatible", ("artifact carries open human-review gates",)
+    return "compatible", ()
+
+
+def _assumption_mismatches(request_assumptions: dict[str, Any], input_payload: Any) -> tuple[str, ...]:
+    if not request_assumptions:
+        return ()
+    observed = _flatten_input_values(input_payload)
+    mismatches = []
+    for key, value in request_assumptions.items():
+        observed_value = observed.get(key)
+        if observed_value is None:
+            mismatches.append(f"requested assumption {key} is absent from artifact input")
+            continue
+        if observed_value != value:
+            mismatches.append(f"requested assumption {key} differs from artifact input")
+    return tuple(mismatches)
+
+
+def _flatten_input_values(input_payload: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    if not isinstance(input_payload, dict):
+        return values
+    candidates = [input_payload]
+    for key in ("cli_input", "expanded_pipeline_input", "input"):
+        item = input_payload.get(key)
+        if isinstance(item, dict):
+            candidates.append(item)
+    for candidate in candidates:
+        for key, value in candidate.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                values[key] = value
+    return values
+
+
+def _extract_output_id(output_payload: Any) -> str | None:
+    if not isinstance(output_payload, dict):
+        return None
+    return str(output_payload.get("output_id") or output_payload.get("brief_id") or "") or None
+
+
+def _extract_confidence(output_payload: Any) -> float | None:
+    if not isinstance(output_payload, dict):
+        return None
+    value = output_payload.get("confidence")
+    if value is None:
+        return None
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_upstream_references(output_payload: Any) -> tuple[str, ...]:
+    if not isinstance(output_payload, dict):
+        return ()
+    references = []
+    for key in ("agent3_handoff", "agent4_handoff"):
+        handoff = output_payload.get(key)
+        if isinstance(handoff, dict):
+            references.extend(str(value) for ref_key, value in handoff.items() if ref_key.endswith("_output_id") and value)
+            references.extend(str(value) for ref_key, value in handoff.items() if ref_key.endswith("_run_id") and value)
+    return tuple(dict.fromkeys(references))
+
+
+def _input_fingerprint(input_payload: Any) -> str:
+    return json.dumps(_to_jsonable(input_payload), ensure_ascii=False, sort_keys=True)
+
+
+def _artifact_satisfied_by_request(artifact_type: str, request: OrchestrationRequest) -> bool:
+    if artifact_type == "clinical_trial_record" and request.nct_id:
+        return True
+    identifiers = set(request.identifiers)
+    if artifact_type in identifiers:
+        return True
+    return False
