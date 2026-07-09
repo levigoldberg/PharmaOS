@@ -37,6 +37,7 @@ from pharma_os.schemas import (
 )
 from pharma_os.workflows import due_diligence
 from pharma_os.workflows.due_diligence import run_due_diligence_workflow
+from pharma_os.validators import validate_due_diligence_constraints, validate_source_coverage
 
 
 def _trial() -> ClinicalTrialRecord:
@@ -301,6 +302,19 @@ def test_due_diligence_workflow_persists_bundle(monkeypatch) -> None:
     assert bundle.claims
     assert bundle.validation_results
     assert bundle.agent_outputs
+    assert bundle.agent_traces
+    assert {trace.agent_name for trace in bundle.agent_traces} >= {
+        "DueDiligenceManagerAgent",
+        "ClinicalEvidenceSynthesisAgent",
+        "CompetitiveLandscapeAgent",
+        "SafetyDiligenceAgent",
+        "IPLOECriticAgent",
+        "CommercialAssumptionsCriticAgent",
+        "DiligenceRedTeamAgent",
+        "AssetMemoAgent",
+    }
+    assert any(agent_output.agent_name == "AssetMemoAgent" for agent_output in bundle.agent_outputs)
+    assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in bundle.agent_traces)
     assert bundle.reports
 
 
@@ -308,6 +322,7 @@ def test_due_diligence_cli_persists_report(monkeypatch, tmp_path) -> None:
     _install_due_diligence_fixtures(monkeypatch, agent3_output=_agent3_output(run_id="cli-agent3"))
     db_path = tmp_path / "memory.sqlite"
     output_path = tmp_path / "due.json"
+    html_path = tmp_path / "due.html"
     exit_code = main(
         [
             "run",
@@ -335,9 +350,15 @@ def test_due_diligence_cli_persists_report(monkeypatch, tmp_path) -> None:
             str(db_path),
             "--output-json",
             str(output_path),
+            "--output-html",
+            str(html_path),
         ]
     )
     assert exit_code == 0
+    assert html_path.exists()
+    html = html_path.read_text(encoding="utf-8")
+    assert "Agent Traces" in html
+    assert "AssetMemoAgent" in html
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["input"]["refresh_agent3"] is True
     assert payload["agent3_handoff"]["agent3_run_id"] == "cli-agent3"
@@ -433,3 +454,56 @@ def test_cross_agent_consistency_flags_mismatched_asset_phase_and_sources(monkey
     assert {result.validation_id.rsplit("-", 1)[-1] for result in failed} >= {"asset_name", "phase", "source_ids"}
     assert any(flag.provenance == "pharma_os.validators.generate_confidence_flags.validation" for flag in output.confidence_flags)
     assert output.human_gate is not None
+
+
+def test_due_diligence_pubmed_synthesis_stays_with_metadata(monkeypatch) -> None:
+    _install_due_diligence_fixtures(monkeypatch, agent3_output=_agent3_output(run_id="pubmed-agent3"))
+
+    output = run_due_diligence_workflow(_due_input(), memory=MemoryStore(":memory:"))
+
+    assert "Examplemab glioblastoma evidence" in output.clinical_evidence.ctgov_summary
+    assert "full text" not in output.clinical_evidence.ctgov_summary.casefold()
+    assert output.clinical_evidence.source_ids
+
+
+def test_due_diligence_unsourced_claims_fail_validation() -> None:
+    claim = EvidenceClaim(
+        claim_id="claim-unsourced",
+        claim_text="Unsourced diligence claim with 42 patients.",
+        source_ids=("missing-source",),
+        provenance="test",
+        confidence=0.1,
+        confidence_level="low",
+    )
+
+    result = validate_source_coverage(
+        target_id="due-output",
+        claims=(claim,),
+        source_ids=set(),
+        run_id="RUN",
+    )
+
+    assert result.status == "failed"
+
+
+def test_due_diligence_missing_loe_and_commercial_inputs_create_flags_and_questions(monkeypatch) -> None:
+    _install_due_diligence_fixtures(monkeypatch, agent3_output=_agent3_output(run_id="missing-agent3"))
+
+    output = run_due_diligence_workflow(DueDiligenceInput(nct_id="NCT12345678"), memory=MemoryStore(":memory:"))
+
+    assert any(flag.category in {"ip_loe", "rnpv"} for flag in output.red_flags)
+    assert any("LOE" in question for question in output.asset_memo.review_questions)
+    assert any("rNPV" in question for question in output.asset_memo.review_questions)
+
+
+def test_due_diligence_guardrail_blocks_decision_language(monkeypatch) -> None:
+    _install_due_diligence_fixtures(monkeypatch, agent3_output=_agent3_output(run_id="guardrail-agent3"))
+    output = run_due_diligence_workflow(_due_input(), memory=MemoryStore(":memory:"))
+    bad_memo = output.asset_memo.model_copy(
+        update={"summary": "This is a recommended investment and go/no-go decision."}
+    )
+    bad_output = output.model_copy(update={"asset_memo": bad_memo})
+
+    results = validate_due_diligence_constraints(run_id="RUN", output=bad_output)
+
+    assert any(result.status == "failed" and result.validator == "due_diligence_guardrails" for result in results)

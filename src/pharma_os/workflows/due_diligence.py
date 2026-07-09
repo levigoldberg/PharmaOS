@@ -6,6 +6,9 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from pydantic import BaseModel
+
+from pharma_os.agents.due_diligence import run_due_diligence_manager_agent
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.components.due_diligence_sections import (
@@ -45,6 +48,7 @@ from pharma_os.validators import (
     validate_schema,
     validate_source_coverage,
     validate_cross_agent_consistency,
+    validate_due_diligence_constraints,
 )
 
 
@@ -188,7 +192,7 @@ def run_due_diligence_workflow(
         rnpv=rnpv,
         missing_data_flags=missing_data_flags,
     )
-    asset_memo = build_asset_memo(
+    deterministic_asset_memo = build_asset_memo(
         run_id=run_id,
         asset=asset_identity,
         clinical_risk=clinical_risk_summary,
@@ -204,6 +208,30 @@ def run_due_diligence_workflow(
         assumptions=assumptions,
         missing_data_flags=missing_data_flags,
     )
+    manager_result = run_due_diligence_manager_agent(
+        run_id=run_id,
+        agent3_output=agent3_output,
+        asset=asset_identity,
+        clinical_risk=clinical_risk_summary,
+        clinical_evidence=clinical_evidence,
+        landscape=competitive_landscape,
+        safety=safety_label_summary,
+        patent=patent_loe_review,
+        pricing=pricing,
+        commercial=commercial_model,
+        rnpv=rnpv,
+        red_flags=red_flags,
+        claims=claims,
+        assumptions=assumptions,
+        missing_data_flags=missing_data_flags,
+        source_ids=tuple(source.source_id for source in sources),
+    )
+    clinical_evidence = manager_result.clinical_evidence
+    competitive_landscape = manager_result.competitive_landscape
+    safety_label_summary = manager_result.safety_label_summary
+    patent_loe_review = manager_result.patent_loe_review
+    red_flags = manager_result.red_flags
+    asset_memo = manager_result.asset_memo or deterministic_asset_memo
     output = DueDiligenceOutput(
         output_id=f"due-diligence-output-{run_id}",
         run_id=run_id,
@@ -254,6 +282,7 @@ def run_due_diligence_workflow(
             agent3_output=agent3_output,
             agent4_output=output,
         ),
+        *validate_due_diligence_constraints(run_id=run_id, output=output),
     )
     output_text = "\n".join([
         *(claim.claim_text for claim in claims),
@@ -298,9 +327,9 @@ def run_due_diligence_workflow(
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
-        agent_name="due_diligence_deterministic_workflow",
+        agent_name="due_diligence_agent4_workflow",
         run_id=run_id,
-        provenance="PharmaOS deterministic due_diligence workflow",
+        provenance="PharmaOS Agent 4 due_diligence workflow with SDK-backed synthesis and deterministic retrieval/math",
         claims=claims,
         sources=sources,
         confidence=output.confidence,
@@ -309,6 +338,17 @@ def run_due_diligence_workflow(
     )
     store.save_sources(run_id, sources)
     store.save_claims(run_id, claims)
+    for payload in manager_result.subagent_payloads:
+        store.save_agent_output(
+            _subagent_output_envelope(
+                run_id=run_id,
+                payload=payload,
+                sources=sources,
+                validation_status=validation_status,
+            ),
+            payload=payload,
+        )
+    store.save_agent_traces(manager_result.traces)
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
     store.save_confidence_flags(run_id, confidence_flags)
@@ -323,7 +363,16 @@ def run_due_diligence_workflow(
             "gate_reason": gate.gate_reason if gate else None,
         }
     )
-    store.save_run(completed_run, input_payload=input_data, output_payload=output)
+    store.save_run(
+        completed_run,
+        input_payload=input_data,
+        output_payload=output,
+        trace_metadata={
+            "manager_agent": "DueDiligenceManagerAgent",
+            "subagent_trace_count": len(manager_result.traces),
+            "subagent_output_count": len(manager_result.subagent_payloads),
+        },
+    )
     build_report(run_id, memory=store)
     return output
 
@@ -511,6 +560,32 @@ def _dedupe_sources(sources: tuple[object, ...]) -> tuple[object, ...]:
     for source in sources:
         deduped[getattr(source, "source_id")] = source
     return tuple(deduped.values())
+
+
+def _subagent_output_envelope(
+    *,
+    run_id: str,
+    payload: BaseModel,
+    sources: tuple[SourceMetadata, ...],
+    validation_status: str,
+) -> AgentOutput:
+    known_sources = {source.source_id: source for source in sources}
+    payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
+    agent_name = getattr(payload, "agent_name", None) or {
+        "DueDiligenceManagerPlan": "DueDiligenceManagerAgent",
+        "AssetMemo": "AssetMemoAgent",
+    }.get(payload.__class__.__name__, payload.__class__.__name__)
+    output_id = getattr(payload, "output_id", None) or getattr(payload, "memo_id", payload.__class__.__name__)
+    return AgentOutput(
+        output_id=f"agent-output-{run_id}-{output_id}",
+        agent_name=agent_name,
+        run_id=run_id,
+        provenance="PharmaOS Agent 4 subagent typed output",
+        claims=(),
+        sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
+        confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
+        validation_status=validation_status,  # type: ignore[arg-type]
+    )
 
 
 def _dedupe_missing_flags(flags: tuple[object, ...]) -> tuple[object, ...]:

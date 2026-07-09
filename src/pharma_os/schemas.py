@@ -538,6 +538,59 @@ class LabelExpansionClinicalRationale(StrictSchema):
     confidence: float = Field(default=0.0, ge=0, le=1)
 
 
+class ClinicalOutcomeManagerPlan(StrictSchema):
+    """Manager-agent plan for coordinating Agent 3 clinical interpretation."""
+
+    output_id: str = Field(..., min_length=1)
+    nct_id: str = Field(..., min_length=1)
+    ordered_agents: tuple[str, ...] = Field(default_factory=tuple)
+    guardrail_summary: str = Field(..., min_length=1)
+    rationale_summary: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class AssetIdentityAdjudication(StrictSchema):
+    """Agent 3 adjudication record for ambiguous asset identity cases."""
+
+    output_id: str = Field(..., min_length=1)
+    nct_id: str = Field(..., min_length=1)
+    is_ambiguous: bool = True
+    ambiguity_reasons: tuple[str, ...] = Field(default_factory=tuple)
+    recommended_asset_name: str | None = None
+    recommended_modality: str | None = None
+    recommended_indication: str | None = None
+    review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ComparatorTrialRelevance(StrictSchema):
+    """Agent 3 relevance judgment for one deterministically retrieved comparator trial."""
+
+    nct_id: str = Field(..., min_length=1)
+    relevance: Literal["relevant", "weak", "excluded"]
+    rationale: str = Field(..., min_length=1)
+    matched_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    mismatched_dimensions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class ComparatorRelevanceOutput(StrictSchema):
+    """ComparatorRelevanceAgent output over deterministic CT.gov comparator candidates."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    trial_relevance: tuple[ComparatorTrialRelevance, ...] = Field(default_factory=tuple)
+    relevance_summary: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
 class ClinicalOutcomePredictionOutput(StrictSchema):
     """Structured output from the Clinical Outcome Prediction Agent 3 workflow."""
 

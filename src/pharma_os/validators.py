@@ -307,6 +307,106 @@ def validate_cross_agent_consistency(
     return tuple(results)
 
 
+def validate_clinical_outcome_constraints(
+    *,
+    run_id: str,
+    output: ClinicalOutcomePredictionOutput,
+) -> tuple[ValidationResult, ...]:
+    """Validate Agent 3 clinical-reasoning guardrails."""
+
+    results: list[ValidationResult] = []
+    output_text = output.model_dump_json().casefold()
+    disallowed_patterns = {
+        "final_decision": r"\bgo\s*/?\s*no-go\b|\bgo decision\b|\bno-go decision\b|\bapproval decision\b|\binvestment recommendation\b|\blicensing recommendation\b",
+        "invented_efficacy": r"\b(?:efficacy|response|orr|pfs|overall survival|os)\s+(?:rate|result)?\s*(?:was|is|=)?\s*(?:assumed|estimated|set\s+at\s+)?\d",
+        "invented_safety_rate": r"\b(?:adverse event|ae|toxicity|serious adverse event|sae|safety)\s+(?:rate)?\s*(?:was|is|=)?\s*(?:assumed|estimated|set\s+at\s+)?\d",
+        "invented_pos_or_approval": r"\b(?:pos|probability of success|approval probability|approval likelihood)\s+(?:is|=)\s+(?:assumed|estimated|set)\s+\d",
+    }
+    findings = [name for name, pattern in disallowed_patterns.items() if re.search(pattern, output_text, re.IGNORECASE)]
+    if output.approval_likelihood_proxy.probability is not None and (
+        output.approval_likelihood_proxy.assumption_type != "source_derived"
+        or not output.approval_likelihood_proxy.source_ids
+    ):
+        findings.append("approval_proxy_not_source_backed")
+    if output.historical_pos_estimate.probability_of_success is not None and (
+        output.historical_pos_estimate.assumption_type != "source_derived"
+        or not output.historical_pos_estimate.source_ids
+    ):
+        findings.append("pos_not_source_backed")
+    if findings:
+        results.append(
+            ValidationResult(
+                validation_id=f"validation-{run_id}-clinical-outcome-guardrails",
+                target_id=output.output_id,
+                status="failed",
+                validator="clinical_outcome_guardrails",
+                message=f"disallowed clinical outcome language or unsupported probability detected: {', '.join(tuple(dict.fromkeys(findings)))}",
+                confidence=1.0,
+                source_ids=tuple(source.source_id for source in output.sources),
+                gate_reason="Agent 3 must remain a source-backed clinical risk artifact, not an outcome oracle or decision engine.",
+                provenance="pharma_os.validators.validate_clinical_outcome_constraints",
+            )
+        )
+    else:
+        results.append(
+            ValidationResult(
+                validation_id=f"validation-{run_id}-clinical-outcome-guardrails",
+                target_id=output.output_id,
+                status="passed",
+                validator="clinical_outcome_guardrails",
+                message="Agent 3 output stayed within clinical risk reasoning guardrails.",
+                confidence=1.0,
+                source_ids=tuple(source.source_id for source in output.sources),
+                provenance="pharma_os.validators.validate_clinical_outcome_constraints",
+            )
+        )
+    return tuple(results)
+
+
+def validate_due_diligence_constraints(
+    *,
+    run_id: str,
+    output: DueDiligenceOutput,
+) -> tuple[ValidationResult, ...]:
+    """Validate Agent 4 draft-only diligence guardrails."""
+
+    output_text = output.model_dump_json().casefold()
+    disallowed_patterns = {
+        "investment_recommendation": r"\brecommend(?:ed)?\s+(?:investment|investing|license|licensing|acquisition|acquire)\b",
+        "go_no_go": r"\bgo\s*/?\s*no-go\b|\bgo decision\b|\bno-go decision\b",
+        "approval_decision": r"\bapproval decision\b|\bapprove(?:d)?\s+(?:the\s+)?(?:asset|trial|protocol|investment)\b|\brecommend(?:ed)?\s+approval\b",
+        "legal_conclusion": r"\blegal conclusion\b|\bfreedom to operate\b|\bfto opinion\b",
+        "invented_diligence_values": r"\b(?:loe|pricing|market size|eligible patients|penetration|rnpv)\s+(?:is|=)\s+(?:assumed|estimated|set)\s+\d",
+    }
+    findings = [name for name, pattern in disallowed_patterns.items() if re.search(pattern, output_text, re.IGNORECASE)]
+    if findings:
+        return (
+            ValidationResult(
+                validation_id=f"validation-{run_id}-due-diligence-guardrails",
+                target_id=output.output_id,
+                status="failed",
+                validator="due_diligence_guardrails",
+                message=f"disallowed due-diligence decision or invented-value language detected: {', '.join(findings)}",
+                confidence=1.0,
+                source_ids=tuple(source.source_id for source in output.sources),
+                gate_reason="Agent 4 must remain a draft diligence artifact without final decisions or invented values.",
+                provenance="pharma_os.validators.validate_due_diligence_constraints",
+            ),
+        )
+    return (
+        ValidationResult(
+            validation_id=f"validation-{run_id}-due-diligence-guardrails",
+            target_id=output.output_id,
+            status="passed",
+            validator="due_diligence_guardrails",
+            message="Agent 4 output stayed within draft diligence guardrails.",
+            confidence=1.0,
+            source_ids=tuple(source.source_id for source in output.sources),
+            provenance="pharma_os.validators.validate_due_diligence_constraints",
+        ),
+    )
+
+
 def validate_protocol_design_constraints(
     *,
     run_id: str,

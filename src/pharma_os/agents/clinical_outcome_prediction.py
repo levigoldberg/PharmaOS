@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import re
+import os
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
 import httpx
+from pydantic import BaseModel
 
+from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, load_agents_sdk, run_structured_agent, runtime_config_from_env
 from pharma_os.schemas import (
+    AgentRunTrace,
     ApprovalLikelihoodProxy,
+    AssetIdentityAdjudication,
     AssetIdentityOutput,
     AssumptionRecord,
+    ClinicalOutcomeManagerPlan,
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
     ClinicalTrialRecord,
     ComparatorBenchmarkBundle,
+    ComparatorRelevanceOutput,
+    ComparatorTrialRelevance,
     EndpointRiskAssessment,
     EnrollmentDurationRisk,
     EvidenceClaim,
@@ -40,21 +49,67 @@ from pharma_os.tools.pos import lookup_pos
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 
 
+@dataclass(frozen=True)
+class ClinicalOutcomePredictionAgentResult:
+    """Agent 3 output plus persisted reasoning artifacts."""
+
+    output: ClinicalOutcomePredictionOutput
+    traces: tuple[AgentRunTrace, ...]
+    subagent_payloads: tuple[BaseModel, ...]
+
+
+@dataclass(frozen=True)
+class ClinicalOutcomeManagerResult:
+    """Manager/subagent results used to preserve the final Agent 3 output shape."""
+
+    manager_plan: ClinicalOutcomeManagerPlan
+    asset_identity: AssetIdentityOutput
+    endpoint_risk_assessment: EndpointRiskAssessment
+    enrollment_duration_risk: EnrollmentDurationRisk
+    comparator_benchmarking: ComparatorBenchmarkBundle
+    comparator_relevance: ComparatorRelevanceOutput
+    failure_mode_classification: FailureModeClassification
+    safety_context: SafetyContext
+    label_expansion_clinical_rationale: LabelExpansionClinicalRationale
+    traces: tuple[AgentRunTrace, ...]
+    subagent_payloads: tuple[BaseModel, ...]
+
+
 def run_clinical_outcome_prediction_agent(
     input_data: ClinicalOutcomePredictionInput,
     *,
     run_id: str,
     ctgov_client: ClinicalTrialsGovClient | None = None,
     label_client: httpx.Client | None = None,
+    config: AgentRuntimeConfig | None = None,
 ) -> ClinicalOutcomePredictionOutput:
-    """Run deterministic Agent 3 components for one NCT ID."""
+    """Run SDK-backed Agent 3 clinical reasoning and return the final output."""
+
+    return run_clinical_outcome_prediction_agent_result(
+        input_data,
+        run_id=run_id,
+        ctgov_client=ctgov_client,
+        label_client=label_client,
+        config=config,
+    ).output
+
+
+def run_clinical_outcome_prediction_agent_result(
+    input_data: ClinicalOutcomePredictionInput,
+    *,
+    run_id: str,
+    ctgov_client: ClinicalTrialsGovClient | None = None,
+    label_client: httpx.Client | None = None,
+    config: AgentRuntimeConfig | None = None,
+) -> ClinicalOutcomePredictionAgentResult:
+    """Run deterministic Agent 3 retrieval/math, then bounded clinical-reasoning agents."""
 
     client = ctgov_client or ClinicalTrialsGovClient()
     trial = client.fetch_trial(input_data.nct_id)
     asset, asset_sources = resolve_asset_identity(trial)
     pos, pos_source = lookup_pos(trial, asset, workbook_path=input_data.pos_workbook_path)
     historical_pos = _historical_pos(pos)
-    comparator, comparator_sources = _comparator_benchmarks(client, trial, run_id)
+    comparator, comparator_sources, comparator_records = _comparator_benchmarks(client, trial, run_id)
     safety_context, label_rationale, label_sources = _label_context(asset, trial, client=label_client)
 
     trial_identity = _trial_identity(trial)
@@ -69,6 +124,42 @@ def run_clinical_outcome_prediction_agent(
         safety_context=safety_context,
         asset=asset,
     )
+    manager_result = run_clinical_outcome_manager_agent(
+        run_id=run_id,
+        input_data=input_data,
+        trial=trial,
+        comparator_records=comparator_records,
+        trial_identity=trial_identity,
+        design=design,
+        asset=asset,
+        endpoint_risk=endpoint_risk,
+        enrollment_risk=enrollment_risk,
+        comparator=comparator,
+        historical_pos=historical_pos,
+        approval_proxy=approval_proxy,
+        failure_modes=failure_modes,
+        safety_context=safety_context,
+        label_rationale=label_rationale,
+        source_ids=tuple(
+            source.source_id
+            for source in _dedupe_sources(
+                (
+                    *asset_sources,
+                    pos_source,
+                    *comparator_sources,
+                    *label_sources,
+                )
+            )
+        ),
+        config=config,
+    )
+    asset = manager_result.asset_identity
+    endpoint_risk = manager_result.endpoint_risk_assessment
+    enrollment_risk = manager_result.enrollment_duration_risk
+    comparator = manager_result.comparator_benchmarking
+    failure_modes = manager_result.failure_mode_classification
+    safety_context = manager_result.safety_context
+    label_rationale = manager_result.label_expansion_clinical_rationale
 
     sources = _dedupe_sources(
         (
@@ -111,7 +202,7 @@ def run_clinical_outcome_prediction_agent(
         label_rationale=label_rationale,
     )
 
-    return ClinicalOutcomePredictionOutput(
+    output = ClinicalOutcomePredictionOutput(
         output_id=f"clinical-outcome-prediction-output-{run_id}",
         run_id=run_id,
         input=input_data,
@@ -132,6 +223,579 @@ def run_clinical_outcome_prediction_agent(
         assumptions=assumptions,
         missing_data_flags=missing_flags,
         confidence=_overall_confidence(missing_flags, historical_pos, comparator, safety_context),
+    )
+    return ClinicalOutcomePredictionAgentResult(
+        output=output,
+        traces=manager_result.traces,
+        subagent_payloads=manager_result.subagent_payloads,
+    )
+
+
+def run_clinical_outcome_manager_agent(
+    *,
+    run_id: str,
+    input_data: ClinicalOutcomePredictionInput,
+    trial: ClinicalTrialRecord,
+    comparator_records: tuple[ClinicalTrialRecord, ...],
+    trial_identity: TrialIdentity,
+    design: TrialDesignFeatures,
+    asset: AssetIdentityOutput,
+    endpoint_risk: EndpointRiskAssessment,
+    enrollment_risk: EnrollmentDurationRisk,
+    comparator: ComparatorBenchmarkBundle,
+    historical_pos: HistoricalPoSEstimate,
+    approval_proxy: ApprovalLikelihoodProxy,
+    failure_modes: FailureModeClassification,
+    safety_context: SafetyContext,
+    label_rationale: LabelExpansionClinicalRationale,
+    source_ids: tuple[str, ...],
+    config: AgentRuntimeConfig | None = None,
+) -> ClinicalOutcomeManagerResult:
+    """Run Agent 3 manager/subagents after deterministic retrieval and math."""
+
+    runtime_config = _agent3_runtime_config(config)
+    traces: list[AgentRunTrace] = []
+    payloads: list[BaseModel] = []
+    common_payload = _agent3_base_payload(
+        input_data=input_data,
+        trial=trial,
+        comparator_records=comparator_records,
+        trial_identity=trial_identity,
+        design=design,
+        asset=asset,
+        endpoint_risk=endpoint_risk,
+        enrollment_risk=enrollment_risk,
+        comparator=comparator,
+        historical_pos=historical_pos,
+        approval_proxy=approval_proxy,
+        failure_modes=failure_modes,
+        safety_context=safety_context,
+        label_rationale=label_rationale,
+        source_ids=source_ids,
+    )
+
+    manager_plan = _run_typed_agent(
+        agent_name="ClinicalOutcomeManagerAgent",
+        instructions=_manager_instructions(),
+        output_type=ClinicalOutcomeManagerPlan,
+        run_id=run_id,
+        input_summary=f"Coordinate Agent 3 clinical risk reasoning for {trial.nct_id}.",
+        payload=common_payload,
+        fallback_output=_manager_plan_fallback(run_id, trial, asset, source_ids),
+        source_ids=source_ids,
+        confidence=0.7,
+        config=runtime_config,
+        rationale_summary="Coordinate bounded clinical interpretation after deterministic retrieval/math.",
+    )
+    traces.append(manager_plan.trace)
+    payloads.append(manager_plan.output)
+
+    updated_asset = asset
+    if _asset_identity_ambiguous(trial, asset):
+        adjudication = _run_typed_agent(
+            agent_name="AssetIdentityAdjudicatorAgent",
+            instructions=_asset_identity_instructions(),
+            output_type=AssetIdentityAdjudication,
+            run_id=run_id,
+            input_summary=f"Adjudicate ambiguous asset identity for {trial.nct_id}.",
+            payload=common_payload,
+            fallback_output=_asset_adjudication_fallback(run_id, trial, asset),
+            source_ids=asset.source_ids or (trial.source_id,),
+            confidence=min(0.75, asset.confidence),
+            config=runtime_config,
+            rationale_summary="Flag asset identity ambiguity without forcing certainty.",
+        )
+        traces.append(adjudication.trace)
+        payloads.append(adjudication.output)
+        updated_asset = _apply_asset_adjudication(asset, adjudication.output)
+
+    endpoint_result = _run_typed_agent(
+        agent_name="EndpointRiskAgent",
+        instructions=_endpoint_instructions(),
+        output_type=EndpointRiskAssessment,
+        run_id=run_id,
+        input_summary=f"Interpret endpoint risks for {trial.nct_id}.",
+        payload=common_payload,
+        fallback_output=endpoint_risk,
+        source_ids=endpoint_risk.source_ids,
+        confidence=endpoint_risk.confidence,
+        config=runtime_config,
+        rationale_summary="Classify endpoint family, hierarchy, phase fit, and credibility risks without inferring success.",
+    )
+    traces.append(endpoint_result.trace)
+    payloads.append(endpoint_result.output)
+    updated_endpoint = _ensure_component_sources(endpoint_result.output, endpoint_risk.source_ids)
+
+    relevance_result = _run_typed_agent(
+        agent_name="ComparatorRelevanceAgent",
+        instructions=_comparator_instructions(),
+        output_type=ComparatorRelevanceOutput,
+        run_id=run_id,
+        input_summary=f"Judge comparator relevance for {trial.nct_id}.",
+        payload=common_payload,
+        fallback_output=_comparator_relevance_fallback(run_id, trial, comparator_records, comparator),
+        source_ids=comparator.source_ids,
+        confidence=comparator.confidence,
+        config=runtime_config,
+        rationale_summary="Classify deterministic comparator candidates as relevant, weak, or excluded without inventing outcomes.",
+    )
+    traces.append(relevance_result.trace)
+    payloads.append(relevance_result.output)
+    comparator_relevance = relevance_result.output
+    updated_comparator = _apply_comparator_relevance(comparator, comparator_relevance)
+
+    enrollment_result = _run_typed_agent(
+        agent_name="EnrollmentFeasibilityAgent",
+        instructions=_enrollment_instructions(),
+        output_type=EnrollmentDurationRisk,
+        run_id=run_id,
+        input_summary=f"Interpret enrollment feasibility for {trial.nct_id}.",
+        payload=common_payload,
+        fallback_output=enrollment_risk,
+        source_ids=enrollment_risk.source_ids,
+        confidence=enrollment_risk.confidence,
+        config=runtime_config,
+        rationale_summary="Explain feasibility risk from registry enrollment, dates, sites, eligibility, and restrictions.",
+    )
+    traces.append(enrollment_result.trace)
+    payloads.append(enrollment_result.output)
+    updated_enrollment = _ensure_component_sources(enrollment_result.output, enrollment_risk.source_ids)
+
+    safety_result = _run_typed_agent(
+        agent_name="SafetyContextAgent",
+        instructions=_safety_instructions(),
+        output_type=SafetyContext,
+        run_id=run_id,
+        input_summary=f"Interpret label and registry safety context for {trial.nct_id}.",
+        payload=common_payload,
+        fallback_output=safety_context,
+        source_ids=safety_context.source_ids or updated_asset.source_ids,
+        confidence=safety_context.confidence,
+        config=runtime_config,
+        rationale_summary="Separate known label-derived risks from missing safety context without inventing adverse-event rates.",
+    )
+    traces.append(safety_result.trace)
+    payloads.append(safety_result.output)
+    updated_safety = _ensure_component_sources(safety_result.output, safety_context.source_ids)
+
+    updated_label_rationale = label_rationale
+    if updated_safety is not safety_context:
+        updated_label_rationale = label_rationale.model_copy(
+            update={
+                "source_ids": tuple(dict.fromkeys((*label_rationale.source_ids, *updated_safety.source_ids))),
+                "confidence": min(label_rationale.confidence or 0.0, updated_safety.confidence or 0.0)
+                if label_rationale.confidence
+                else updated_safety.confidence,
+            }
+        )
+
+    failure_fallback = _failure_modes(
+        endpoint_risk=updated_endpoint,
+        enrollment_risk=updated_enrollment,
+        comparator=updated_comparator,
+        safety_context=updated_safety,
+        asset=updated_asset,
+    )
+    failure_payload = {
+        **common_payload,
+        "updated_asset_identity": updated_asset.model_dump(mode="json"),
+        "updated_endpoint_risk_assessment": updated_endpoint.model_dump(mode="json"),
+        "updated_enrollment_duration_risk": updated_enrollment.model_dump(mode="json"),
+        "updated_comparator_benchmarking": updated_comparator.model_dump(mode="json"),
+        "updated_safety_context": updated_safety.model_dump(mode="json"),
+        "comparator_relevance": comparator_relevance.model_dump(mode="json"),
+    }
+    failure_result = _run_typed_agent(
+        agent_name="FailureModeSynthesisAgent",
+        instructions=_failure_mode_instructions(),
+        output_type=FailureModeClassification,
+        run_id=run_id,
+        input_summary=f"Synthesize likely failure-mode categories for {trial.nct_id}.",
+        payload=failure_payload,
+        fallback_output=failure_fallback,
+        source_ids=failure_fallback.source_ids or source_ids,
+        confidence=failure_fallback.confidence,
+        config=runtime_config,
+        rationale_summary="Integrate risk patterns into categorical failure modes, not an outcome prediction.",
+    )
+    traces.append(failure_result.trace)
+    payloads.append(failure_result.output)
+    updated_failure = _ensure_component_sources(failure_result.output, failure_fallback.source_ids or source_ids)
+
+    return ClinicalOutcomeManagerResult(
+        manager_plan=manager_plan.output,
+        asset_identity=updated_asset,
+        endpoint_risk_assessment=updated_endpoint,
+        enrollment_duration_risk=updated_enrollment,
+        comparator_benchmarking=updated_comparator,
+        comparator_relevance=comparator_relevance,
+        failure_mode_classification=updated_failure,
+        safety_context=updated_safety,
+        label_expansion_clinical_rationale=updated_label_rationale,
+        traces=tuple(traces),
+        subagent_payloads=tuple(payloads),
+    )
+
+
+def _agent3_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
+    if config is not None:
+        return config
+    env_config = runtime_config_from_env()
+    live_enabled = str(os.getenv("PHARMA_OS_ENABLE_LIVE_AGENTS") or "").strip().casefold() in {"1", "true", "yes", "on"}
+    if env_config.disabled or (live_enabled and os.getenv("OPENAI_API_KEY")):
+        return env_config
+    return env_config.model_copy(update={"disabled": True, "provenance": "pharma_os.agents.clinical_outcome_prediction.live_agents_not_enabled"})
+
+
+def _run_typed_agent(
+    *,
+    agent_name: str,
+    instructions: str,
+    output_type: type[Any],
+    run_id: str,
+    input_summary: str,
+    payload: dict[str, Any],
+    fallback_output: BaseModel,
+    source_ids: tuple[str, ...],
+    confidence: float,
+    config: AgentRuntimeConfig,
+    rationale_summary: str,
+) -> StructuredAgentResult:
+    agent = object()
+    if not config.disabled:
+        Agent, _, _, _ = load_agents_sdk()
+        agent = Agent(
+            name=agent_name,
+            instructions=instructions,
+            model=config.model,
+            output_type=output_type,
+        )
+    return run_structured_agent(
+        agent=agent,
+        payload=payload,
+        output_type=output_type,
+        agent_name=agent_name,
+        run_id=run_id,
+        input_summary=input_summary,
+        config=config,
+        offline_output=fallback_output,
+        source_ids=source_ids,
+        confidence=confidence,
+        rationale_summary=rationale_summary,
+    )
+
+
+def _agent3_base_payload(
+    *,
+    input_data: ClinicalOutcomePredictionInput,
+    trial: ClinicalTrialRecord,
+    comparator_records: tuple[ClinicalTrialRecord, ...],
+    trial_identity: TrialIdentity,
+    design: TrialDesignFeatures,
+    asset: AssetIdentityOutput,
+    endpoint_risk: EndpointRiskAssessment,
+    enrollment_risk: EnrollmentDurationRisk,
+    comparator: ComparatorBenchmarkBundle,
+    historical_pos: HistoricalPoSEstimate,
+    approval_proxy: ApprovalLikelihoodProxy,
+    failure_modes: FailureModeClassification,
+    safety_context: SafetyContext,
+    label_rationale: LabelExpansionClinicalRationale,
+    source_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "input": input_data.model_dump(mode="json"),
+        "target_trial": trial.model_dump(mode="json"),
+        "comparator_candidates": [record.model_dump(mode="json") for record in comparator_records],
+        "trial_identity": trial_identity.model_dump(mode="json"),
+        "trial_design_features": design.model_dump(mode="json"),
+        "asset_identity": asset.model_dump(mode="json"),
+        "endpoint_risk_assessment": endpoint_risk.model_dump(mode="json"),
+        "enrollment_duration_risk": enrollment_risk.model_dump(mode="json"),
+        "comparator_benchmarking": comparator.model_dump(mode="json"),
+        "historical_pos_estimate": historical_pos.model_dump(mode="json"),
+        "approval_likelihood_proxy": approval_proxy.model_dump(mode="json"),
+        "failure_mode_classification": failure_modes.model_dump(mode="json"),
+        "safety_context": safety_context.model_dump(mode="json"),
+        "label_expansion_clinical_rationale": label_rationale.model_dump(mode="json"),
+        "source_ids": source_ids,
+        "guardrails": (
+            "Agent 3 is not an outcome oracle. Use only source-backed evidence. Do not invent efficacy results, "
+            "safety rates, approval probability, PoS, enrollment rates, site performance, competitor outcomes, or final "
+            "clinical, approval, investment, licensing, or go/no-go decisions."
+        ),
+    }
+
+
+def _manager_plan_fallback(
+    run_id: str,
+    trial: ClinicalTrialRecord,
+    asset: AssetIdentityOutput,
+    source_ids: tuple[str, ...],
+) -> ClinicalOutcomeManagerPlan:
+    ordered_agents = [
+        "EndpointRiskAgent",
+        "ComparatorRelevanceAgent",
+        "EnrollmentFeasibilityAgent",
+        "SafetyContextAgent",
+        "FailureModeSynthesisAgent",
+    ]
+    if _asset_identity_ambiguous(trial, asset):
+        ordered_agents.insert(0, "AssetIdentityAdjudicatorAgent")
+    return ClinicalOutcomeManagerPlan(
+        output_id=f"clinical-outcome-manager-plan-{run_id}",
+        nct_id=trial.nct_id,
+        ordered_agents=tuple(ordered_agents),
+        guardrail_summary="Agent 3 interprets clinical risk patterns only; missing or ambiguous evidence is routed to flags and human review.",
+        rationale_summary="Coordinate clinical reasoning after deterministic CT.gov, RxNorm, PoS, comparator, duration, and openFDA steps.",
+        source_ids=source_ids,
+        missing_data_flags=asset.missing_data_flags,
+        confidence=0.7 if not asset.missing_data_flags else 0.55,
+    )
+
+
+def _asset_identity_ambiguous(trial: ClinicalTrialRecord, asset: AssetIdentityOutput) -> bool:
+    non_placebo = tuple(item for item in trial.interventions if "placebo" not in item.name.casefold())
+    return any(
+        (
+            len(non_placebo) > 1,
+            asset.rxnorm_match is None,
+            not asset.asset_name,
+            not asset.sponsor,
+            not asset.normalized_indication,
+            (asset.modality or "unknown") == "unknown",
+            any(flag.field in {"asset_name", "rxnorm_match", "modality", "normalized_indication", "sponsor"} for flag in asset.missing_data_flags),
+        )
+    )
+
+
+def _asset_adjudication_fallback(
+    run_id: str,
+    trial: ClinicalTrialRecord,
+    asset: AssetIdentityOutput,
+) -> AssetIdentityAdjudication:
+    reasons = []
+    if len(tuple(item for item in trial.interventions if "placebo" not in item.name.casefold())) > 1:
+        reasons.append("multiple non-placebo interventions or combination therapy")
+    if asset.rxnorm_match is None:
+        reasons.append("RxNorm returned no deterministic match")
+    if not asset.sponsor:
+        reasons.append("lead sponsor is missing or ambiguous")
+    if not asset.normalized_indication:
+        reasons.append("normalized indication is missing")
+    if (asset.modality or "unknown") == "unknown":
+        reasons.append("modality is unknown")
+    flags = (
+        *asset.missing_data_flags,
+        _missing(
+            f"cop-asset-adjudication-{trial.nct_id}",
+            "asset_identity",
+            "asset_name",
+            "Asset identity requires clinical review because deterministic resolution has ambiguity signals.",
+            "medium",
+        ),
+    )
+    return AssetIdentityAdjudication(
+        output_id=f"asset-identity-adjudication-{run_id}",
+        nct_id=trial.nct_id,
+        is_ambiguous=True,
+        ambiguity_reasons=tuple(dict.fromkeys(reasons or ("asset identity ambiguity detected",))),
+        recommended_asset_name=asset.asset_name,
+        recommended_modality=asset.modality if asset.modality != "unknown" else None,
+        recommended_indication=asset.normalized_indication,
+        review_questions=("Which intervention is the target asset for downstream diligence?",),
+        source_ids=asset.source_ids or (trial.source_id,),
+        missing_data_flags=_dedupe_missing_flags(flags),
+        confidence=min(asset.confidence, 0.55),
+    )
+
+
+def _apply_asset_adjudication(
+    asset: AssetIdentityOutput,
+    adjudication: AssetIdentityAdjudication,
+) -> AssetIdentityOutput:
+    updates: dict[str, Any] = {
+        "missing_data_flags": _dedupe_missing_flags((*asset.missing_data_flags, *adjudication.missing_data_flags)),
+        "confidence": min(asset.confidence, adjudication.confidence),
+    }
+    if not asset.asset_name and adjudication.recommended_asset_name:
+        updates["asset_name"] = adjudication.recommended_asset_name
+    if (not asset.modality or asset.modality == "unknown") and adjudication.recommended_modality:
+        updates["modality"] = adjudication.recommended_modality
+    if not asset.normalized_indication and adjudication.recommended_indication:
+        updates["normalized_indication"] = adjudication.recommended_indication
+    return asset.model_copy(update=updates)
+
+
+def _comparator_relevance_fallback(
+    run_id: str,
+    trial: ClinicalTrialRecord,
+    comparator_records: tuple[ClinicalTrialRecord, ...],
+    comparator: ComparatorBenchmarkBundle,
+) -> ComparatorRelevanceOutput:
+    judgments = tuple(_judge_comparator_relevance(trial, candidate) for candidate in comparator_records if candidate.nct_id != trial.nct_id)
+    counts = {key: sum(1 for item in judgments if item.relevance == key) for key in ("relevant", "weak", "excluded")}
+    if not judgments and comparator.missing_data_flags:
+        summary = "Comparator relevance could not be reviewed because no comparator candidates were available."
+    else:
+        summary = f"Comparator relevance review classified {counts['relevant']} relevant, {counts['weak']} weak, and {counts['excluded']} excluded CT.gov candidates."
+    return ComparatorRelevanceOutput(
+        output_id=f"comparator-relevance-{run_id}",
+        target_nct_id=trial.nct_id,
+        trial_relevance=judgments,
+        relevance_summary=summary,
+        source_ids=comparator.source_ids,
+        missing_data_flags=comparator.missing_data_flags,
+        confidence=comparator.confidence,
+    )
+
+
+def _judge_comparator_relevance(
+    target: ClinicalTrialRecord,
+    candidate: ClinicalTrialRecord,
+) -> ComparatorTrialRelevance:
+    matched: list[str] = []
+    mismatched: list[str] = []
+    target_conditions = {item.casefold() for item in target.conditions}
+    candidate_conditions = {item.casefold() for item in candidate.conditions}
+    if target_conditions & candidate_conditions:
+        matched.append("indication")
+    else:
+        mismatched.append("indication")
+    if set(target.phases) & set(candidate.phases):
+        matched.append("phase")
+    else:
+        mismatched.append("phase")
+    target_endpoint = _endpoint_family_text(target)
+    candidate_endpoint = _endpoint_family_text(candidate)
+    if target_endpoint and candidate_endpoint and target_endpoint == candidate_endpoint:
+        matched.append("endpoint_family")
+    elif candidate_endpoint:
+        mismatched.append("endpoint_family")
+    target_types = {(item.type or "").casefold() for item in target.interventions if item.type}
+    candidate_types = {(item.type or "").casefold() for item in candidate.interventions if item.type}
+    if target_types and candidate_types and target_types & candidate_types:
+        matched.append("modality_or_intervention_type")
+    elif candidate_types:
+        mismatched.append("modality_or_intervention_type")
+
+    if "indication" in matched and "phase" in matched and "endpoint_family" in matched:
+        relevance = "relevant"
+    elif "indication" in matched or ("phase" in matched and "endpoint_family" in matched):
+        relevance = "weak"
+    else:
+        relevance = "excluded"
+    rationale = f"{candidate.nct_id} comparator relevance is {relevance} based on matched dimensions: {', '.join(matched) or 'none'}."
+    return ComparatorTrialRelevance(
+        nct_id=candidate.nct_id,
+        relevance=relevance,
+        rationale=rationale,
+        matched_dimensions=tuple(matched),
+        mismatched_dimensions=tuple(mismatched),
+        source_ids=(candidate.source_id,),
+        confidence=0.7 if relevance == "relevant" else 0.55 if relevance == "weak" else 0.5,
+    )
+
+
+def _endpoint_family_text(trial: ClinicalTrialRecord) -> str | None:
+    text = " ".join(endpoint.measure for endpoint in trial.primary_endpoints).casefold()
+    if not text:
+        return None
+    if any(term in text for term in ("overall survival", "mortality", "death", "os")):
+        return "survival"
+    if any(term in text for term in ("progression-free survival", "pfs", "time to progression")):
+        return "time_to_event"
+    if any(term in text for term in ("response rate", "orr", "complete response", "partial response")):
+        return "response"
+    if any(term in text for term in ("biomarker", "pharmacodynamic", "immune response")):
+        return "biomarker"
+    return "other"
+
+
+def _apply_comparator_relevance(
+    comparator: ComparatorBenchmarkBundle,
+    relevance: ComparatorRelevanceOutput,
+) -> ComparatorBenchmarkBundle:
+    relevant_or_weak = tuple(item.nct_id for item in relevance.trial_relevance if item.relevance in {"relevant", "weak"})
+    return comparator.model_copy(
+        update={
+            "comparator_trial_ids": relevant_or_weak[:5] or comparator.comparator_trial_ids,
+            "benchmark_summary": f"{comparator.benchmark_summary} {relevance.relevance_summary}",
+            "source_ids": tuple(dict.fromkeys((*comparator.source_ids, *relevance.source_ids))),
+            "missing_data_flags": _dedupe_missing_flags((*comparator.missing_data_flags, *relevance.missing_data_flags)),
+            "confidence": min(0.85, max(comparator.confidence, relevance.confidence)),
+        }
+    )
+
+
+def _ensure_component_sources(component: BaseModel, fallback_source_ids: tuple[str, ...]) -> Any:
+    source_ids = getattr(component, "source_ids", ())
+    if source_ids or not fallback_source_ids:
+        return component
+    return component.model_copy(update={"source_ids": fallback_source_ids})
+
+
+def _shared_instructions() -> str:
+    return (
+        "Use only supplied structured evidence and source_ids. Store concise rationale summaries only. "
+        "Missing evidence must become missing_data_flags, confidence reductions, or review questions. "
+        "Do not invent efficacy results, safety rates, approval probability, PoS, enrollment rates, site performance, "
+        "competitor outcomes, or final clinical/investment/licensing/go-no-go decisions."
+    )
+
+
+def _manager_instructions() -> str:
+    return (
+        "You are ClinicalOutcomeManagerAgent. Coordinate Agent 3 subagents after deterministic retrieval is complete. "
+        "Return only a ClinicalOutcomeManagerPlan. " + _shared_instructions()
+    )
+
+
+def _asset_identity_instructions() -> str:
+    return (
+        "You are AssetIdentityAdjudicatorAgent. Review CT.gov interventions, aliases, RxNorm output, sponsor, modality, "
+        "and indication only when identity is ambiguous. Flag ambiguity instead of forcing certainty. "
+        "Return AssetIdentityAdjudication. " + _shared_instructions()
+    )
+
+
+def _endpoint_instructions() -> str:
+    return (
+        "You are EndpointRiskAgent. Interpret endpoint family, surrogate versus clinical nature, hierarchy ambiguity, "
+        "phase appropriateness, and credibility risks. Return EndpointRiskAssessment. Do not infer efficacy or success. "
+        + _shared_instructions()
+    )
+
+
+def _comparator_instructions() -> str:
+    return (
+        "You are ComparatorRelevanceAgent. Classify deterministically retrieved CT.gov comparator candidates as relevant, "
+        "weak, or excluded by indication, phase, modality/MOA, endpoint family, comparator/control, population, and design. "
+        "Do not invent competitor outcomes. Return ComparatorRelevanceOutput. " + _shared_instructions()
+    )
+
+
+def _enrollment_instructions() -> str:
+    return (
+        "You are EnrollmentFeasibilityAgent. Interpret enrollment count, deterministic planned duration, sites/countries, "
+        "eligibility, biomarker or prior-treatment restrictions, and operational burden. Return EnrollmentDurationRisk. "
+        "Do not invent enrollment rates or site performance. " + _shared_instructions()
+    )
+
+
+def _safety_instructions() -> str:
+    return (
+        "You are SafetyContextAgent. Interpret openFDA label context and registry safety exclusions. Separate known "
+        "label-derived risks from missing context. Return SafetyContext. Do not invent adverse-event rates. "
+        + _shared_instructions()
+    )
+
+
+def _failure_mode_instructions() -> str:
+    return (
+        "You are FailureModeSynthesisAgent. Integrate endpoint, enrollment, comparator, safety, biology, operational, "
+        "asset-identity ambiguity, missing-data, and PoS availability into FailureModeClassification categories. "
+        "This is risk pattern synthesis, not an outcome prediction. " + _shared_instructions()
     )
 
 
@@ -264,7 +928,7 @@ def _comparator_benchmarks(
     client: ClinicalTrialsGovClient,
     trial: ClinicalTrialRecord,
     run_id: str,
-) -> tuple[ComparatorBenchmarkBundle, tuple[SourceMetadata, ...]]:
+) -> tuple[ComparatorBenchmarkBundle, tuple[SourceMetadata, ...], tuple[ClinicalTrialRecord, ...]]:
     condition = trial.conditions[0] if trial.conditions else None
     phase = trial.phases[0] if trial.phases else None
     search_source = SourceMetadata(
@@ -284,6 +948,7 @@ def _comparator_benchmarks(
                 confidence=0.2,
             ),
             (search_source,),
+            (),
         )
     try:
         landscape = search_trial_landscape(
@@ -303,6 +968,7 @@ def _comparator_benchmarks(
                 confidence=0.2,
             ),
             (search_source,),
+            (),
         )
     comparators = tuple(record for record in landscape.trials if record.nct_id != trial.nct_id)
     comparator_ids = tuple(record.nct_id for record in comparators[:5])
@@ -327,6 +993,7 @@ def _comparator_benchmarks(
             confidence=0.65 if comparators else 0.4,
         ),
         sources,
+        comparators,
     )
 
 

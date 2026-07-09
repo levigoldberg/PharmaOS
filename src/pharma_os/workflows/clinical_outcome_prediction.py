@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 from typing import Callable
 from uuid import uuid4
 
-from pharma_os.agents.clinical_outcome_prediction import run_clinical_outcome_prediction_agent
+from pydantic import BaseModel
+
+from pharma_os.agents.clinical_outcome_prediction import (
+    ClinicalOutcomePredictionAgentResult,
+    run_clinical_outcome_prediction_agent_result,
+)
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -14,19 +19,21 @@ from pharma_os.schemas import (
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
     HumanGate,
+    SourceMetadata,
     WorkflowRun,
 )
 from pharma_os.validators import (
     aggregate_validation_status,
     assign_human_gate,
     generate_confidence_flags,
+    validate_clinical_outcome_constraints,
     validate_numeric_provenance,
     validate_schema,
     validate_source_coverage,
 )
 
 
-AgentRunner = Callable[[ClinicalOutcomePredictionInput, str], ClinicalOutcomePredictionOutput]
+AgentRunner = Callable[[ClinicalOutcomePredictionInput, str], ClinicalOutcomePredictionOutput | ClinicalOutcomePredictionAgentResult]
 
 
 def run_clinical_outcome_prediction_workflow(
@@ -50,7 +57,15 @@ def run_clinical_outcome_prediction_workflow(
     store.save_run(run, input_payload=input_data)
 
     runner = agent_runner or _default_agent_runner
-    output = runner(input_data, run_id).model_copy(update={"run_id": run_id})
+    runner_result = runner(input_data, run_id)
+    if isinstance(runner_result, ClinicalOutcomePredictionAgentResult):
+        output = runner_result.output.model_copy(update={"run_id": run_id})
+        subagent_payloads = runner_result.subagent_payloads
+        agent_traces = runner_result.traces
+    else:
+        output = runner_result.model_copy(update={"run_id": run_id})
+        subagent_payloads = ()
+        agent_traces = ()
 
     validation_results = (
         validate_schema(
@@ -69,6 +84,10 @@ def run_clinical_outcome_prediction_workflow(
             target_id=output.output_id,
             claims=output.claims,
             run_id=run_id,
+        ),
+        *validate_clinical_outcome_constraints(
+            run_id=run_id,
+            output=output,
         ),
     )
     output_text = "\n".join([*(claim.claim_text for claim in output.claims), *(flag.reason for flag in output.missing_data_flags)])
@@ -107,9 +126,9 @@ def run_clinical_outcome_prediction_workflow(
 
     agent_output = AgentOutput(
         output_id=f"agent-output-{run_id}",
-        agent_name="clinical_outcome_prediction_agent",
+        agent_name="clinical_outcome_prediction_agent3_workflow",
         run_id=run_id,
-        provenance="PharmaOS deterministic clinical_outcome_prediction workflow",
+        provenance="PharmaOS Agent 3 clinical_outcome_prediction workflow with SDK-backed clinical reasoning and deterministic retrieval/math",
         claims=output.claims,
         sources=output.sources,
         confidence=output.confidence,
@@ -118,6 +137,17 @@ def run_clinical_outcome_prediction_workflow(
     )
     store.save_sources(run_id, output.sources)
     store.save_claims(run_id, output.claims)
+    for payload in subagent_payloads:
+        store.save_agent_output(
+            _subagent_output_envelope(
+                run_id=run_id,
+                payload=payload,
+                sources=output.sources,
+                validation_status=validation_status,
+            ),
+            payload=payload,
+        )
+    store.save_agent_traces(agent_traces)
     store.save_agent_output(agent_output, payload=output)
     store.save_validation_results(run_id, validation_results)
     store.save_confidence_flags(run_id, confidence_flags)
@@ -132,10 +162,50 @@ def run_clinical_outcome_prediction_workflow(
             "gate_reason": gate.gate_reason if gate else None,
         }
     )
-    store.save_run(completed_run, input_payload=input_data, output_payload=output)
+    store.save_run(
+        completed_run,
+        input_payload=input_data,
+        output_payload=output,
+        trace_metadata={
+            "manager_agent": "ClinicalOutcomeManagerAgent",
+            "subagent_trace_count": len(agent_traces),
+            "subagent_output_count": len(subagent_payloads),
+        },
+    )
     build_report(run_id, memory=store)
     return output
 
 
-def _default_agent_runner(input_data: ClinicalOutcomePredictionInput, run_id: str) -> ClinicalOutcomePredictionOutput:
-    return run_clinical_outcome_prediction_agent(input_data, run_id=run_id)
+def _default_agent_runner(input_data: ClinicalOutcomePredictionInput, run_id: str) -> ClinicalOutcomePredictionAgentResult:
+    return run_clinical_outcome_prediction_agent_result(input_data, run_id=run_id)
+
+
+def _subagent_output_envelope(
+    *,
+    run_id: str,
+    payload: BaseModel,
+    sources: tuple[SourceMetadata, ...],
+    validation_status: str,
+) -> AgentOutput:
+    known_sources = {source.source_id: source for source in sources}
+    payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
+    agent_name = {
+        "ClinicalOutcomeManagerPlan": "ClinicalOutcomeManagerAgent",
+        "AssetIdentityAdjudication": "AssetIdentityAdjudicatorAgent",
+        "EndpointRiskAssessment": "EndpointRiskAgent",
+        "ComparatorRelevanceOutput": "ComparatorRelevanceAgent",
+        "EnrollmentDurationRisk": "EnrollmentFeasibilityAgent",
+        "SafetyContext": "SafetyContextAgent",
+        "FailureModeClassification": "FailureModeSynthesisAgent",
+    }.get(payload.__class__.__name__, payload.__class__.__name__)
+    output_id = getattr(payload, "output_id", None) or f"{agent_name}-{payload.__class__.__name__}"
+    return AgentOutput(
+        output_id=f"agent-output-{run_id}-{output_id}",
+        agent_name=agent_name,
+        run_id=run_id,
+        provenance="PharmaOS Agent 3 subagent typed output",
+        claims=(),
+        sources=tuple(known_sources[source_id] for source_id in payload_source_ids),
+        confidence=float(getattr(payload, "confidence", 0.5) or 0.5),
+        validation_status=validation_status,  # type: ignore[arg-type]
+    )
