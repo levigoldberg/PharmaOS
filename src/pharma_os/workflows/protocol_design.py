@@ -23,6 +23,7 @@ from pharma_os.schemas import (
     DueDiligenceInput,
     DueDiligenceOutput,
     HumanGate,
+    NextStudyIntent,
     ProtocolDesignInput,
     ProtocolDesignOutput,
     SourceMetadata,
@@ -174,6 +175,7 @@ def run_protocol_design_workflow(
         target_trial=target_trial,
         agent3_handoff=agent3_handoff,
         agent4_handoff=agent4_handoff,
+        next_study_intent=manager_result.next_study_intent,
         analog_candidates=analog_candidates,
         analog_benchmark_bundle=benchmark_bundle,
         protocol_design_brief=brief,
@@ -285,6 +287,7 @@ def run_protocol_design_workflow(
             agent3_handoff=agent3_handoff,
             agent4_output=agent4_output,
             agent4_handoff=agent4_handoff,
+            next_study_intent=manager_result.next_study_intent,
             assumptions=assumptions,
             missing_data_flags=upstream_missing_flags,
             source_ids=initial_source_ids,
@@ -435,6 +438,7 @@ def _expanded_protocol_design_input(
     agent3_handoff: Agent3HandoffReference,
     agent4_output: DueDiligenceOutput,
     agent4_handoff: Agent4HandoffReference,
+    next_study_intent: NextStudyIntent,
     assumptions: tuple[object, ...],
     missing_data_flags: tuple[object, ...],
     source_ids: tuple[str, ...],
@@ -447,6 +451,7 @@ def _expanded_protocol_design_input(
             "agent3_output": _compact_agent3_input(agent3_output),
             "agent4_handoff": agent4_handoff.model_dump(mode="json"),
             "agent4_output": _compact_agent4_input(agent4_output),
+            "next_study_intent": next_study_intent.model_dump(mode="json"),
             "assumptions": [
                 assumption.model_dump(mode="json") if hasattr(assumption, "model_dump") else str(assumption)
                 for assumption in assumptions
@@ -569,6 +574,7 @@ def _subagent_output_envelope(
     known_sources = {source.source_id: source for source in sources}
     payload_source_ids = tuple(source_id for source_id in getattr(payload, "source_ids", ()) if source_id in known_sources)
     agent_name = getattr(payload, "agent_name", None) or {
+        "NextStudyIntent": "DevelopmentStrategyAgent",
         "ProtocolDesignManagerPlan": "ProtocolDesignManagerAgent",
         "AnalogSearchPlanOutput": "AnalogSearchPlannerAgent",
         "AnalogTrialSelectionOutput": "AnalogSelectionAgent",

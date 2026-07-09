@@ -118,7 +118,8 @@ def _headline(module_name: ModuleName, values: dict[str, Any], validation_status
         return f"Agent 4 diligence summary for {nct_id}: {red_flags} red flags; validation {validation_status}."
     if module_name == "protocol_design":
         analogs = len(_nested(values, "analog_benchmark_bundle", "selected_analog_ids") or ())
-        return f"Agent 5 protocol design summary for {nct_id}: {analogs} selected analogs; validation {validation_status}."
+        proposed = _nested(values, "next_study_intent", "proposed_next_stage") or _nested(values, "protocol_design_brief", "next_study_intent", "proposed_next_stage") or "proposed next study"
+        return f"Agent 5 protocol design summary for {nct_id}: {proposed}; {analogs} selected analogs; validation {validation_status}."
     trials = len(values.get("trials") or ())
     return f"Trial intelligence summary for {nct_id}: {trials} trials; validation {validation_status}."
 
@@ -136,7 +137,9 @@ def _plain_summary(module_name: ModuleName, values: dict[str, Any], validation_s
         return f"Agent 4 combines clinical, safety, IP, pricing, commercial, and rNPV diligence. {memo} Validation status is {validation_status}.{suffix}"
     if module_name == "protocol_design":
         title = _nested(values, "protocol_design_brief", "title") or "draft protocol design brief"
-        return f"Agent 5 produced {title} from Agent 3/4 handoffs and analog benchmarking. Validation status is {validation_status}.{suffix}"
+        objective = _nested(values, "next_study_intent", "development_objective") or _nested(values, "protocol_design_brief", "next_study_intent", "development_objective")
+        objective_sentence = f" Development objective: {objective}." if objective else ""
+        return f"Agent 5 produced {title} from Agent 3/4 handoffs and analog benchmarking.{objective_sentence} Validation status is {validation_status}.{suffix}"
     return f"Trial intelligence generated a source-backed landscape summary. Validation status is {validation_status}.{suffix}"
 
 
@@ -205,7 +208,9 @@ def _findings(
             _finding("Asset memo", _nested(values, "asset_memo", "summary") or "Asset memo summary unavailable.", source_ids, confidence),
         ]
     if module_name == "protocol_design":
+        intent_detail = _next_study_intent_summary(values)
         return [
+            _finding("Next study intent", intent_detail, source_ids, confidence),
             _finding("Analog benchmark", _analog_summary(values), source_ids, confidence),
             _finding("Executive synopsis", _nested(values, "protocol_design_brief", "executive_synopsis", "body") or "Executive synopsis unavailable.", source_ids, confidence),
             _finding("Endpoint strategy", _nested(values, "protocol_design_brief", "endpoint_strategy", "body") or "Endpoint strategy unavailable.", source_ids, confidence),
@@ -226,6 +231,22 @@ def _analog_summary(values: dict[str, Any]) -> str:
     selected = ", ".join(bundle.get("selected_analog_ids") or ()) or "none selected"
     limitations = "; ".join(bundle.get("limitations") or ())
     return f"Selected analogs: {selected}. {limitations}".strip()
+
+
+def _next_study_intent_summary(values: dict[str, Any]) -> str:
+    intent = values.get("next_study_intent") or _nested(values, "protocol_design_brief", "next_study_intent") or {}
+    if not isinstance(intent, dict):
+        return "Next-study intent unavailable."
+    parts = [
+        f"Proposed next study: {intent.get('proposed_next_stage') or 'unknown'}",
+        f"role: {intent.get('study_role') or 'unknown'}",
+        f"objective: {intent.get('development_objective') or 'unknown'}",
+        f"key question: {intent.get('key_clinical_question') or 'unknown'}",
+    ]
+    alternatives = "; ".join(intent.get("alternatives_considered") or ())
+    if alternatives:
+        parts.append(f"alternatives considered: {alternatives}")
+    return ". ".join(parts) + "."
 
 
 def _nct_id(values: dict[str, Any]) -> str:

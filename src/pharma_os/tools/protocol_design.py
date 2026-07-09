@@ -19,6 +19,7 @@ from pharma_os.schemas import (
     DueDiligenceOutput,
     EvidenceClaim,
     MissingDataFlag,
+    NextStudyIntent,
     ProtocolDesignBrief,
     ProtocolReviewerCritique,
     ProtocolSectionDraft,
@@ -208,6 +209,7 @@ def build_protocol_design_brief(
     *,
     run_id: str,
     target_trial: ClinicalTrialRecord,
+    next_study_intent: NextStudyIntent,
     strategy_sections: dict[str, ProtocolSectionDraft],
     eligibility_sections: dict[str, ProtocolSectionDraft],
     reviewer_critique: ProtocolReviewerCritique,
@@ -224,6 +226,8 @@ def build_protocol_design_brief(
             (
                 *reviewer_critique.statistical_questions,
                 *reviewer_critique.regulatory_questions,
+                f"Is the proposed next study ({next_study_intent.proposed_next_stage}; {next_study_intent.study_role}) the right next development step?",
+                f"What evidence is still needed to resolve the key clinical question: {next_study_intent.key_clinical_question}",
                 "Which analog trials should be accepted or rejected by the clinical team?",
                 "Which missing CT.gov, PubMed, or label fields must be resolved before protocol drafting?",
             )
@@ -231,7 +235,8 @@ def build_protocol_design_brief(
     )
     return ProtocolDesignBrief(
         brief_id=f"protocol-design-brief-{run_id}",
-        title=f"Draft Protocol Design Brief for {target_trial.nct_id}",
+        title=f"Draft {next_study_intent.proposed_next_stage} Protocol Design Brief for {target_trial.nct_id}",
+        next_study_intent=next_study_intent,
         executive_synopsis=strategy_sections["executive_synopsis"],
         strategic_rationale=strategy_sections["strategic_rationale"],
         analog_trial_benchmark_summary=strategy_sections["analog_trial_benchmark_summary"],

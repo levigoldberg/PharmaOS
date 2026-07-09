@@ -29,6 +29,7 @@ from pharma_os.schemas import (
     DueDiligenceOutput,
     ExcludedAnalogTrial,
     MissingDataFlag,
+    NextStudyIntent,
     ProtocolDesignBrief,
     ProtocolDesignManagerPlan,
     ProtocolReviewerCritique,
@@ -56,6 +57,7 @@ class ProtocolDesignManagerResult:
     """All Agent 5 manager/subagent pieces needed by the workflow."""
 
     manager_plan: ProtocolDesignManagerPlan
+    next_study_intent: NextStudyIntent
     search_plan: AnalogSearchPlanOutput
     analog_candidates: tuple[AnalogCandidateRecord, ...]
     analog_sources: tuple[object, ...]
@@ -118,18 +120,42 @@ def run_protocol_design_manager_agent(
     traces.append(manager_plan.trace)
     payloads.append(manager_plan.output)
 
+    next_study_intent = _run_typed_agent(
+        agent_name="DevelopmentStrategyAgent",
+        instructions=_development_strategy_instructions(),
+        output_type=NextStudyIntent,
+        run_id=run_id,
+        input_summary=f"Define logical next study intent for {target_trial.nct_id}.",
+        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+        fallback_output=build_next_study_intent(
+            run_id=run_id,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent4_output=agent4_output,
+            source_ids=source_ids,
+            missing_data_flags=missing_data_flags,
+        ),
+        source_ids=source_ids,
+        confidence=0.7,
+        config=runtime_config,
+        rationale_summary="Determine the logical next clinical study before analog search or protocol drafting.",
+    )
+    traces.append(next_study_intent.trace)
+    payloads.append(next_study_intent.output)
+
     search_plan = _run_typed_agent(
         agent_name="AnalogSearchPlannerAgent",
         instructions=_search_planner_instructions(),
         output_type=AnalogSearchPlanOutput,
         run_id=run_id,
         input_summary=f"Plan CT.gov analog searches for {target_trial.nct_id}.",
-        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
         fallback_output=build_search_strategy(
             run_id=run_id,
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
+            next_study_intent=next_study_intent.output,
         ),
         source_ids=source_ids,
         confidence=0.7,
@@ -147,7 +173,7 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Select relevant analogs for {target_trial.nct_id} from {len(analog_candidates)} candidates.",
         payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
             "search_plan": search_plan.output.model_dump(mode="json"),
             "analog_candidates": [_compact_analog_candidate(candidate) for candidate in analog_candidates],
             "top_k": top_k,
@@ -158,6 +184,7 @@ def run_protocol_design_manager_agent(
             candidates=analog_candidates,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
+            next_study_intent=next_study_intent.output,
             search_plan=search_plan.output,
             top_k=top_k,
         ),
@@ -178,10 +205,10 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Interpret deterministic benchmark bundle {benchmark_bundle.bundle_id}.",
         payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
             "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
         },
-        fallback_output=_fallback_benchmark_interpretation(run_id, target_trial, benchmark_bundle),
+        fallback_output=_fallback_benchmark_interpretation(run_id, target_trial, next_study_intent.output, benchmark_bundle),
         source_ids=benchmark_bundle.source_ids,
         confidence=benchmark_bundle.confidence,
         config=runtime_config,
@@ -199,6 +226,7 @@ def run_protocol_design_manager_agent(
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
+            next_study_intent=next_study_intent.output,
             benchmark_bundle=benchmark_bundle,
             benchmark_interpretation=benchmark_interpretation.output,
             source_ids=source_ids,
@@ -209,6 +237,7 @@ def run_protocol_design_manager_agent(
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
+            next_study_intent=next_study_intent.output,
             benchmark_bundle=benchmark_bundle,
             benchmark_interpretation=benchmark_interpretation.output,
             source_ids=source_ids,
@@ -227,6 +256,7 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Red-team Agent 5 draft sections for {target_trial.nct_id}.",
         payload={
+            "next_study_intent": next_study_intent.output.model_dump(mode="json"),
             "sections": [section.model_dump(mode="json") for output in section_payloads for section in output.sections],
             "benchmark_interpretation": benchmark_interpretation.output.model_dump(mode="json"),
             "agent3_risks": agent3_output.failure_mode_classification.model_dump(mode="json"),
@@ -239,6 +269,7 @@ def run_protocol_design_manager_agent(
             analog_limitations=benchmark_bundle.limitations,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
+            next_study_intent=next_study_intent.output,
         ),
         source_ids=source_ids,
         confidence=0.6,
@@ -251,6 +282,7 @@ def run_protocol_design_manager_agent(
     fallback_brief = build_protocol_design_brief(
         run_id=run_id,
         target_trial=target_trial,
+        next_study_intent=next_study_intent.output,
         strategy_sections=draft_sections["strategy_sections"],
         eligibility_sections=draft_sections["eligibility_sections"],
         reviewer_critique=reviewer_critique.output,
@@ -267,6 +299,7 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Assemble draft ProtocolDesignBrief for {target_trial.nct_id}.",
         payload={
+            "next_study_intent": next_study_intent.output.model_dump(mode="json"),
             "sections": [section.model_dump(mode="json") for output in section_payloads for section in output.sections],
             "reviewer_critique": reviewer_critique.output.model_dump(mode="json"),
             "benchmark_interpretation": benchmark_interpretation.output.model_dump(mode="json"),
@@ -284,6 +317,7 @@ def run_protocol_design_manager_agent(
 
     return ProtocolDesignManagerResult(
         manager_plan=manager_plan.output,
+        next_study_intent=next_study_intent.output,
         search_plan=search_plan.output,
         analog_candidates=analog_candidates,
         analog_sources=analog_sources,
@@ -367,6 +401,7 @@ def _run_section_agent(
     target_trial: ClinicalTrialRecord,
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
+    next_study_intent: NextStudyIntent,
     benchmark_bundle: AnalogBenchmarkBundle,
     benchmark_interpretation: BenchmarkInterpretation,
     source_ids: tuple[str, ...],
@@ -377,9 +412,9 @@ def _run_section_agent(
         instructions=instructions,
         output_type=ProtocolSectionAgentOutput,
         run_id=run_id,
-        input_summary=f"Draft source-grounded strategy sections for {target_trial.nct_id}.",
+        input_summary=f"Draft source-grounded next-study strategy sections for {target_trial.nct_id}.",
         payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent),
             "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
             "benchmark_interpretation": benchmark_interpretation.model_dump(mode="json"),
         },
@@ -396,8 +431,9 @@ def _base_payload(
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
     source_ids: tuple[str, ...],
+    next_study_intent: NextStudyIntent | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "target_trial": _compact_trial_record(target_trial),
         "agent3_context": {
             "output_id": agent3_output.output_id,
@@ -433,6 +469,9 @@ def _base_payload(
             "power, effect size, efficacy, safety, patient, site, or enrollment facts."
         ),
     }
+    if next_study_intent is not None:
+        payload["next_study_intent"] = next_study_intent.model_dump(mode="json")
+    return payload
 
 
 def _fallback_manager_plan(
@@ -567,6 +606,7 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 def _fallback_benchmark_interpretation(
     run_id: str,
     target_trial: ClinicalTrialRecord,
+    next_study_intent: NextStudyIntent,
     benchmark_bundle: AnalogBenchmarkBundle,
 ) -> BenchmarkInterpretation:
     common_patterns = []
@@ -581,11 +621,12 @@ def _fallback_benchmark_interpretation(
         output_id=f"benchmark-interpretation-{run_id}",
         target_nct_id=target_trial.nct_id,
         common_design_patterns=tuple(common_patterns) or ("No dominant analog design pattern was confidently identified.",),
-        target_alignment=("Target-trial alignment should be reviewed against selected analog endpoint, comparator, and population patterns.",),
-        target_misalignment=("No source-backed target misalignment should be treated as final without human review.",),
-        strategy_implications=("Use benchmark patterns as protocol-team review inputs, not as final design recommendations.",),
+        target_alignment=(f"Analog alignment should be reviewed against the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}, not only the anchor trial phase.",),
+        target_misalignment=("No source-backed next-study misalignment should be treated as final without human review.",),
+        strategy_implications=(f"Use benchmark patterns as review inputs for the proposed next study objective: {next_study_intent.development_objective}.",),
         weak_or_incomplete_findings=weak,
         human_review_questions=(
+            f"Do selected analogs fit the proposed next study role: {next_study_intent.study_role}?",
             "Which benchmark patterns are strong enough to influence protocol strategy?",
             "Which analog limitations should reduce confidence in protocol design choices?",
         ),
@@ -600,6 +641,7 @@ def _section_agent_specs(
     target_trial: ClinicalTrialRecord,
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
+    next_study_intent: NextStudyIntent,
     benchmark_bundle: AnalogBenchmarkBundle,
     benchmark_interpretation: BenchmarkInterpretation,
     source_ids: tuple[str, ...],
@@ -608,6 +650,7 @@ def _section_agent_specs(
     strategy_sections = build_protocol_strategy_sections(
         run_id=run_id,
         target_trial=target_trial,
+        next_study_intent=next_study_intent,
         source_ids=source_ids,
         benchmark_summary=build_benchmark_summary(benchmark_bundle),
         agent3_output=agent3_output,
@@ -751,11 +794,21 @@ def _manager_instructions() -> str:
     )
 
 
+def _development_strategy_instructions() -> str:
+    return _shared_guardrails() + (
+        " Determine the logical next clinical study for the asset before protocol drafting. Use the target trial as the evidence anchor, "
+        "then incorporate Agent 3 clinical risks and Agent 4 diligence, commercial, IP, safety, and red-flag context. "
+        "Do not blindly increment phase. You may propose Phase I/II/III, another same-phase study, expansion, combination, "
+        "confirmatory, pivotal, dose-ranging, or other justified study role. Clearly state rationale, alternatives considered, "
+        "missing evidence, and human-review needs."
+    )
+
+
 def _search_planner_instructions() -> str:
     return _shared_guardrails() + (
         " Create bounded ClinicalTrials.gov analog search queries only. Do not execute searches or select analogs. "
-        "Cover same indication/phase, adjacent phase when justified, modality or target/MOA when known, endpoint family, "
-        "comparator/control, biomarker-defined population, and line/prior-treatment setting when detectable. "
+        "Use NextStudyIntent as the primary design target. Cover proposed stage, study role, indication, population, regimen, "
+        "modality or target/MOA when known, endpoint family, comparator/control, biomarker-defined population, and line/prior-treatment setting when detectable. "
         "If a dimension is unknown, expose it as unknown rather than guessing."
     )
 
@@ -820,7 +873,105 @@ def _regulatory_critic_instructions() -> str:
 def _brief_writer_instructions() -> str:
     return _shared_guardrails() + (
         " Assemble the final ProtocolDesignBrief from supplied typed sections and critique. Preserve source IDs, human-review framing, "
-        "missing evidence, and review questions. Avoid final protocol language and avoid saying recommended design unless framed as a human-review option."
+        "the proposed next study, development objective, rationale, alternatives considered, missing evidence, and review questions. "
+        "Avoid final protocol language and avoid saying recommended design unless framed as a human-review option."
+    )
+
+
+def build_next_study_intent(
+    *,
+    run_id: str,
+    target_trial: ClinicalTrialRecord,
+    agent3_output: ClinicalOutcomePredictionOutput,
+    agent4_output: DueDiligenceOutput,
+    source_ids: tuple[str, ...],
+    missing_data_flags: tuple[MissingDataFlag, ...],
+) -> NextStudyIntent:
+    """Build a conservative deterministic next-study intent from sourced context."""
+
+    del run_id
+    current_stage = _current_stage(target_trial, agent3_output)
+    normalized_stage = " ".join(_norm_phase_values(tuple(target_trial.phases)) or (current_stage.casefold().replace(" ", ""),))
+    status = (target_trial.overall_status or "").casefold()
+    endpoint_risk = (agent4_output.clinical_risk_summary.endpoint_risk_level or agent3_output.endpoint_risk_assessment.risk_level or "unknown").casefold()
+    enrollment_risk = (agent4_output.clinical_risk_summary.enrollment_duration_risk_level or agent3_output.enrollment_duration_risk.risk_level or "unknown").casefold()
+    results_available = bool(target_trial.results_available)
+    high_uncertainty = bool(missing_data_flags) or endpoint_risk == "high" or enrollment_risk == "high" or not results_available
+
+    if "phase1" in normalized_stage:
+        if endpoint_risk == "high" or enrollment_risk == "high":
+            proposed_stage = "Phase I/II expansion"
+            study_role = "dose-expansion and signal-seeking study"
+            objective = "clarify safety, tolerability, regimen, and early activity before a broader efficacy study"
+        else:
+            proposed_stage = "Phase II signal-seeking study"
+            study_role = "proof-of-concept efficacy and safety study"
+            objective = "test whether the asset has enough clinical signal to justify later confirmatory development"
+    elif "phase2" in normalized_stage:
+        if results_available and endpoint_risk != "high" and enrollment_risk != "high" and not agent4_output.red_flags:
+            proposed_stage = "Phase III pivotal study"
+            study_role = "confirmatory pivotal study"
+            objective = "confirm clinical benefit and safety in a registration-oriented setting"
+        else:
+            proposed_stage = "Phase IIb optimization study"
+            study_role = "dose-ranging, regimen-optimization, or signal-confirmation study"
+            objective = "resolve efficacy, regimen, endpoint, and feasibility uncertainty before a pivotal study"
+    elif "phase3" in normalized_stage:
+        proposed_stage = "Phase III confirmatory or label-supporting study"
+        study_role = "confirmatory, supportive, or label-expansion study"
+        objective = "address remaining confirmatory, population, comparator, or regulatory questions"
+    else:
+        proposed_stage = "human-reviewed next clinical study"
+        study_role = "development-stage clarification study"
+        objective = "resolve missing development-stage evidence before protocol drafting"
+
+    if "withdrawn" in status or "terminated" in status or "suspended" in status:
+        proposed_stage = "same-stage redesign or feasibility-reset study"
+        study_role = "redesign and feasibility-risk resolution study"
+        objective = "address termination, feasibility, or design issues before escalation"
+
+    indication = (
+        agent4_output.asset_identity.normalized_indication
+        or agent3_output.asset_identity.normalized_indication
+        or ", ".join(target_trial.conditions)
+        or "target indication requiring human confirmation"
+    )
+    population = _population_summary(target_trial)
+    regimen = _regimen_context(target_trial)
+    key_question = f"Can {agent4_output.asset_identity.asset_name or agent3_output.asset_identity.asset_name or 'the asset'} support {study_role} in {indication} without unresolved clinical, safety, feasibility, or source-evidence gaps?"
+    alternatives = [
+        "repeat or redesign the current-stage study if safety, endpoint, enrollment, or source-evidence gaps remain unresolved",
+        "advance to a later-stage confirmatory study only if human review finds sufficient efficacy, safety, comparator, and feasibility evidence",
+    ]
+    if proposed_stage.lower().startswith("phase ii"):
+        alternatives.append("consider a Phase III pivotal study only after signal, regimen, endpoint, and feasibility questions are addressed")
+    if proposed_stage.lower().startswith("phase iii"):
+        alternatives.append("consider a Phase IIb optimization study if current evidence is not mature enough for pivotal assumptions")
+    confidence = 0.7
+    if high_uncertainty:
+        confidence = 0.55
+    if not target_trial.phases:
+        confidence = min(confidence, 0.45)
+    return NextStudyIntent(
+        evidence_anchor_nct_id=target_trial.nct_id,
+        current_development_stage=current_stage,
+        proposed_next_stage=proposed_stage,
+        study_role=study_role,
+        development_objective=objective,
+        key_clinical_question=key_question,
+        indication=indication,
+        target_population_context=population,
+        regimen_context=regimen,
+        rationale=(
+            f"Current evidence anchor is {target_trial.nct_id} at {current_stage} with status {target_trial.overall_status or 'unknown'}. "
+            f"Endpoint risk is {endpoint_risk}; enrollment/duration risk is {enrollment_risk}; results_available is {results_available}. "
+            "The proposed next study is therefore framed as a human-reviewed development intent, not an automatic phase increment."
+        ),
+        alternatives_considered=tuple(dict.fromkeys(alternatives)),
+        missing_data_flags=missing_data_flags,
+        source_ids=source_ids,
+        confidence=confidence,
+        requires_human_review=True,
     )
 
 
@@ -831,22 +982,35 @@ def build_search_strategy(
     target_trial: ClinicalTrialRecord,
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
+    next_study_intent: NextStudyIntent | None = None,
 ) -> AnalogSearchPlanOutput:
     """Build a structured CT.gov search plan without calling the API."""
 
-    indication = (
+    if next_study_intent is None:
+        next_study_intent = build_next_study_intent(
+            run_id=run_id,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent4_output=agent4_output,
+            source_ids=tuple(dict.fromkeys((target_trial.source_id, *agent3_output.trial_identity.source_ids, *agent4_output.asset_identity.source_ids))),
+            missing_data_flags=tuple(agent3_output.missing_data_flags) + tuple(agent4_output.missing_data_flags),
+        )
+    indication = next_study_intent.indication or (
         agent4_output.asset_identity.normalized_indication
         or agent3_output.asset_identity.normalized_indication
         or (target_trial.conditions[0] if target_trial.conditions else None)
     )
     if not indication:
         indication = "unknown condition"
-    phase = target_trial.phases[0] if target_trial.phases else agent3_output.historical_pos_estimate.current_phase
+    phase = (
+        _phase_query_from_stage(next_study_intent.proposed_next_stage)
+        or (target_trial.phases[0] if target_trial.phases else agent3_output.historical_pos_estimate.current_phase)
+    )
     asset = agent4_output.asset_identity.asset_name or agent3_output.asset_identity.asset_name
     modality = agent4_output.asset_identity.modality or agent3_output.asset_identity.modality
     endpoint_family = _endpoint_family(target_trial)
     comparator = _comparator_hint(target_trial)
-    biomarker_or_line = _biomarker_or_line(target_trial)
+    biomarker_or_line = _biomarker_or_line(target_trial) or _intent_biomarker_or_line(next_study_intent)
     query_limit = _env_int("PHARMA_OS_CTGV_MAX_RESULTS", 25, minimum=1, maximum=100)
 
     queries = [
@@ -857,9 +1021,10 @@ def build_search_strategy(
             endpoint_family=endpoint_family,
             comparator=comparator,
             biomarker_or_line=biomarker_or_line,
+            term=next_study_intent.study_role,
             limit=query_limit,
-            expected_analog_dimension="same indication and phase",
-            rationale="Primary analog search anchored to target indication and phase from CT.gov and upstream handoffs.",
+            expected_analog_dimension="same indication and proposed next-study stage",
+            rationale="Primary analog search anchored to NextStudyIntent indication, proposed stage, and study role.",
         )
     ]
     if modality and modality != "unknown":
@@ -870,9 +1035,10 @@ def build_search_strategy(
                 phase=phase,
                 target_or_moa=modality,
                 endpoint_family=endpoint_family,
+                term=next_study_intent.development_objective,
                 limit=query_limit,
-                expected_analog_dimension="same indication, phase, and modality",
-                rationale="Secondary analog search adds modality when upstream asset identity provides one.",
+                expected_analog_dimension="same indication, proposed stage, and modality or MOA",
+                rationale="Secondary analog search adds modality/MOA to the NextStudyIntent target.",
             )
         )
     if asset:
@@ -883,21 +1049,25 @@ def build_search_strategy(
                 intervention=asset,
                 phase=phase,
                 endpoint_family=endpoint_family,
+                term=next_study_intent.regimen_context,
                 limit=query_limit,
                 expected_analog_dimension="same asset or close asset-family context",
-                rationale="Asset-name search captures same-product studies when public registry records exist.",
+                rationale="Asset-name search captures same-product or regimen-context studies when public registry records exist.",
             )
         )
     return AnalogSearchPlanOutput(
         output_id=f"analog-search-plan-{run_id}",
         target_nct_id=target_trial.nct_id,
         queries=tuple(queries),
-        rationale="Search plan is bounded to CT.gov and prioritizes analog dimensions detectable from Agent 3, Agent 4, and the target trial registry record.",
+        rationale="Search plan is bounded to CT.gov and prioritizes the proposed next study intent rather than the current target trial phase alone.",
         expected_dimensions=tuple(
             item
             for item in (
                 "indication",
-                "phase",
+                "proposed_next_stage",
+                "study_role",
+                "population_context",
+                "regimen_context",
                 "modality" if modality else None,
                 "endpoint_family" if endpoint_family else None,
                 "comparator" if comparator else None,
@@ -912,6 +1082,7 @@ def build_search_strategy(
                     *agent3_output.trial_identity.source_ids,
                     *agent3_output.asset_identity.source_ids,
                     *agent4_output.asset_identity.source_ids,
+                    *next_study_intent.source_ids,
                 )
             )
         ),
@@ -927,12 +1098,22 @@ def select_analog_trials(
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
     search_plan: AnalogSearchPlanOutput,
+    next_study_intent: NextStudyIntent | None = None,
     top_k: int = 10,
 ) -> AnalogTrialSelectionOutput:
     """Select analogs from normalized candidates without API calls."""
 
+    if next_study_intent is None:
+        next_study_intent = build_next_study_intent(
+            run_id=run_id,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent4_output=agent4_output,
+            source_ids=search_plan.source_ids,
+            missing_data_flags=tuple(agent3_output.missing_data_flags) + tuple(agent4_output.missing_data_flags),
+        )
     del agent3_output, agent4_output, search_plan
-    scored = [_score_candidate(target_trial, candidate) for candidate in candidates if candidate.trial.nct_id != target_trial.nct_id]
+    scored = [_score_candidate(target_trial, next_study_intent, candidate) for candidate in candidates if candidate.trial.nct_id != target_trial.nct_id]
     scored.sort(key=lambda item: (-item[0].match_score, item[0].nct_id))
     selected = tuple(item[0] for item in scored[:top_k])
     selected_ids = {item.nct_id for item in selected}
@@ -976,6 +1157,7 @@ def build_protocol_strategy_sections(
     *,
     run_id: str,
     target_trial: ClinicalTrialRecord,
+    next_study_intent: NextStudyIntent,
     source_ids: tuple[str, ...],
     benchmark_summary: str,
     agent3_output: ClinicalOutcomePredictionOutput,
@@ -985,7 +1167,7 @@ def build_protocol_strategy_sections(
 
     asset = agent4_output.asset_identity.asset_name or agent3_output.asset_identity.asset_name or "the investigational asset"
     indication = agent4_output.asset_identity.normalized_indication or ", ".join(target_trial.conditions) or "the target indication"
-    phase = ", ".join(target_trial.phases) or "the target phase"
+    proposed_stage = next_study_intent.proposed_next_stage
     endpoint = _endpoint_family(target_trial) or "endpoint family not clearly classified"
     risk = agent4_output.clinical_risk_summary.endpoint_risk_level or "unknown"
     population = _population_summary(target_trial)
@@ -993,14 +1175,22 @@ def build_protocol_strategy_sections(
         "executive_synopsis": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-executive-synopsis",
             title="Executive Synopsis",
-            body=f"Draft strategy brief for {asset} in {indication}. The target registry record is {target_trial.nct_id}, {phase}, and this artifact requires human review before protocol use.",
+            body=(
+                f"Draft next-study strategy brief for {asset} in {indication}. The evidence anchor is {target_trial.nct_id}; "
+                f"the proposed next study is {proposed_stage} with role '{next_study_intent.study_role}'. "
+                f"Development objective: {next_study_intent.development_objective}. This artifact requires human review before protocol use."
+            ),
             source_ids=source_ids,
             confidence=0.7,
         ),
         "strategic_rationale": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-strategic-rationale",
             title="Strategic Rationale",
-            body=f"Rationale is grounded in Agent 3 clinical-risk context, Agent 4 diligence findings, and public analog trial benchmarks. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags.",
+            body=(
+                f"Next-study rationale: {next_study_intent.rationale} Agent 3 clinical-risk context, Agent 4 diligence findings, "
+                f"and public analog trial benchmarks inform the draft. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags. "
+                f"Alternatives considered: {'; '.join(next_study_intent.alternatives_considered) or 'none recorded'}."
+            ),
             source_ids=source_ids,
             confidence=0.65,
         ),
@@ -1014,14 +1204,20 @@ def build_protocol_strategy_sections(
         "target_population": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-target-population",
             title="Target Population",
-            body=f"Draft target population follows the public target trial record: {population}. Human review should confirm biomarker, line-of-therapy, organ function, and safety exclusions.",
+            body=(
+                f"Draft target population for the proposed next study: {next_study_intent.target_population_context}. "
+                f"The anchor trial population context is {population}. Human review should confirm biomarker, line-of-therapy, organ function, and safety exclusions."
+            ),
             source_ids=(target_trial.source_id,),
             confidence=0.65,
         ),
         "study_design": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-study-design",
             title="Study Design",
-            body="Draft design should be benchmarked against selected analog trials for randomization, blinding, arm count, duration, and enrollment burden; no final protocol design decision is made by Agent 5.",
+            body=(
+                f"Draft design should be benchmarked for the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}. "
+                "Selected analogs should inform randomization, blinding, arm count, duration, and enrollment burden; no final protocol design decision is made by Agent 5."
+            ),
             source_ids=source_ids,
             confidence=0.6,
         ),
@@ -1109,6 +1305,7 @@ def review_protocol_design(
     analog_limitations: tuple[str, ...],
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
+    next_study_intent: NextStudyIntent,
 ) -> ProtocolReviewerCritique:
     """Review only; do not approve or add unsupported facts."""
 
@@ -1123,10 +1320,12 @@ def review_protocol_design(
         critique_id=f"protocol-reviewer-critique-{run_id}",
         missing_elements=tuple(missing),
         statistical_questions=(
+            f"What estimand and analysis population should govern the proposed {next_study_intent.proposed_next_stage}?",
             "What estimand and analysis population should govern the primary endpoint?",
             "What sample-size and multiplicity assumptions are justified by source evidence?",
         ),
         regulatory_questions=(
+            f"Is {next_study_intent.study_role} the right next development role, or should an alternative be selected?",
             "Is the comparator or control strategy acceptable for the target population?",
             "Do eligibility restrictions align with safety evidence and intended-use rationale?",
         ),
@@ -1136,26 +1335,28 @@ def review_protocol_design(
     )
 
 
-def _score_candidate(target: ClinicalTrialRecord, candidate: AnalogCandidateRecord) -> tuple[SelectedAnalogTrial, AnalogCandidateRecord]:
+def _score_candidate(target: ClinicalTrialRecord, next_study_intent: NextStudyIntent, candidate: AnalogCandidateRecord) -> tuple[SelectedAnalogTrial, AnalogCandidateRecord]:
     trial = candidate.trial
     matched: list[str] = []
     mismatched: list[str] = []
     unknown: list[str] = []
     score = 0.0
-    if set(map(norm, target.conditions)) & set(map(norm, trial.conditions)):
+    intent_indication_terms = {norm(next_study_intent.indication), *map(norm, target.conditions)}
+    if intent_indication_terms & set(map(norm, trial.conditions)):
         matched.append("indication")
         score += 0.3
     elif trial.conditions:
         mismatched.append("indication")
     else:
         unknown.append("indication")
-    if set(_norm_phase_values(target.phases)) & set(_norm_phase_values(trial.phases)):
-        matched.append("phase")
+    intent_phase = _phase_query_from_stage(next_study_intent.proposed_next_stage)
+    if intent_phase and set(_norm_phase_values((intent_phase,))) & set(_norm_phase_values(trial.phases)):
+        matched.append("proposed_next_stage")
         score += 0.2
     elif trial.phases:
-        mismatched.append("phase")
+        mismatched.append("proposed_next_stage")
     else:
-        unknown.append("phase")
+        unknown.append("proposed_next_stage")
     if _endpoint_family(target) and _endpoint_family(target) == _endpoint_family(trial):
         matched.append("endpoint_family")
         score += 0.2
@@ -1242,6 +1443,45 @@ def _population_summary(trial: ClinicalTrialRecord) -> str:
     return "; ".join(parts)
 
 
+def _current_stage(trial: ClinicalTrialRecord, agent3_output: ClinicalOutcomePredictionOutput) -> str:
+    if trial.phases:
+        return ", ".join(_human_phase_label(phase) for phase in trial.phases)
+    if agent3_output.historical_pos_estimate.current_phase:
+        return agent3_output.historical_pos_estimate.current_phase
+    return "development stage unknown"
+
+
+def _phase_query_from_stage(stage: str | None) -> str | None:
+    text = (stage or "").casefold()
+    if "phase iii" in text or "phase 3" in text or "pivotal" in text:
+        return "PHASE3"
+    if "phase ii" in text or "phase 2" in text or "proof-of-concept" in text or "signal" in text or "dose-ranging" in text or "optimization" in text:
+        return "PHASE2"
+    if "phase i" in text or "phase 1" in text or "dose-expansion" in text:
+        return "PHASE1"
+    return None
+
+
+def _regimen_context(trial: ClinicalTrialRecord) -> str:
+    interventions = [intervention.name for intervention in trial.interventions if intervention.name]
+    descriptions = [intervention.description for intervention in trial.interventions if intervention.description]
+    if interventions:
+        context = "; ".join(interventions[:4])
+        if descriptions:
+            context += f" ({'; '.join(descriptions[:2])})"
+        return context
+    return "regimen or intervention context requires human confirmation"
+
+
+def _intent_biomarker_or_line(intent: NextStudyIntent) -> str | None:
+    text = f"{intent.target_population_context} {intent.key_clinical_question} {intent.development_objective}".casefold()
+    if any(term in text for term in ("biomarker", "mutation", "expression", "testing")):
+        return "biomarker_defined"
+    if any(term in text for term in ("prior therapy", "previous treatment", "line of therapy", "refractory", "relapsed")):
+        return "prior_treatment_defined"
+    return None
+
+
 def _norm_phase_values(values: tuple[str, ...]) -> tuple[str, ...]:
     normalized = []
     for value in values:
@@ -1249,3 +1489,18 @@ def _norm_phase_values(values: tuple[str, ...]) -> tuple[str, ...]:
         text = text.replace("phaseiii", "phase3").replace("phaseii", "phase2").replace("phasei", "phase1")
         normalized.append(text)
     return tuple(normalized)
+
+
+def _human_phase_label(value: str) -> str:
+    normalized = _norm_phase_values((value,))
+    if not normalized:
+        return value
+    label_by_phase = {
+        "earlyphase1": "Early Phase I",
+        "phase1": "Phase I",
+        "phase2": "Phase II",
+        "phase3": "Phase III",
+        "phase4": "Phase IV",
+        "notapplicable": "Not Applicable",
+    }
+    return label_by_phase.get(normalized[0], value)

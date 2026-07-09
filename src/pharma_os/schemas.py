@@ -936,6 +936,26 @@ class AnalogSearchPlanOutput(StrictSchema):
     confidence: float = Field(default=0.6, ge=0, le=1)
 
 
+class NextStudyIntent(StrictSchema):
+    """Agent 5 development strategy intent for the logical next study."""
+
+    evidence_anchor_nct_id: str = Field(..., min_length=1)
+    current_development_stage: str = Field(..., min_length=1)
+    proposed_next_stage: str = Field(..., min_length=1)
+    study_role: str = Field(..., min_length=1)
+    development_objective: str = Field(..., min_length=1)
+    key_clinical_question: str = Field(..., min_length=1)
+    indication: str = Field(..., min_length=1)
+    target_population_context: str = Field(..., min_length=1)
+    regimen_context: str = Field(..., min_length=1)
+    rationale: str = Field(..., min_length=1)
+    alternatives_considered: tuple[str, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    requires_human_review: bool = True
+
+
 class AnalogCandidateRecord(StrictSchema):
     """A normalized analog candidate with query provenance."""
 
@@ -1105,6 +1125,7 @@ class ProtocolDesignBrief(StrictSchema):
     title: str = Field(..., min_length=1)
     artifact_type: Literal["draft_protocol_design_brief"] = "draft_protocol_design_brief"
     requires_human_review: bool = True
+    next_study_intent: NextStudyIntent
     executive_synopsis: ProtocolSectionDraft
     strategic_rationale: ProtocolSectionDraft
     analog_trial_benchmark_summary: ProtocolSectionDraft
@@ -1136,6 +1157,7 @@ class ProtocolDesignOutput(StrictSchema):
     target_trial: ClinicalTrialRecord
     agent3_handoff: Agent3HandoffReference
     agent4_handoff: Agent4HandoffReference
+    next_study_intent: NextStudyIntent
     analog_candidates: tuple[AnalogCandidateRecord, ...] = Field(default_factory=tuple)
     analog_benchmark_bundle: AnalogBenchmarkBundle
     protocol_design_brief: ProtocolDesignBrief

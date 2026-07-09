@@ -209,6 +209,76 @@ def test_calculate_analog_benchmark_handles_missing_values() -> None:
     assert any(flag.field == "enrollment" for flag in bundle.missing_data_flags)
 
 
+def test_next_study_intent_does_not_blindly_increment_phase() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = _target_trial()
+
+    intent = protocol_design_agents.build_next_study_intent(
+        run_id="run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=(target.source_id,),
+        missing_data_flags=(),
+    )
+
+    assert intent.evidence_anchor_nct_id == target.nct_id
+    assert intent.current_development_stage == "Phase II"
+    assert intent.proposed_next_stage == "Phase IIb optimization study"
+    assert "not an automatic phase increment" in intent.rationale
+    assert intent.requires_human_review is True
+
+
+def test_analog_search_and_selection_follow_next_study_intent_phase() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = _target_trial()
+    intent = protocol_design_agents.build_next_study_intent(
+        run_id="run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=(target.source_id,),
+        missing_data_flags=(),
+    ).model_copy(
+        update={
+            "proposed_next_stage": "Phase III pivotal study",
+            "study_role": "pivotal efficacy confirmation",
+            "development_objective": "Confirm clinical benefit in a registration-enabling population.",
+        }
+    )
+
+    plan = protocol_design.build_search_strategy(
+        run_id="run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        next_study_intent=intent,
+    )
+    assert plan.queries[0].phase == "PHASE3"
+    assert "proposed_next_stage" in plan.expected_dimensions
+    assert "current target trial phase" in plan.rationale
+
+    phase3_candidate = AnalogCandidateRecord(
+        candidate_id="c1",
+        trial=_analog("NCT00000003").model_copy(update={"phases": ("PHASE3",)}),
+        query_ids=("q1",),
+        source_ids=("ctgov:NCT00000003",),
+        provenance="test",
+    )
+    selection = protocol_design.select_analog_trials(
+        run_id="run",
+        target_trial=target,
+        candidates=(phase3_candidate,),
+        agent3_output=agent3,
+        agent4_output=agent4,
+        search_plan=plan,
+        next_study_intent=intent,
+    )
+
+    assert selection.selected_analogs
+    assert "proposed_next_stage" in selection.selected_analogs[0].matched_dimensions
+
+
 def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch) -> None:
     agent3, handoff3, agent4, handoff4 = _handoffs()
     monkeypatch.setattr(protocol_design, "_get_or_run_agent3", lambda input_data, memory: (agent3, handoff3))
@@ -231,12 +301,17 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
 
     assert output.protocol_design_brief.artifact_type == "draft_protocol_design_brief"
     assert output.protocol_design_brief.requires_human_review is True
+    assert output.next_study_intent.proposed_next_stage == "Phase IIb optimization study"
+    assert output.protocol_design_brief.next_study_intent == output.next_study_intent
+    assert "Phase IIb optimization study" in output.protocol_design_brief.title
     assert output.analog_benchmark_bundle.selected_analog_ids
     assert output.human_gate is not None
     assert output.human_gate.decision == "needs_human_review"
     assert output.validation_status == "needs_human_review"
     assert output.human_readable_summary is not None
     assert output.human_readable_summary.module_name == "protocol_design"
+    assert "Phase IIb optimization study" in output.human_readable_summary.plain_language_summary
+    assert any(finding.title == "Next study intent" for finding in output.human_readable_summary.key_findings)
     assert "Agent 3 run" in output.human_readable_summary.handoff_summary
     assert "Agent 4 run" in output.human_readable_summary.handoff_summary
     bundle = store.get_run_bundle(output.run_id)
@@ -245,6 +320,7 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert bundle.agent_traces
     assert {trace.agent_name for trace in bundle.agent_traces} >= {
         "ProtocolDesignManagerAgent",
+        "DevelopmentStrategyAgent",
         "AnalogSearchPlannerAgent",
         "AnalogSelectionAgent",
         "AnalogBenchmarkInterpreterAgent",
@@ -262,9 +338,12 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert bundle.input_json is not None
     assert bundle.input_json["cli_input"]["nct_id"] == "NCT12345678"
     assert bundle.input_json["expanded_pipeline_input"]["target_trial"]["nct_id"] == "NCT12345678"
+    assert bundle.input_json["expanded_pipeline_input"]["next_study_intent"]["proposed_next_stage"] == "Phase IIb optimization study"
     assert bundle.input_json["expanded_pipeline_input"]["agent3_output"]["output_id"] == agent3.output_id
     assert bundle.input_json["expanded_pipeline_input"]["agent4_output"]["output_id"] == agent4.output_id
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
+    assert payload["next_study_intent"]["proposed_next_stage"] == "Phase IIb optimization study"
+    assert payload["protocol_design_brief"]["next_study_intent"]["study_role"]
     assert payload["analog_benchmark_bundle"]["selected_analog_ids"]
     assert payload["human_readable_summary"]["module_name"] == "protocol_design"
 
@@ -272,6 +351,8 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     html = html_path.read_text(encoding="utf-8")
     assert "Agent Traces" in html
     assert "ProtocolBriefWriterAgent" in html
+    assert "Next Study Intent" in html
+    assert "Phase IIb optimization study" in html
     assert "Human-Readable Module Summary" in html
 
 

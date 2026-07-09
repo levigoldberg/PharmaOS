@@ -184,6 +184,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
 def _protocol_design_report(output: dict[str, Any]) -> str:
     target = _dict(output.get("target_trial"))
     brief = _dict(output.get("protocol_design_brief"))
+    intent = _dict(output.get("next_study_intent") or brief.get("next_study_intent"))
     benchmark = _dict(output.get("analog_benchmark_bundle"))
     candidates = _list(output.get("analog_candidates"))
     selected_ids = set(_list(benchmark.get("selected_analog_ids")))
@@ -200,19 +201,21 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
                     ("Target", target.get("nct_id")),
                     ("Status", target.get("overall_status")),
                     ("Phase", ", ".join(_list(target.get("phases")))),
+                    ("Proposed Next Study", intent.get("proposed_next_stage")),
                     ("Human Review", _display(brief.get("requires_human_review"))),
                 ],
             ),
             _kpi_grid(
                 [
+                    ("Next Study", intent.get("proposed_next_stage"), _display(intent.get("study_role"))),
                     ("Selected Analogs", len(_list(benchmark.get("selected_analog_ids"))), "CT.gov analog trials selected by Agent 5."),
                     ("Benchmark Confidence", _percent(benchmark.get("confidence")), "Confidence after deterministic analog coverage checks."),
                     ("Median Enrollment", _summary_value(benchmark.get("enrollment"), "median"), "Selected analog participant median."),
                     ("Median Duration", _summary_value(benchmark.get("planned_duration_months"), "median"), "Selected analog planned duration median."),
                     ("Median Sites", _summary_value(benchmark.get("site_count"), "median"), "Selected analog site-count median."),
-                    ("Open Questions", len(_list(brief.get("human_review_questions"))), "Questions carried into the human gate."),
                 ]
             ),
+            _section("Next Study Intent", _next_study_intent_section(intent)),
             _section(
                 "Target Trial",
                 _kv_table(
@@ -241,6 +244,41 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
                         ("Regulatory Questions", _bullets(_list(reviewer.get("regulatory_questions")) or ["None emitted."])),
                     ]
                 ),
+            ),
+        ]
+    )
+
+
+def _next_study_intent_section(intent: dict[str, Any]) -> str:
+    if not intent:
+        return "<p class='muted'>No next-study intent was emitted.</p>"
+    missing_flags = [
+        item.get("reason") if isinstance(item, dict) else item
+        for item in _list(intent.get("missing_data_flags"))
+    ]
+    return "".join(
+        [
+            _kv_table(
+                {
+                    "evidence_anchor_nct_id": intent.get("evidence_anchor_nct_id"),
+                    "current_development_stage": intent.get("current_development_stage"),
+                    "proposed_next_stage": intent.get("proposed_next_stage"),
+                    "study_role": intent.get("study_role"),
+                    "development_objective": intent.get("development_objective"),
+                    "key_clinical_question": intent.get("key_clinical_question"),
+                    "indication": intent.get("indication"),
+                    "target_population_context": intent.get("target_population_context"),
+                    "regimen_context": intent.get("regimen_context"),
+                    "confidence": _percent(intent.get("confidence")),
+                    "requires_human_review": intent.get("requires_human_review"),
+                }
+            ),
+            _cards(
+                [
+                    ("Rationale", _paragraphs([intent.get("rationale")])),
+                    ("Alternatives Considered", _bullets(_list(intent.get("alternatives_considered")) or ["None emitted."])),
+                    ("Missing Data Flags", _bullets(missing_flags or ["None emitted."])),
+                ]
             ),
         ]
     )
