@@ -63,7 +63,7 @@ def build_run_html(run_id: str, *, memory: MemoryStore | None = None) -> str:
             _table_section("Validation Results", bundle.validation_results, ("validation_id", "target_id", "status", "validator", "message")),
             _table_section("Confidence Flags", bundle.confidence_flags, ("flag_id", "target_id", "severity", "reason", "confidence")),
             _table_section("Human Gates", bundle.human_gates, ("gate_id", "decision", "gate_reason", "required_roles", "reviewer")),
-            _table_section("Agent Traces", bundle.agent_traces, ("trace_id", "agent_name", "execution_mode", "output_id", "output_type", "confidence", "rationale_summary")),
+            _table_section("Agent Traces", bundle.agent_traces, ("trace_id", "agent_name", "model_route", "model", "execution_mode", "retry_count", "fallback_cause", "output_id", "output_type", "confidence", "rationale_summary")),
             _json_details("Raw Bundle JSON", _bundle_json(bundle)),
             "</main></body></html>",
         ]
@@ -87,6 +87,8 @@ def _workflow_report_section(output_json: Any, workflow_name: str) -> str:
         return _control_tower_report(output_json)
     if workflow_name == "due_diligence" or "asset_memo" in output_json:
         return _due_diligence_report(output_json)
+    if workflow_name == "clinical_outcome_prediction" or "endpoint_risk_assessment" in output_json:
+        return _clinical_outcome_prediction_report(output_json)
     if workflow_name == "protocol_design" or "protocol_design_brief" in output_json:
         return _protocol_design_report(output_json)
     return ""
@@ -101,8 +103,9 @@ def _execution_mode_summary_section(bundle: Any) -> str:
     if not summary and bundle.reports:
         latest = bundle.reports[-1]
         summary = latest.execution_mode_summary.model_dump(mode="json")
+    runtime_table = _runtime_trace_table(bundle.agent_traces)
     if not isinstance(summary, dict):
-        return ""
+        return _section("AI Execution Mode", runtime_table) if runtime_table else ""
     return _section(
         "AI Execution Mode",
         _two_col(
@@ -121,7 +124,8 @@ def _execution_mode_summary_section(bundle: Any) -> str:
                     "reused_artifacts_used": summary.get("reused_artifacts_used"),
                 }
             ),
-        ),
+        )
+        + runtime_table,
     )
 
 
@@ -132,6 +136,7 @@ def _control_tower_report(output: dict[str, Any]) -> str:
     steps = _list(output.get("step_results"))
     replans = _list(output.get("replans"))
     snapshots = _list(output.get("snapshots"))
+    validation_results = _list(output.get("validation_results"))
     final_snapshot = _dict(output.get("final_snapshot"))
     unavailable = _list(report.get("unavailable_modules"))
     unresolved = _list(report.get("unresolved_gates"))
@@ -149,6 +154,7 @@ def _control_tower_report(output: dict[str, Any]) -> str:
                     ("Unresolved Gates", len(unresolved)),
                 ],
             ),
+            _control_tower_executive_audit(report, request, steps, plans, validation_results, output),
             _kpi_grid(
                 [
                     ("Executed", sum(1 for step in steps if isinstance(step, dict) and step.get("status") in {"executed", "refreshed"}), "Workflow steps executed or refreshed."),
@@ -208,6 +214,116 @@ def _control_tower_report(output: dict[str, Any]) -> str:
             _section("Planning Snapshots", _control_tower_snapshot_table(snapshots)),
         ]
     )
+
+
+def _control_tower_executive_audit(
+    report: dict[str, Any],
+    request: dict[str, Any],
+    steps: list[Any],
+    plans: list[Any],
+    validation_results: list[Any],
+    output: dict[str, Any],
+) -> str:
+    identifiers = _dict(request.get("identifiers"))
+    action_taken = _control_tower_action_taken(steps, validation_results)
+    executed_steps = [step for step in steps if isinstance(step, dict) and step.get("status") in {"executed", "refreshed"}]
+    reused_steps = [step for step in steps if isinstance(step, dict) and step.get("status") == "reused"]
+    first_step = next((step for step in steps if isinstance(step, dict)), None)
+    child_runs = [step.get("child_run_id") for step in executed_steps if step.get("child_run_id")]
+    outputs = [
+        step.get("output_id") or step.get("reused_output_id")
+        for step in steps
+        if isinstance(step, dict) and (step.get("output_id") or step.get("reused_output_id"))
+    ]
+    why = _control_tower_why(first_step, plans, validation_results)
+    attention = _control_tower_attention_items(steps, validation_results, report)
+    return "".join(
+        [
+            _section(
+                "What Happened",
+                _two_col(
+                    _kv_table(
+                        {
+                            "requested_goal": request.get("objective") or report.get("objective"),
+                            "inferred_capability": identifiers.get("target_capability"),
+                            "execution_intent": identifiers.get("execution_intent"),
+                            "nct_id": request.get("nct_id"),
+                            "action_taken": action_taken,
+                        }
+                    ),
+                    _kv_table(
+                        {
+                            "workflow_executed": "yes" if executed_steps else "no",
+                            "memory_reused": "yes" if reused_steps else "no",
+                            "child_run_ids": ", ".join(str(item) for item in child_runs),
+                            "output_ids": ", ".join(str(item) for item in outputs),
+                            "parent_run_id": output.get("run_id"),
+                        }
+                    ),
+                ),
+            ),
+            _section("Why", _paragraphs(why)),
+            _section("Human Attention Needed", _bullets(attention or ["No run-specific attention items were identified."])),
+        ]
+    )
+
+
+def _control_tower_action_taken(steps: list[Any], validation_results: list[Any]) -> str:
+    if any(isinstance(step, dict) and step.get("status") in {"executed", "refreshed"} for step in steps):
+        actions = [
+            f"{step.get('capability_name')} {step.get('status')}"
+            for step in steps
+            if isinstance(step, dict) and step.get("status") in {"executed", "refreshed"}
+        ]
+        return "; ".join(actions)
+    if any(isinstance(step, dict) and step.get("status") == "reused" for step in steps):
+        actions = [
+            f"{step.get('capability_name')} reused existing artifact {step.get('reused_output_id') or step.get('reused_run_id')}"
+            for step in steps
+            if isinstance(step, dict) and step.get("status") == "reused"
+        ]
+        return "; ".join(actions)
+    if any(isinstance(step, dict) and step.get("status") in {"blocked", "failed"} for step in steps):
+        step = next(step for step in steps if isinstance(step, dict) and step.get("status") in {"blocked", "failed"})
+        return f"No workflow executed; {step.get('capability_name')} {step.get('status')}."
+    if _failed_validation_messages(validation_results):
+        return "No workflow executed; Control Tower plan validation failed."
+    return "No workflow step was executed or reused."
+
+
+def _control_tower_why(first_step: Any, plans: list[Any], validation_results: list[Any]) -> list[str]:
+    failed = _failed_validation_messages(validation_results)
+    if failed:
+        return [f"Plan validation failed: {item}" for item in failed[:3]]
+    if isinstance(first_step, dict) and first_step.get("rationale"):
+        return [first_step.get("rationale")]
+    latest_plan = next((plan for plan in reversed(plans) if isinstance(plan, dict)), None)
+    if latest_plan and latest_plan.get("objective_interpretation"):
+        return [latest_plan.get("objective_interpretation")]
+    return ["The Control Tower did not emit a planner rationale."]
+
+
+def _control_tower_attention_items(steps: list[Any], validation_results: list[Any], report: dict[str, Any]) -> list[str]:
+    items = _failed_validation_messages(validation_results)
+    items.extend(str(item) for item in _list(report.get("fallback_summaries")) if item)
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if step.get("status") in {"blocked", "failed"} and step.get("rationale"):
+            items.append(str(step.get("rationale")))
+        for gate in _list(step.get("gates")):
+            if isinstance(gate, dict) and gate.get("gate_reason"):
+                items.append(str(gate.get("gate_reason")))
+    items.extend(str(item) for item in _list(report.get("unavailable_modules")) if item)
+    return list(dict.fromkeys(items))[:8]
+
+
+def _failed_validation_messages(validation_results: list[Any]) -> list[str]:
+    return [
+        str(item.get("message") or item.get("gate_reason"))
+        for item in validation_results
+        if isinstance(item, dict) and item.get("status") == "failed" and (item.get("message") or item.get("gate_reason"))
+    ]
 
 
 def _control_tower_plan_tables(plans: list[Any]) -> str:
@@ -281,6 +397,128 @@ def _control_tower_snapshot_table(snapshots: list[Any]) -> str:
         if isinstance(snapshot, dict)
     ]
     return _dict_table(rows, ("snapshot", "artifacts", "open_gates", "missing_artifacts"))
+
+
+def _clinical_outcome_prediction_report(output: dict[str, Any]) -> str:
+    trial = _dict(output.get("trial_identity"))
+    asset = _dict(output.get("asset_identity"))
+    endpoint = _dict(output.get("endpoint_risk_assessment"))
+    enrollment = _dict(output.get("enrollment_duration_risk"))
+    comparator = _dict(output.get("comparator_benchmarking"))
+    pos = _dict(output.get("historical_pos_estimate"))
+    approval = _dict(output.get("approval_likelihood_proxy"))
+    failure = _dict(output.get("failure_mode_classification"))
+    safety = _dict(output.get("safety_context"))
+    source_availability = _dict(output.get("source_availability"))
+    missing_flags = _list(output.get("missing_data_flags"))
+    input_payload = _dict(output.get("input"))
+
+    return "".join(
+        [
+            _hero(
+                "Clinical Outcome Prediction",
+                trial.get("brief_title") or trial.get("official_title") or output.get("run_id"),
+                endpoint.get("rationale") or "Clinical risk and outcome-readiness assessment.",
+                [
+                    ("Run", output.get("run_id")),
+                    ("NCT", trial.get("nct_id") or input_payload.get("nct_id")),
+                    ("Asset", asset.get("asset_name")),
+                    ("Indication", asset.get("normalized_indication") or ", ".join(_list(trial.get("conditions")))),
+                    ("Validation", output.get("validation_status")),
+                ],
+            ),
+            _kpi_grid(
+                [
+                    ("Approval Proxy", _percent(approval.get("probability")), approval.get("basis") or "Source-derived approval likelihood proxy."),
+                    ("Historical PoS", _percent(pos.get("probability_of_success")), _display(pos.get("lookup_key") or pos.get("current_phase"))),
+                    ("Endpoint Risk", endpoint.get("risk_level"), "Risk level from endpoint and design assessment."),
+                    ("Enrollment Risk", enrollment.get("risk_level"), enrollment.get("rationale")),
+                    ("Comparators", comparator.get("matched_public_trials_count"), comparator.get("landscape_summary")),
+                    ("Missing Flags", len(missing_flags), "Data limitations that should be reviewed."),
+                ]
+            ),
+            _section(
+                "What It Assessed",
+                _two_col(
+                    _kv_table(
+                        {
+                            "nct_id": trial.get("nct_id") or input_payload.get("nct_id"),
+                            "phase": ", ".join(_list(trial.get("phases"))),
+                            "status": trial.get("overall_status"),
+                            "sponsor": trial.get("sponsor"),
+                            "conditions": ", ".join(_list(trial.get("conditions"))),
+                        }
+                    ),
+                    _kv_table(
+                        {
+                            "asset_name": asset.get("asset_name"),
+                            "modality": asset.get("modality"),
+                            "therapeutic_area": asset.get("therapeutic_area"),
+                            "intervention_type": asset.get("intervention_type"),
+                            "asset_confidence": _percent(asset.get("confidence")),
+                        }
+                    ),
+                ),
+            ),
+            _section(
+                "Risk Rationale",
+                _cards(
+                    [
+                        ("Endpoint Risk", _paragraphs([endpoint.get("rationale")]) + _bullets(_list(endpoint.get("risk_factors")))),
+                        ("Enrollment Risk", _paragraphs([enrollment.get("rationale")])),
+                        ("Safety Context", _paragraphs([safety.get("summary")]) + _flag_table(_list(safety.get("missing_data_flags")))),
+                        ("Source Availability", _source_availability_table(_list(source_availability.get("flags")))),
+                    ]
+                ),
+            ),
+            _section("Failure Modes", _failure_mode_table(_list(failure.get("likely_failure_modes")))),
+            _section(
+                "Comparator Benchmarking",
+                _paragraphs(
+                    [
+                        comparator.get("benchmark_summary"),
+                        comparator.get("status_summary"),
+                        comparator.get("phase_summary"),
+                        comparator.get("endpoint_summary"),
+                        comparator.get("population_summary"),
+                    ]
+                )
+                + _dict_table(
+                    [{"comparator_trial_id": item} for item in _list(comparator.get("comparator_trial_ids"))],
+                    ("comparator_trial_id",),
+                ),
+            ),
+            _section("Missing Data And Review Flags", _flag_table(missing_flags)),
+        ]
+    )
+
+
+def _failure_mode_table(modes: list[Any]) -> str:
+    rows = [
+        {
+            "category": item.get("category"),
+            "severity": item.get("severity"),
+            "rationale": item.get("rationale"),
+            "sources": ", ".join(_list(item.get("source_ids"))),
+        }
+        for item in modes
+        if isinstance(item, dict)
+    ]
+    return _dict_table(rows, ("category", "severity", "rationale", "sources"))
+
+
+def _source_availability_table(flags: list[Any]) -> str:
+    rows = [
+        {
+            "source": item.get("source_name"),
+            "status": item.get("status"),
+            "type": item.get("source_type"),
+            "reason": item.get("reason"),
+        }
+        for item in flags
+        if isinstance(item, dict)
+    ]
+    return _dict_table(rows, ("source", "status", "type", "reason"))
 
 
 def _due_diligence_report(output: dict[str, Any]) -> str:
@@ -501,6 +739,12 @@ def _pricing_section(pricing: dict[str, Any]) -> str:
 def _commercial_section(commercial: dict[str, Any]) -> str:
     rows = _list(commercial.get("revenue_forecast"))
     assumptions = _list(commercial.get("assumptions"))
+    ledger = _list(commercial.get("assumption_ledger"))
+    population = _dict(commercial.get("selected_population_measure"))
+    funnel = _dict(commercial.get("patient_funnel"))
+    input_summary = _dict(commercial.get("commercial_input_bundle_summary"))
+    review_questions = _list(commercial.get("human_review_questions"))
+    confidence_flags = _list(commercial.get("confidence_flags"))
     forecast_rows = []
     annual_patients = _float(commercial.get("annual_patients"))
     peak_penetration = _float(commercial.get("peak_penetration"))
@@ -524,12 +768,56 @@ def _commercial_section(commercial: dict[str, Any]) -> str:
                 "net_revenue": _money(row.get("net_revenue")),
             }
         )
+    ledger_rows = [
+        {
+            "assumption": item.get("assumption_name"),
+            "base": _display(item.get("base") if item.get("base") is not None else item.get("value")),
+            "source": item.get("source_type"),
+            "review": _display(item.get("human_review_required")),
+            "rationale": item.get("rationale"),
+        }
+        for item in ledger
+        if isinstance(item, dict)
+    ]
     return "".join(
         [
             _paragraphs(
                 [
-                    "Deterministic formula: net_price = annual_wac * (1 - gross_to_net); treated_patients = annual_patients * peak_penetration * launch_ramp_year; net_revenue = treated_patients * net_price.",
+                    "Market sizing uses source-backed or reviewed population evidence plus AI-selected/defaulted funnel assumptions, then deterministic Python revenue math.",
+                    "Deterministic formula: net_price = annual_wac * (1 - gross_to_net); treated_patients = commercially_addressable_patients * peak_penetration * launch_ramp_year; net_revenue = treated_patients * net_price.",
                     f"Calculable: {_display(commercial.get('calculable'))}. Peak net sales: {_money(commercial.get('peak_net_sales'))}.",
+                    "If non-calculable, unresolved commercial inputs are listed below for human review.",
+                ]
+            ),
+            _mini_heading("Commercial Market Sizing"),
+            _two_col(
+                _kv_table(
+                    {
+                        "selected_market_archetype": commercial.get("selected_market_archetype"),
+                        "market_basis": commercial.get("market_basis"),
+                        "population_value": _patients(population.get("value")),
+                        "population_source": population.get("source_type"),
+                        "population_review_required": population.get("human_review_required"),
+                        "pricing_source": input_summary.get("pricing_source"),
+                    }
+                ),
+                _kv_table(
+                    {
+                        "starting_population": _patients(funnel.get("starting_population")),
+                        "diagnosed_patients": _patients(funnel.get("diagnosed_patients")),
+                        "treated_or_managed": _patients(funnel.get("treated_or_managed_patients")),
+                        "eligible_patients": _patients(funnel.get("eligible_patients")),
+                        "commercially_addressable": _patients(funnel.get("commercially_addressable_patients")),
+                    }
+                ),
+            ),
+            _mini_heading("Commercial Assumption Ledger"),
+            _dict_table(ledger_rows, ("assumption", "base", "source", "review", "rationale")),
+            _mini_heading("Commercial Human Review"),
+            _cards(
+                [
+                    ("Review Questions", _bullets(review_questions or ["None emitted."])),
+                    ("Confidence And Missing Inputs", _bullets(confidence_flags or _list(input_summary.get("missing_inputs")) or ["None emitted."])),
                 ]
             ),
             _mini_heading("Commercial Assumptions"),
@@ -724,6 +1012,24 @@ def _human_readable_summary_section(output_json: Any) -> str:
         f"<h4>Key Findings</h4><ul>{findings_html or '<li>None.</li>'}</ul>"
         f"<h4>Limitations</h4><ul>{limitations_html or '<li>None.</li>'}</ul>",
     )
+
+
+def _runtime_trace_table(traces: tuple[Any, ...]) -> str:
+    rows = [
+        {
+            "agent": getattr(trace, "agent_name", None),
+            "route": getattr(trace, "model_route", None),
+            "model": getattr(trace, "model", None),
+            "mode": getattr(trace, "execution_mode", None),
+            "retries": getattr(trace, "retry_count", 0),
+            "fallback": getattr(trace, "fallback_cause", None),
+        }
+        for trace in traces
+        if getattr(trace, "model", None) or getattr(trace, "model_route", None) or getattr(trace, "retry_count", 0)
+    ]
+    if not rows:
+        return ""
+    return _mini_heading("Runtime Routes And Retries") + _dict_table(rows, ("agent", "route", "model", "mode", "retries", "fallback"))
 
 
 def _table_section(title: str, rows: tuple[Any, ...], fields: tuple[str, ...]) -> str:

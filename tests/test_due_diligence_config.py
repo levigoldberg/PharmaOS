@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pharma_os.schemas import PatentExclusivityOutput, PoSOutput, PricingOutput
-from pharma_os.tools.commercial_model import build_commercial_model
+from pharma_os.tools.commercial_model import build_commercial_model, build_commercial_model_with_trace
 from pharma_os.tools.rnpv import build_rnpv
 from pharma_os.tools.rules import config_source_id, load_config
 
@@ -38,6 +38,30 @@ def test_commercial_assumption_precedence_and_config_provenance() -> None:
     )
     assert "default_archetypes.yaml:archetypes.chronic_specialty_prevalence.gross_to_net.base" in assumptions["gross_to_net"].provenance
     assert output.calculable
+
+
+def test_commercial_model_ai_unavailable_returns_reviewable_noncalculable_output(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    output = build_commercial_model_with_trace(
+        annual_patients=None,
+        peak_penetration=None,
+        gross_to_net=None,
+        pricing=PricingOutput(
+            annual_wac=1000.0,
+            wac_value=1000.0,
+            dosing_summary="source-backed dosing",
+            source_ids=("wac:fixture", "openfda_label:fixture"),
+            confidence=0.8,
+        ),
+        run_id="commercial-fixture",
+    )
+
+    assert output.output.calculable is False
+    assert output.output.selected_market_archetype == "chronic_specialty_prevalence"
+    assert output.output.assumption_ledger
+    assert output.output.human_review_questions
+    assert any(flag.field == "selected_population_measure.value" for flag in output.output.missing_data_flags)
+    assert output.agent_trace is not None
 
 
 def test_rnpv_uses_config_fallbacks_with_provenance() -> None:

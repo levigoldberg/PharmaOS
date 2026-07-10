@@ -51,10 +51,24 @@ Copy `.env.example` to `.env` and fill only the keys you have.
 Required for live agent runs:
 
 - `OPENAI_API_KEY`
-- `PHARMA_OS_MODEL`, defaults to `gpt-5.5`
+- `PHARMA_OS_MODEL`, optional global model override. If unset, PharmaOS uses route-specific defaults.
+- Route-specific model overrides:
+  `PHARMA_OS_MODEL_REQUEST_UNDERSTANDING`,
+  `PHARMA_OS_MODEL_CONTROL_TOWER`,
+  `PHARMA_OS_MODEL_HUMAN_SUMMARY`,
+  `PHARMA_OS_MODEL_AGENT3_MANAGER`,
+  `PHARMA_OS_MODEL_AGENT3_SUBAGENT`,
+  `PHARMA_OS_MODEL_AGENT4_MANAGER`,
+  `PHARMA_OS_MODEL_AGENT4_SUBAGENT`,
+  `PHARMA_OS_MODEL_AGENT5_MANAGER`,
+  `PHARMA_OS_MODEL_AGENT5_SUBAGENT`.
+- Default route tiers when no override is set: fast routes use `gpt-5.6-luna`, balanced routes use `gpt-5.6-terra`, and deep protocol-writing routes use `gpt-5.6-sol`.
 - `PHARMA_OS_ENABLE_LIVE_AGENTS=false` forces deterministic offline fallbacks even when an API key exists.
 - `PHARMA_OS_AGENTS_DISABLED=true` or `PHARMA_OS_OFFLINE=true` also forces deterministic offline fallbacks.
 - `PHARMA_OS_AGENT_MAX_TURNS`, defaults to `8`
+- `PHARMA_OS_LLM_MAX_RETRIES`, defaults to `4`; transient rate limits, timeouts, and server errors retry before deterministic fallback.
+- `PHARMA_OS_LLM_RETRY_INITIAL_DELAY_SECONDS`, defaults to `1.0`
+- `PHARMA_OS_LLM_RETRY_MAX_DELAY_SECONDS`, defaults to `30.0`
 
 Optional for due diligence:
 

@@ -160,7 +160,9 @@ class Orchestrator:
         replans: list[OrchestrationReplanRecord] = []
         child_run_ids: list[str] = []
         control_tower_traces = []
+        fallback_summaries: list[str] = []
         completed_capabilities: set[str] = set()
+        completed_step_ids: set[str] = set()
         current_snapshot = initial_snapshot
         current_plan: ExecutionPlan | None = None
         step_count = 0
@@ -169,44 +171,62 @@ class Orchestrator:
 
         while step_count < max_steps:
             if current_plan is None:
-                agent_result = run_control_tower_agent(
-                    run_id=parent_run_id,
-                    request=request,
-                    snapshot=current_snapshot,
-                    registry=self.registry,
-                )
-                self.memory.save_agent_trace(agent_result.trace)
-                control_tower_traces.append(agent_result.trace)
-                plan_results = validate_execution_plan(
-                    run_id=f"{parent_run_id}-plan-{len(plans) + 1}",
-                    plan=agent_result.output,
-                    snapshot=current_snapshot,
-                    registry=self.registry,
-                )
-                validation_results.extend(plan_results)
-                failed = any(result.status == "failed" for result in plan_results)
-                plan_status = "failed" if failed else "needs_human_review" if agent_result.output.blocked else "passed"
-                current_plan = agent_result.output.model_copy(update={"validation_status": plan_status})
-                plans.append(current_plan)
-                self.memory.save_agent_output(
-                    AgentOutput(
-                        output_id=current_plan.output_id,
-                        agent_name="ControlTowerAgent",
+                plan_feedback: tuple[str, ...] = ()
+                for attempt in range(2):
+                    agent_result = run_control_tower_agent(
                         run_id=parent_run_id,
-                        provenance=agent_result.trace.provenance,
-                        confidence=current_plan.confidence,
-                        validation_status=plan_status,
-                        gate_reason="; ".join(current_plan.block_reasons) if current_plan.block_reasons else None,
-                        execution_mode=agent_result.trace.execution_mode,
-                        execution_mode_summary=summarize_execution_modes((agent_result.trace,)),
-                    ),
-                    payload=current_plan,
-                )
-                if failed:
-                    plan_validation_failed = True
+                        request=request,
+                        snapshot=current_snapshot,
+                        registry=self.registry,
+                        plan_feedback=plan_feedback,
+                    )
+                    self.memory.save_agent_trace(agent_result.trace)
+                    control_tower_traces.append(agent_result.trace)
+                    fallback_summary = _agent_fallback_summary(agent_result)
+                    if fallback_summary:
+                        fallback_summaries.append(fallback_summary)
+                    plan_results = validate_execution_plan(
+                        run_id=f"{parent_run_id}-plan-{len(plans) + 1}",
+                        plan=agent_result.output,
+                        snapshot=current_snapshot,
+                        registry=self.registry,
+                    )
+                    validation_results.extend(plan_results)
+                    failed = any(result.status == "failed" for result in plan_results)
+                    plan_status = "failed" if failed else "needs_human_review" if agent_result.output.blocked else "passed"
+                    current_plan = agent_result.output.model_copy(update={"validation_status": plan_status})
+                    plans.append(current_plan)
+                    self.memory.save_agent_output(
+                        AgentOutput(
+                            output_id=current_plan.output_id,
+                            agent_name="ControlTowerAgent",
+                            run_id=parent_run_id,
+                            provenance=agent_result.trace.provenance,
+                            confidence=current_plan.confidence,
+                            validation_status=plan_status,
+                            gate_reason="; ".join(current_plan.block_reasons) if current_plan.block_reasons else None,
+                            execution_mode=agent_result.trace.execution_mode,
+                            execution_mode_summary=summarize_execution_modes((agent_result.trace,)),
+                        ),
+                        payload=current_plan,
+                    )
+                    if not failed:
+                        break
+                    plan_feedback = _validation_failure_feedback(plan_results)
+                    if attempt == 1:
+                        plan_validation_failed = True
+                        step_results.append(
+                            _plan_validation_failure_step_result(
+                                parent_run_id=parent_run_id,
+                                plan=current_plan,
+                                snapshot=current_snapshot,
+                                failures=plan_feedback,
+                            )
+                        )
+                if plan_validation_failed:
                     break
 
-            step = _next_unhandled_step(current_plan, completed_capabilities)
+            step = _next_unhandled_step(current_plan, completed_step_ids, completed_capabilities)
             if step is None:
                 break
             step_count += 1
@@ -219,6 +239,7 @@ class Orchestrator:
                 before_snapshot=before_snapshot,
             )
             step_results.append(result)
+            completed_step_ids.add(step.step_id)
             completed_capabilities.add(step.capability_name)
             if result.child_run_id:
                 child_run_ids.append(result.child_run_id)
@@ -279,6 +300,7 @@ class Orchestrator:
             step_results=tuple(step_results),
             replans=replans,
             execution_mode_summary=execution_mode_summary,
+            fallback_summaries=tuple(dict.fromkeys(fallback_summaries)),
         )
         failed = plan_validation_failed or any(result.status == "failed" for result in step_results)
         blocked = any(result.status == "blocked" for result in step_results) or any(plan.blocked for plan in plans)
@@ -436,11 +458,74 @@ class Orchestrator:
         )
 
 
-def _next_unhandled_step(plan: ExecutionPlan, completed_capabilities: set[str]) -> PlannedStep | None:
+def _next_unhandled_step(
+    plan: ExecutionPlan,
+    completed_step_ids: set[str],
+    completed_capabilities: set[str],
+) -> PlannedStep | None:
     for step in plan.steps:
-        if step.capability_name not in completed_capabilities:
+        if step.step_id not in completed_step_ids and step.capability_name not in completed_capabilities:
             return step
     return None
+
+
+def _validation_failure_feedback(results: tuple[ValidationResult, ...]) -> tuple[str, ...]:
+    return tuple(
+        f"{result.target_id}: {result.message}"
+        for result in results
+        if result.status == "failed"
+    )
+
+
+def _agent_fallback_summary(agent_result: object) -> str | None:
+    trace = getattr(agent_result, "trace", None)
+    metadata = getattr(agent_result, "trace_metadata", {}) or {}
+    if getattr(trace, "execution_mode", None) != "deterministic_fallback":
+        return None
+    agent_name = str(metadata.get("agent_name") or getattr(trace, "agent_name", "agent"))
+    if metadata.get("fallback"):
+        error_type = metadata.get("error_type") or "unknown error"
+        error = metadata.get("error") or "no error detail captured"
+        route = metadata.get("model_route") or getattr(trace, "model_route", None) or "default"
+        model = metadata.get("model") or getattr(trace, "model", None) or "unknown model"
+        retry_count = int(metadata.get("retry_count") or getattr(trace, "retry_count", 0) or 0)
+        cause = metadata.get("fallback_cause") or getattr(trace, "fallback_cause", None) or "live execution failed"
+        if retry_count:
+            return (
+                f"{agent_name} used deterministic fallback after {retry_count} retries on route {route} "
+                f"using model {model} because {cause}: {error_type}: {error}"
+            )
+        return f"{agent_name} used deterministic fallback on route {route} using model {model} because {cause}: {error_type}: {error}"
+    if metadata.get("disabled"):
+        provenance = getattr(trace, "provenance", "offline")
+        route = metadata.get("model_route") or getattr(trace, "model_route", None) or "default"
+        model = metadata.get("model") or getattr(trace, "model", None) or "unknown model"
+        return f"{agent_name} used deterministic fallback on route {route} using model {model} because live execution was disabled or unavailable ({provenance})."
+    provenance = getattr(trace, "provenance", "deterministic_fallback")
+    return f"{agent_name} used deterministic fallback ({provenance})."
+
+
+def _plan_validation_failure_step_result(
+    *,
+    parent_run_id: str,
+    plan: ExecutionPlan,
+    snapshot: ScientificStateSnapshot,
+    failures: tuple[str, ...],
+) -> OrchestrationStepResult:
+    detail = "; ".join(failures) if failures else "Control Tower plan failed deterministic validation."
+    return OrchestrationStepResult(
+        step_id=f"step-{uuid4()}",
+        capability_name="control_tower",
+        action="block",
+        status="failed",
+        rationale=f"Control Tower plan validation failed after retry: {detail}",
+        parent_run_id=parent_run_id,
+        validation_status="failed",
+        state_changed=False,
+        before_snapshot_id=snapshot.snapshot_id,
+        plan_output_id=plan.output_id,
+        execution_mode="deterministic_fallback",
+    )
 
 
 def _workflow_input_from_request(
@@ -605,6 +690,7 @@ def _build_control_tower_report(
     step_results: tuple[OrchestrationStepResult, ...],
     replans: tuple[OrchestrationReplanRecord, ...],
     execution_mode_summary: object,
+    fallback_summaries: tuple[str, ...] = (),
 ) -> ControlTowerReport:
     unavailable = tuple(
         dict.fromkeys(
@@ -639,6 +725,7 @@ def _build_control_tower_report(
         unresolved_gates=unresolved_gates,
         unavailable_modules=unavailable,
         replan_summaries=tuple(replan.reason for replan in replans),
+        fallback_summaries=fallback_summaries,
         execution_mode_summary=execution_mode_summary,  # type: ignore[arg-type]
     )
 

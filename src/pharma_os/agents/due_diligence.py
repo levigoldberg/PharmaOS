@@ -9,13 +9,14 @@ from pydantic import BaseModel
 
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
-    StructuredAgentResult,
     AgentRuntimeError,
+    StructuredAgentResult,
+    agents_sdk_output_schema,
     agent_fallbacks_disabled,
     load_agents_sdk,
     run_structured_agent,
     run_structured_llm_call,
-    runtime_config_for_live_agents,
+    runtime_config_for_route,
 )
 from pharma_os.components.due_diligence_sections import build_asset_memo
 from pharma_os.schemas import (
@@ -86,7 +87,7 @@ def run_due_diligence_manager_agent(
 ) -> DueDiligenceManagerResult:
     """Run Agent 4 manager/subagents after deterministic retrieval and math."""
 
-    runtime_config = _agent4_runtime_config(config)
+    runtime_config = config
     traces: list[AgentRunTrace] = []
     payloads: list[BaseModel] = []
 
@@ -371,7 +372,10 @@ def run_due_diligence_manager_agent(
 def _agent4_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
     if config is not None:
         return config
-    return runtime_config_for_live_agents(disabled_provenance="pharma_os.agents.due_diligence")
+    return runtime_config_for_route(
+        model_route="agent4_manager",
+        disabled_provenance="pharma_os.agents.due_diligence",
+    )
 
 
 def _run_synthesis_agent(
@@ -384,7 +388,7 @@ def _run_synthesis_agent(
     source_ids: tuple[str, ...],
     confidence: float,
     payload: dict[str, Any],
-    config: AgentRuntimeConfig,
+    config: AgentRuntimeConfig | None,
 ) -> StructuredAgentResult:
     input_summary = f"Interpret Agent 4 {section} evidence."
     rationale_summary = f"{agent_name} synthesized {section} evidence without inventing facts."
@@ -477,9 +481,15 @@ def _run_typed_agent(
     fallback_output: BaseModel,
     source_ids: tuple[str, ...],
     confidence: float,
-    config: AgentRuntimeConfig,
+    config: AgentRuntimeConfig | None,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    route = "agent4_manager" if agent_name == "DueDiligenceManagerAgent" else "agent4_subagent"
+    call_config = runtime_config_for_route(
+        model_route=route,
+        disabled_provenance="pharma_os.agents.due_diligence",
+        config=config,
+    )
     if agent_name in _DIRECT_LLM_AGENT_NAMES:
         return run_structured_llm_call(
             agent_name=agent_name,
@@ -488,7 +498,7 @@ def _run_typed_agent(
             output_type=output_type,
             run_id=run_id,
             input_summary=input_summary,
-            config=config,
+            config=call_config,
             offline_output=fallback_output,
             source_ids=source_ids,
             confidence=confidence,
@@ -496,13 +506,13 @@ def _run_typed_agent(
         )
 
     agent = object()
-    if not config.disabled:
+    if not call_config.disabled:
         Agent, _, _, _ = load_agents_sdk()
         agent = Agent(
             name=agent_name,
             instructions=instructions,
-            model=config.model,
-            output_type=output_type,
+            model=call_config.model,
+            output_type=agents_sdk_output_schema(output_type),
         )
     return run_structured_agent(
         agent=agent,
@@ -511,7 +521,7 @@ def _run_typed_agent(
         agent_name=agent_name,
         run_id=run_id,
         input_summary=input_summary,
-        config=config,
+        config=call_config,
         offline_output=fallback_output,
         source_ids=source_ids,
         confidence=confidence,

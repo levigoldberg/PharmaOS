@@ -7,6 +7,7 @@ from pydantic import Field
 
 from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, run_structured_llm_call
 from pharma_os.agents import clinical_outcome_prediction, due_diligence, protocol_design
+from pharma_os.human_readable import build_human_readable_module_output
 from pharma_os.schemas import StrictSchema
 
 
@@ -118,3 +119,75 @@ def test_borderline_agents_remain_on_agents_sdk_path(module: Any, agent_name: st
     assert isinstance(result.output, FixtureOutput)
     assert instantiated == [agent_name]
     assert sdk_calls == [agent_name]
+
+
+@pytest.mark.parametrize(
+    ("module", "agent_name", "expected_route"),
+    [
+        (clinical_outcome_prediction, "ClinicalOutcomeManagerAgent", "agent3_manager"),
+        (clinical_outcome_prediction, "EndpointRiskAgent", "agent3_subagent"),
+        (due_diligence, "DueDiligenceManagerAgent", "agent4_manager"),
+        (due_diligence, "DiligenceRedTeamAgent", "agent4_subagent"),
+        (protocol_design, "ProtocolDesignManagerAgent", "agent5_manager"),
+        (protocol_design, "DevelopmentStrategyAgent", "agent5_manager"),
+        (protocol_design, "ProtocolBriefWriterAgent", "agent5_manager"),
+        (protocol_design, "AnalogSearchPlannerAgent", "agent5_subagent"),
+    ],
+)
+def test_workflow_agents_use_expected_model_routes(module: Any, agent_name: str, expected_route: str, monkeypatch) -> None:
+    seen_routes: list[str] = []
+
+    def fake_direct(**kwargs: Any) -> StructuredAgentResult:
+        seen_routes.append(kwargs["config"].model_route)
+        return _direct_result(**kwargs)
+
+    def fake_sdk(**kwargs: Any) -> StructuredAgentResult:
+        seen_routes.append(kwargs["config"].model_route)
+        return _direct_result(**kwargs)
+
+    class FakeAgent:
+        def __init__(self, *, name: str, instructions: str, model: str, output_type: type[Any]) -> None:
+            del name, instructions, model, output_type
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("PHARMA_OS_MODEL", raising=False)
+    monkeypatch.setattr(module, "run_structured_llm_call", fake_direct)
+    monkeypatch.setattr(module, "run_structured_agent", fake_sdk)
+    monkeypatch.setattr(module, "load_agents_sdk", lambda: (FakeAgent, object, object, object))
+
+    result = module._run_typed_agent(
+        agent_name=agent_name,
+        instructions="Return FixtureOutput.",
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture routing input.",
+        payload={"prompt": "fixture"},
+        fallback_output=FixtureOutput(output_id=f"{agent_name}-OUT", summary="Fixture summary.", confidence=0.7),
+        source_ids=("ctgov:NCT12345678",),
+        confidence=0.7,
+        config=None,
+        rationale_summary="Fixture routing rationale.",
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert seen_routes == [expected_route]
+
+
+def test_human_readable_summary_uses_human_summary_route(monkeypatch) -> None:
+    seen_routes: list[str] = []
+
+    def fake_direct(**kwargs: Any) -> StructuredAgentResult:
+        seen_routes.append(kwargs["config"].model_route)
+        return _direct_result(**kwargs)
+
+    monkeypatch.setattr("pharma_os.human_readable.run_structured_llm_call", fake_direct)
+
+    result = build_human_readable_module_output(
+        module_name="trial_intelligence",
+        module_display_name="Trial Intelligence",
+        run_id="RUN",
+        typed_output=FixtureOutput(output_id="OUT", summary="Fixture summary.", confidence=0.7),
+    )
+
+    assert result.output.output_id == "human-readable-trial_intelligence-RUN"
+    assert seen_routes == ["human_summary"]

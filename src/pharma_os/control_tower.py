@@ -8,6 +8,7 @@ from uuid import uuid4
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
     StructuredAgentResult,
+    agents_sdk_output_schema,
     load_agents_sdk,
     run_structured_agent,
     runtime_config_for_live_agents,
@@ -31,11 +32,15 @@ def run_control_tower_agent(
     snapshot: ScientificStateSnapshot,
     registry: WorkflowRegistry | None = None,
     config: AgentRuntimeConfig | None = None,
+    plan_feedback: tuple[str, ...] = (),
 ) -> StructuredAgentResult:
     """Return a typed execution plan without executing workflows."""
 
     effective_registry = registry or WorkflowRegistry.default()
-    runtime_config = config or runtime_config_for_live_agents(disabled_provenance="pharma_os.control_tower")
+    runtime_config = config or runtime_config_for_live_agents(
+        disabled_provenance="pharma_os.control_tower",
+        model_route="control_tower",
+    )
     fallback = build_deterministic_execution_plan(
         run_id=run_id,
         request=request,
@@ -49,7 +54,7 @@ def run_control_tower_agent(
             name="ControlTowerAgent",
             instructions=_control_tower_instructions(),
             model=runtime_config.model,
-            output_type=ExecutionPlan,
+            output_type=agents_sdk_output_schema(ExecutionPlan),
         )
     return run_structured_agent(
         agent=agent,
@@ -64,6 +69,7 @@ def run_control_tower_agent(
             "contradictory_claims": snapshot.contradictory_claims,
             "human_gates": [gate.model_dump(mode="json") for gate in snapshot.open_gates],
             "workflow_registry": [capability.model_dump(mode="json") for capability in effective_registry.capabilities()],
+            "prior_plan_validation_feedback": plan_feedback,
             "constraint": "Return only an ExecutionPlan. Do not execute workflows or fabricate unavailable module outputs.",
         },
         output_type=ExecutionPlan,
@@ -146,13 +152,21 @@ def validate_execution_plan(
     ordered = [step.capability_name for step in plan.steps]
     satisfied: set[str] = _memory_satisfied_capabilities(snapshot.artifacts, registry)
     changed: set[str] = set()
+    seen_capabilities: dict[str, str] = {}
+    allowed_capabilities = _allowed_target_path_capabilities(plan.request, snapshot, registry)
 
     for index, step in enumerate(plan.steps):
         capability = registry.get(step.capability_name)
         failures: list[str] = []
+        prior_action = seen_capabilities.get(step.capability_name)
+        if prior_action is not None:
+            failures.append(f"duplicate capability step: {step.capability_name} already planned as {prior_action}")
+        seen_capabilities[step.capability_name] = step.action
         if step.capability_name not in known or capability is None:
             failures.append("unknown capability")
         else:
+            if allowed_capabilities and step.capability_name not in allowed_capabilities:
+                failures.append("capability outside requested target path")
             relevant_requirements = _requirements_for_capability(snapshot, capability)
             unsatisfied_requirements = _unsatisfied_requirements_for_capability(snapshot, capability)
             if step.action != "block":
@@ -177,6 +191,8 @@ def validate_execution_plan(
                 failures.append("reuse references missing or incompatible artifact")
             if step.action == "reuse" and relevant_requirements and not _reuse_satisfies_addressed_requirements(step, snapshot):
                 failures.append("reuse does not satisfy cited decision evidence requirements")
+            if step.action == "reuse" and _force_refreshes(capability, plan.request):
+                failures.append("reuse ignores force_refresh request")
             if step.action == "refresh" and not _refresh_justified(step, capability, plan.request, snapshot.artifacts, changed):
                 failures.append("refresh is not justified by force_refresh, incompatibility, staleness, or dependency changes")
             if step.action in {"run", "refresh"} and _has_blocking_dependency_gate(capability, snapshot.artifacts):
@@ -393,12 +409,30 @@ def _best_artifact_for_capability(capability: ModuleCapability, artifacts: tuple
 
 
 def _has_compatible_artifact(capability: ModuleCapability, artifacts: tuple[ArtifactStatus, ...], step: PlannedStep | None = None) -> bool:
+    if step and (step.reuse_run_id or step.reuse_output_id):
+        return _referenced_compatible_artifact(capability, artifacts, step) is not None
     artifact = _best_artifact_for_capability(capability, artifacts)
     if artifact is None or artifact.compatibility != "compatible":
         return False
-    if step and step.reuse_run_id and artifact.run_id != step.reuse_run_id:
-        return False
     return True
+
+
+def _referenced_compatible_artifact(
+    capability: ModuleCapability,
+    artifacts: tuple[ArtifactStatus, ...],
+    step: PlannedStep,
+) -> ArtifactStatus | None:
+    for artifact in artifacts:
+        if artifact.producer_workflow not in {capability.name, getattr(capability, "workflow_name", capability.name)}:
+            continue
+        if artifact.compatibility != "compatible":
+            continue
+        if step.reuse_run_id and artifact.run_id != step.reuse_run_id:
+            continue
+        if step.reuse_output_id and artifact.output_id != step.reuse_output_id:
+            continue
+        return artifact
+    return None
 
 
 def _memory_satisfied_capabilities(artifacts: tuple[ArtifactStatus, ...], registry: WorkflowRegistry) -> set[str]:
@@ -407,6 +441,19 @@ def _memory_satisfied_capabilities(artifacts: tuple[ArtifactStatus, ...], regist
         if _has_compatible_artifact(capability, artifacts):
             satisfied.add(capability.name)
     return satisfied
+
+
+def _allowed_target_path_capabilities(
+    request: OrchestrationRequest,
+    snapshot: ScientificStateSnapshot,
+    registry: WorkflowRegistry,
+) -> set[str]:
+    target = request.identifiers.get("target_capability")
+    if not target and snapshot.pending_decision:
+        target = snapshot.pending_decision.target_capability_name
+    if not target or target not in registry.names():
+        return set()
+    return set(_dependency_order((target,), registry))
 
 
 def _refresh_justified(
@@ -525,6 +572,9 @@ def _control_tower_instructions() -> str:
         "You are ControlTowerAgent. You only produce a typed ExecutionPlan. "
         "Do not execute workflows. Use registry metadata, current scientific state, validation, gates, compatibility, freshness, "
         "dependencies, and force_refresh to choose run, reuse, refresh, skip, or block. "
+        "If prior_plan_validation_feedback is supplied, correct the plan so it passes those deterministic validation checks. "
+        "Only plan the requested target capability and its registry dependencies; do not add downstream workflows that the "
+        "objective did not request. "
         "Do not blindly plan Agent 3 to Agent 4 to Agent 5; choose the minimum justified path. "
         "Block unavailable skeleton capabilities and state missing connectors."
     )

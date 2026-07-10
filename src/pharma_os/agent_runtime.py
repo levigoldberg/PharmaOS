@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -28,7 +30,8 @@ class AgentRuntimeError(RuntimeError):
 class AgentRuntimeConfig(StrictSchema):
     """Runtime settings for OpenAI Agents SDK-backed workflow components."""
 
-    model: str = Field(default="gpt-5.5", min_length=1)
+    model: str = Field(default="gpt-5.6-terra", min_length=1)
+    model_route: str = Field(default="default", min_length=1)
     max_turns: int = Field(default=8, ge=1, le=50)
     disabled: bool = False
     provenance: str = "pharma_os.agent_runtime.env"
@@ -42,7 +45,39 @@ class StructuredAgentResult(StrictSchema):
     trace_metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
 
 
-def runtime_config_from_env() -> AgentRuntimeConfig:
+MODEL_TIER_DEFAULTS = {
+    "fast": "gpt-5.6-luna",
+    "balanced": "gpt-5.6-terra",
+    "deep": "gpt-5.6-sol",
+}
+
+MODEL_ROUTE_ENV = {
+    "request_understanding": "PHARMA_OS_MODEL_REQUEST_UNDERSTANDING",
+    "control_tower": "PHARMA_OS_MODEL_CONTROL_TOWER",
+    "human_summary": "PHARMA_OS_MODEL_HUMAN_SUMMARY",
+    "agent3_manager": "PHARMA_OS_MODEL_AGENT3_MANAGER",
+    "agent3_subagent": "PHARMA_OS_MODEL_AGENT3_SUBAGENT",
+    "agent4_manager": "PHARMA_OS_MODEL_AGENT4_MANAGER",
+    "agent4_subagent": "PHARMA_OS_MODEL_AGENT4_SUBAGENT",
+    "agent5_manager": "PHARMA_OS_MODEL_AGENT5_MANAGER",
+    "agent5_subagent": "PHARMA_OS_MODEL_AGENT5_SUBAGENT",
+}
+
+MODEL_ROUTE_TIERS = {
+    "default": "balanced",
+    "request_understanding": "fast",
+    "control_tower": "balanced",
+    "human_summary": "fast",
+    "agent3_manager": "balanced",
+    "agent3_subagent": "fast",
+    "agent4_manager": "balanced",
+    "agent4_subagent": "balanced",
+    "agent5_manager": "deep",
+    "agent5_subagent": "balanced",
+}
+
+
+def runtime_config_from_env(*, model_route: str = "default") -> AgentRuntimeConfig:
     """Read runtime configuration from environment variables."""
 
     disabled = _truthy(os.getenv("PHARMA_OS_AGENTS_DISABLED")) or _truthy(os.getenv("PHARMA_OS_OFFLINE"))
@@ -51,21 +86,23 @@ def runtime_config_from_env() -> AgentRuntimeConfig:
         max_turns = int(max_turns_text) if max_turns_text else 8
     except ValueError:
         max_turns = 8
+    route = _normalize_model_route(model_route)
     return AgentRuntimeConfig(
-        model=os.getenv("PHARMA_OS_MODEL") or "gpt-5.5",
+        model=resolve_model_for_route(route),
+        model_route=route,
         max_turns=max_turns,
         disabled=disabled,
     )
 
 
-def runtime_config_for_live_agents(*, disabled_provenance: str) -> AgentRuntimeConfig:
+def runtime_config_for_live_agents(*, disabled_provenance: str, model_route: str = "default") -> AgentRuntimeConfig:
     """Resolve live/offline agent mode from environment.
 
     Live OpenAI Agents SDK calls are enabled when an API key is present, unless
     the operator explicitly disables agents or sets PHARMA_OS_ENABLE_LIVE_AGENTS=false.
     """
 
-    env_config = runtime_config_from_env()
+    env_config = runtime_config_from_env(model_route=model_route)
     if env_config.disabled:
         return env_config
     live_setting = os.getenv("PHARMA_OS_ENABLE_LIVE_AGENTS")
@@ -74,6 +111,34 @@ def runtime_config_for_live_agents(*, disabled_provenance: str) -> AgentRuntimeC
     if os.getenv("OPENAI_API_KEY"):
         return env_config
     return env_config.model_copy(update={"disabled": True, "provenance": f"{disabled_provenance}.missing_openai_api_key"})
+
+
+def runtime_config_for_route(
+    *,
+    model_route: str,
+    disabled_provenance: str,
+    config: AgentRuntimeConfig | None = None,
+) -> AgentRuntimeConfig:
+    """Return route-specific runtime config unless the caller supplied an explicit config."""
+
+    if config is not None:
+        if config.model_route == "default":
+            return config.model_copy(update={"model_route": _normalize_model_route(model_route)})
+        return config
+    return runtime_config_for_live_agents(disabled_provenance=disabled_provenance, model_route=model_route)
+
+
+def resolve_model_for_route(model_route: str = "default") -> str:
+    """Resolve the selected model for a logical agent/workflow route."""
+
+    route = _normalize_model_route(model_route)
+    route_env = MODEL_ROUTE_ENV.get(route)
+    if route_env and os.getenv(route_env):
+        return str(os.getenv(route_env))
+    if os.getenv("PHARMA_OS_MODEL"):
+        return str(os.getenv("PHARMA_OS_MODEL"))
+    tier = MODEL_ROUTE_TIERS.get(route, MODEL_ROUTE_TIERS["default"])
+    return MODEL_TIER_DEFAULTS[tier]
 
 
 def load_agents_sdk() -> tuple[Any, Any, Any, Any]:
@@ -86,6 +151,20 @@ def load_agents_sdk() -> tuple[Any, Any, Any, Any]:
             "OpenAI Agents SDK is not installed. Install project dependencies before live agent runs."
         ) from exc
     return Agent, AgentOutputSchema, Runner, function_tool
+
+
+def agents_sdk_output_schema(output_type: type[BaseModel]) -> Any:
+    """Build an Agents SDK output schema compatible with PharmaOS Pydantic models.
+
+    PharmaOS schemas intentionally include typed metadata dictionaries for
+    provenance, assumptions, and trace details. The Agents SDK strict schema
+    preflight rejects those dynamic object fields, so live SDK agents use the
+    non-strict SDK wrapper and PharmaOS validates the final output with the
+    original strict Pydantic model after the call.
+    """
+
+    _, AgentOutputSchema, _, _ = load_agents_sdk()
+    return AgentOutputSchema(output_type, strict_json_schema=False)
 
 
 def run_structured_agent(
@@ -128,61 +207,26 @@ def run_structured_agent(
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.offline",
                 execution_mode="deterministic_fallback",
+                runtime_metadata=_trace_runtime_metadata(settings, {"retry_count": 0, "retry_attempts": 1, "retry_exhausted": False, "fallback_cause": "disabled"}),
             ),
             trace_metadata={
                 "agent_name": agent_name,
                 "model": settings.model,
+                "model_route": settings.model_route,
                 "max_turns": effective_max_turns,
                 "disabled": True,
                 "execution_mode": "deterministic_fallback",
+                "retry_count": 0,
+                "fallback_cause": "disabled",
             },
         )
 
     _, _, Runner, _ = load_agents_sdk()
     try:
-        response = Runner.run_sync(
-            agent,
-            _payload_json(payload),
-            max_turns=effective_max_turns,
+        response, retry_metadata = _execute_with_retries(
+            lambda: _run_agent_once(Runner, agent, payload, effective_max_turns),
+            operation="Agents SDK run",
         )
-    except TypeError:
-        try:
-            response = Runner.run_sync(agent, _payload_json(payload))
-        except Exception as exc:
-            if _agent_fallbacks_disabled():
-                raise AgentRuntimeError(f"Agent run failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
-            if offline_output is None:
-                raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
-            output = _validate_output(offline_output, output_type)
-            completed_at = datetime.now(timezone.utc)
-            return StructuredAgentResult(
-                output=output,
-                trace=_trace(
-                    run_id=run_id,
-                    agent_name=agent_name,
-                    input_summary=input_summary,
-                    output=output,
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    source_ids=source_ids,
-                    confidence=confidence,
-                    rationale_summary=rationale_summary
-                    or "Agents SDK call failed; offline structured output was validated as fallback.",
-                    tool_calls=(),
-                    provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
-                    execution_mode="deterministic_fallback",
-                ),
-                trace_metadata={
-                    "agent_name": agent_name,
-                    "model": settings.model,
-                    "max_turns": effective_max_turns,
-                    "disabled": False,
-                    "fallback": True,
-                    "execution_mode": "deterministic_fallback",
-                    "error_type": exc.__class__.__name__,
-                    "error": str(exc)[:500],
-                },
-            )
     except Exception as exc:
         if _agent_fallbacks_disabled():
             raise AgentRuntimeError(f"Agent run failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
@@ -190,6 +234,7 @@ def run_structured_agent(
             raise AgentRuntimeError(f"Agent run failed: {exc.__class__.__name__}: {exc}") from exc
         output = _validate_output(offline_output, output_type)
         completed_at = datetime.now(timezone.utc)
+        retry_metadata = _retry_metadata_for_exception(exc)
         return StructuredAgentResult(
             output=output,
             trace=_trace(
@@ -206,16 +251,20 @@ def run_structured_agent(
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
                 execution_mode="deterministic_fallback",
+                runtime_metadata=_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
             ),
             trace_metadata={
                 "agent_name": agent_name,
                 "model": settings.model,
+                "model_route": settings.model_route,
                 "max_turns": effective_max_turns,
                 "disabled": False,
                 "fallback": True,
                 "execution_mode": "deterministic_fallback",
                 "error_type": exc.__class__.__name__,
                 "error": str(exc)[:500],
+                "fallback_cause": _fallback_cause(exc),
+                **retry_metadata,
             },
         )
 
@@ -244,14 +293,17 @@ def run_structured_agent(
             tool_calls=tool_calls,
             provenance="pharma_os.agent_runtime.openai_agents_sdk",
             execution_mode="live_agent",
+            runtime_metadata=_trace_runtime_metadata(settings, retry_metadata),
         ),
         trace_metadata={
             **_response_metadata(response),
             "agent_name": agent_name,
             "model": settings.model,
+            "model_route": settings.model_route,
             "max_turns": effective_max_turns,
             "disabled": False,
             "execution_mode": "live_agent",
+            **retry_metadata,
         },
     )
 
@@ -290,11 +342,14 @@ def run_structured_llm_call(
         )
 
     try:
-        parsed, response_metadata = _call_openai_structured_output(
-            model=settings.model,
-            instructions=instructions,
-            payload=payload,
-            output_type=output_type,
+        (parsed, response_metadata), retry_metadata = _execute_with_retries(
+            lambda: _call_openai_structured_output(
+                model=settings.model,
+                instructions=instructions,
+                payload=payload,
+                output_type=output_type,
+            ),
+            operation="Direct OpenAI structured output call",
         )
     except Exception as exc:
         if _agent_fallbacks_disabled():
@@ -307,6 +362,7 @@ def run_structured_llm_call(
             raise AgentRuntimeError(f"Direct OpenAI structured output call failed: {exc.__class__.__name__}: {exc}") from exc
         output = _validate_output(offline_output, output_type)
         completed_at = datetime.now(timezone.utc)
+        retry_metadata = _retry_metadata_for_exception(exc)
         return StructuredAgentResult(
             output=output,
             trace=_trace(
@@ -323,16 +379,20 @@ def run_structured_llm_call(
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.direct_openai_api_fallback",
                 execution_mode="deterministic_fallback",
+                runtime_metadata=_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
             ),
             trace_metadata={
                 "agent_name": agent_name,
                 "model": settings.model,
+                "model_route": settings.model_route,
                 "disabled": False,
                 "direct_api": True,
                 "fallback": True,
                 "execution_mode": "deterministic_fallback",
                 "error_type": exc.__class__.__name__,
                 "error": str(exc)[:500],
+                "fallback_cause": _fallback_cause(exc),
+                **retry_metadata,
             },
         )
 
@@ -353,14 +413,17 @@ def run_structured_llm_call(
             tool_calls=(),
             provenance="pharma_os.agent_runtime.openai_api_structured_output",
             execution_mode="direct_llm",
+            runtime_metadata=_trace_runtime_metadata(settings, retry_metadata),
         ),
         trace_metadata={
             **response_metadata,
             "agent_name": agent_name,
             "model": settings.model,
+            "model_route": settings.model_route,
             "disabled": False,
             "direct_api": True,
             "execution_mode": "direct_llm",
+            **retry_metadata,
         },
     )
 
@@ -379,6 +442,7 @@ def _trace(
     tool_calls: tuple[AgentToolCallTrace, ...],
     provenance: str,
     execution_mode: ExecutionMode,
+    runtime_metadata: dict[str, str | int | float | bool | None] | None = None,
 ) -> AgentRunTrace:
     output_id = getattr(output, "output_id", None) or getattr(output, "brief_id", None)
     output_summary = _summarize_model(output)
@@ -413,6 +477,7 @@ def _trace(
         completed_at=completed_at,
         provenance=provenance,
         execution_mode=execution_mode,
+        **(runtime_metadata or {}),
     )
 
 
@@ -449,16 +514,177 @@ def _offline_structured_result(
             tool_calls=(),
             provenance="pharma_os.agent_runtime.offline",
             execution_mode="deterministic_fallback",
+            runtime_metadata=_trace_runtime_metadata(settings, {"retry_count": 0, "retry_attempts": 1, "retry_exhausted": False, "fallback_cause": "disabled"}),
         ),
         trace_metadata={
             "agent_name": agent_name,
             "model": settings.model,
+            "model_route": settings.model_route,
             "max_turns": settings.max_turns,
             "disabled": True,
             "execution_mode": "deterministic_fallback",
+            "retry_count": 0,
+            "fallback_cause": "disabled",
             **(trace_metadata or {}),
         },
     )
+
+
+def _run_agent_once(Runner: Any, agent: Any, payload: BaseModel | dict[str, Any], max_turns: int) -> Any:
+    try:
+        return Runner.run_sync(
+            agent,
+            _payload_json(payload),
+            max_turns=max_turns,
+        )
+    except TypeError:
+        return Runner.run_sync(agent, _payload_json(payload))
+
+
+def _execute_with_retries(operation_call: Any, *, operation: str) -> tuple[Any, dict[str, str | int | float | bool | None]]:
+    policy = _retry_policy_from_env()
+    attempts = 0
+    last_exc: Exception | None = None
+    while attempts < policy["max_attempts"]:
+        attempts += 1
+        try:
+            result = operation_call()
+            return result, {
+                "retry_count": attempts - 1,
+                "retry_attempts": attempts,
+                "retry_exhausted": False,
+            }
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc) or attempts >= policy["max_attempts"]:
+                break
+            delay = _retry_delay_seconds(exc, attempt=attempts, policy=policy)
+            time.sleep(delay)
+    assert last_exc is not None
+    if _is_transient_error(last_exc) and attempts >= policy["max_attempts"]:
+        raise AgentRuntimeError(
+            f"{operation} failed after {attempts} attempts due to transient error: "
+            f"{last_exc.__class__.__name__}: {last_exc}"
+        ) from last_exc
+    raise last_exc
+
+
+def _retry_policy_from_env() -> dict[str, float | int]:
+    return {
+        "max_attempts": _env_int("PHARMA_OS_LLM_MAX_RETRIES", 4, minimum=1, maximum=12),
+        "initial_delay": _env_float("PHARMA_OS_LLM_RETRY_INITIAL_DELAY_SECONDS", 1.0, minimum=0.0, maximum=120.0),
+        "max_delay": _env_float("PHARMA_OS_LLM_RETRY_MAX_DELAY_SECONDS", 30.0, minimum=0.0, maximum=300.0),
+    }
+
+
+def _retry_delay_seconds(exc: Exception, *, attempt: int, policy: dict[str, float | int]) -> float:
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return min(float(policy["max_delay"]), max(0.0, retry_after))
+    base = float(policy["initial_delay"]) * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0.0, min(1.0, base * 0.25)) if base > 0 else 0.0
+    return min(float(policy["max_delay"]), base + jitter)
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    headers = getattr(exc, "headers", None)
+    response = getattr(exc, "response", None)
+    if headers is None and response is not None:
+        headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    retry_after_ms = _header_value(headers, "retry-after-ms")
+    if retry_after_ms is not None:
+        try:
+            return float(retry_after_ms) / 1000.0
+        except ValueError:
+            return None
+    retry_after = _header_value(headers, "retry-after")
+    if retry_after is not None:
+        try:
+            return float(retry_after)
+        except ValueError:
+            return None
+    return None
+
+
+def _header_value(headers: Any, key: str) -> str | None:
+    if hasattr(headers, "get"):
+        value = headers.get(key) or headers.get(key.title())
+        return str(value) if value is not None else None
+    return None
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    status_code = _status_code(exc)
+    if status_code in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    name = exc.__class__.__name__.casefold()
+    text = str(exc).casefold()
+    transient_markers = ("ratelimit", "rate_limit", "timeout", "connection", "temporarily", "service unavailable")
+    return any(marker in name or marker in text for marker in transient_markers)
+
+
+def _status_code(exc: Exception) -> int | None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None and getattr(exc, "response", None) is not None:
+        status_code = getattr(exc.response, "status_code", None)
+    try:
+        return int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_metadata_for_exception(exc: Exception) -> dict[str, str | int | float | bool | None]:
+    retry_count = 0
+    retry_attempts = 1
+    retry_exhausted = False
+    cause_exc: Exception = exc
+    if isinstance(exc, AgentRuntimeError) and exc.__cause__ is not None and isinstance(exc.__cause__, Exception):
+        cause_exc = exc.__cause__
+        if "failed after" in str(exc):
+            retry_exhausted = True
+            retry_attempts = _retry_policy_from_env()["max_attempts"]  # type: ignore[assignment]
+            retry_count = int(retry_attempts) - 1
+    metadata: dict[str, str | int | float | bool | None] = {
+        "retry_count": retry_count,
+        "retry_attempts": retry_attempts,
+        "retry_exhausted": retry_exhausted,
+    }
+    if retry_exhausted:
+        metadata["final_retry_reason"] = f"{cause_exc.__class__.__name__}: {str(cause_exc)[:500]}"
+    return metadata
+
+
+def _trace_runtime_metadata(
+    settings: AgentRuntimeConfig,
+    retry_metadata: dict[str, str | int | float | bool | None],
+    *,
+    fallback_cause: str | None = None,
+) -> dict[str, str | int | float | bool | None]:
+    values: dict[str, str | int | float | bool | None] = {
+        "model": settings.model,
+        "model_route": settings.model_route,
+        "retry_count": int(retry_metadata.get("retry_count") or 0),
+        "retry_attempts": int(retry_metadata.get("retry_attempts") or 1),
+        "retry_exhausted": bool(retry_metadata.get("retry_exhausted") or False),
+        "fallback_cause": fallback_cause or retry_metadata.get("fallback_cause"),
+        "final_retry_reason": retry_metadata.get("final_retry_reason"),
+    }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _fallback_cause(exc: Exception) -> str:
+    cause = exc.__cause__ if isinstance(exc, AgentRuntimeError) and isinstance(exc.__cause__, Exception) else exc
+    if _status_code(cause) == 429 or "ratelimit" in cause.__class__.__name__.casefold() or "rate limit" in str(cause).casefold():
+        return "rate_limit"
+    if "timeout" in cause.__class__.__name__.casefold() or "timeout" in str(cause).casefold():
+        return "timeout"
+    if _is_transient_error(cause):
+        return "transient_error"
+    if isinstance(exc, AgentRuntimeError):
+        return "runtime_error"
+    return "sdk_error"
 
 
 def _extract_tool_calls(
@@ -616,6 +842,27 @@ def _safe_summary(value: Any) -> str | None:
         return json.dumps(value, ensure_ascii=False, default=str)[:1000]
     except TypeError:
         return str(value)[:1000]
+
+
+def _normalize_model_route(model_route: str | None) -> str:
+    route = str(model_route or "default").strip().casefold()
+    return route if route in MODEL_ROUTE_TIERS else "default"
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name) or default)
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name) or default)
+    except ValueError:
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _truthy(value: str | None) -> bool:

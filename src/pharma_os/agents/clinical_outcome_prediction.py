@@ -14,10 +14,11 @@ from pydantic import BaseModel
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
     StructuredAgentResult,
+    agents_sdk_output_schema,
     load_agents_sdk,
     run_structured_agent,
     run_structured_llm_call,
-    runtime_config_for_live_agents,
+    runtime_config_for_route,
 )
 from pharma_os.schemas import (
     AgentRunTrace,
@@ -271,7 +272,7 @@ def run_clinical_outcome_manager_agent(
 ) -> ClinicalOutcomeManagerResult:
     """Run Agent 3 manager/subagents after deterministic retrieval and math."""
 
-    runtime_config = _agent3_runtime_config(config)
+    runtime_config = config
     traces: list[AgentRunTrace] = []
     payloads: list[BaseModel] = []
     common_payload = _agent3_base_payload(
@@ -458,7 +459,10 @@ def run_clinical_outcome_manager_agent(
 def _agent3_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
     if config is not None:
         return config
-    return runtime_config_for_live_agents(disabled_provenance="pharma_os.agents.clinical_outcome_prediction")
+    return runtime_config_for_route(
+        model_route="agent3_manager",
+        disabled_provenance="pharma_os.agents.clinical_outcome_prediction",
+    )
 
 
 def _run_typed_agent(
@@ -472,9 +476,15 @@ def _run_typed_agent(
     fallback_output: BaseModel,
     source_ids: tuple[str, ...],
     confidence: float,
-    config: AgentRuntimeConfig,
+    config: AgentRuntimeConfig | None,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    route = "agent3_manager" if agent_name == "ClinicalOutcomeManagerAgent" else "agent3_subagent"
+    call_config = runtime_config_for_route(
+        model_route=route,
+        disabled_provenance="pharma_os.agents.clinical_outcome_prediction",
+        config=config,
+    )
     if agent_name in _DIRECT_LLM_AGENT_NAMES:
         return run_structured_llm_call(
             agent_name=agent_name,
@@ -483,7 +493,7 @@ def _run_typed_agent(
             output_type=output_type,
             run_id=run_id,
             input_summary=input_summary,
-            config=config,
+            config=call_config,
             offline_output=fallback_output,
             source_ids=source_ids,
             confidence=confidence,
@@ -491,13 +501,13 @@ def _run_typed_agent(
         )
 
     agent = object()
-    if not config.disabled:
+    if not call_config.disabled:
         Agent, _, _, _ = load_agents_sdk()
         agent = Agent(
             name=agent_name,
             instructions=instructions,
-            model=config.model,
-            output_type=output_type,
+            model=call_config.model,
+            output_type=agents_sdk_output_schema(output_type),
         )
     return run_structured_agent(
         agent=agent,
@@ -506,7 +516,7 @@ def _run_typed_agent(
         agent_name=agent_name,
         run_id=run_id,
         input_summary=input_summary,
-        config=config,
+        config=call_config,
         offline_output=fallback_output,
         source_ids=source_ids,
         confidence=confidence,

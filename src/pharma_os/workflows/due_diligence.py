@@ -41,7 +41,7 @@ from pharma_os.schemas import (
 from pharma_os.workflows.clinical_outcome_prediction import run_clinical_outcome_prediction_workflow
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovClient
 from pharma_os.tools.asset_identity import resolve_asset_identity
-from pharma_os.tools.commercial_model import build_commercial_model
+from pharma_os.tools.commercial_model import build_commercial_model_with_trace
 from pharma_os.tools.patents_lens import search_patent_exclusivity
 from pharma_os.tools.pos import lookup_pos
 from pharma_os.tools.pricing import lookup_pricing
@@ -103,12 +103,17 @@ def run_due_diligence_workflow(
         asset_identity,
         wac_data_path=input_data.wac_data_path,
     )
-    commercial_model = build_commercial_model(
+    commercial_result = build_commercial_model_with_trace(
         annual_patients=input_data.annual_patients,
         peak_penetration=input_data.peak_penetration,
         gross_to_net=input_data.gross_to_net,
         pricing=pricing,
+        trial=trial,
+        asset=asset_identity,
+        clinical_evidence=clinical_evidence,
+        run_id=run_id,
     )
+    commercial_model = commercial_result.output
     rnpv = build_rnpv(
         commercial=commercial_model,
         pos=pos,
@@ -337,7 +342,8 @@ def run_due_diligence_workflow(
         run_id=run_id,
         typed_output=output,
     )
-    all_agent_traces = (*manager_result.traces, human_readable_result.trace)
+    market_sizing_traces = (commercial_result.agent_trace,) if commercial_result.agent_trace is not None else ()
+    all_agent_traces = (*market_sizing_traces, *manager_result.traces, human_readable_result.trace)
     execution_mode_summary = summarize_execution_modes(
         all_agent_traces,
         reused_artifacts=1 if handoff.retrieved_from_memory else 0,
@@ -378,6 +384,8 @@ def run_due_diligence_workflow(
             ),
             payload=payload,
         )
+    if market_sizing_traces:
+        store.save_agent_traces(market_sizing_traces)
     store.save_agent_traces(manager_result.traces)
     store.save_agent_trace(human_readable_result.trace)
     store.save_agent_output(
@@ -410,9 +418,11 @@ def run_due_diligence_workflow(
         output_payload=output,
         trace_metadata={
             "manager_agent": "DueDiligenceManagerAgent",
-            "subagent_trace_count": len(manager_result.traces),
+            "subagent_trace_count": len(all_agent_traces),
             "subagent_output_count": len(manager_result.subagent_payloads),
             "human_readable_summary_output_id": human_readable_output.output_id,
+            "commercial_market_sizing_trace": bool(commercial_result.agent_trace is not None),
+            "commercial_market_sizing_trace_metadata": str(commercial_result.trace_metadata),
             "execution_mode_summary": execution_mode_summary.model_dump(mode="json"),
         },
     )

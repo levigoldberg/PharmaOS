@@ -11,10 +11,11 @@ from pydantic import BaseModel
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
     StructuredAgentResult,
+    agents_sdk_output_schema,
     load_agents_sdk,
     run_structured_agent,
     run_structured_llm_call,
-    runtime_config_for_live_agents,
+    runtime_config_for_route,
 )
 from pharma_os.schemas import (
     AnalogCandidateRecord,
@@ -100,7 +101,7 @@ def run_protocol_design_manager_agent(
 ) -> ProtocolDesignManagerResult:
     """Run the Agent 5 manager and scoped subagents with deterministic fallbacks."""
 
-    runtime_config = _agent5_runtime_config(config)
+    runtime_config = config
     traces: list[AgentRunTrace] = []
     payloads: list[BaseModel] = []
 
@@ -336,7 +337,10 @@ def run_protocol_design_manager_agent(
 def _agent5_runtime_config(config: AgentRuntimeConfig | None) -> AgentRuntimeConfig:
     if config is not None:
         return config
-    return runtime_config_for_live_agents(disabled_provenance="pharma_os.agents.protocol_design")
+    return runtime_config_for_route(
+        model_route="agent5_manager",
+        disabled_provenance="pharma_os.agents.protocol_design",
+    )
 
 
 def _run_typed_agent(
@@ -350,9 +354,15 @@ def _run_typed_agent(
     fallback_output: BaseModel,
     source_ids: tuple[str, ...],
     confidence: float,
-    config: AgentRuntimeConfig,
+    config: AgentRuntimeConfig | None,
     rationale_summary: str,
 ) -> StructuredAgentResult:
+    route = _agent5_route(agent_name)
+    call_config = runtime_config_for_route(
+        model_route=route,
+        disabled_provenance="pharma_os.agents.protocol_design",
+        config=config,
+    )
     if agent_name in _DIRECT_LLM_AGENT_NAMES:
         return run_structured_llm_call(
             agent_name=agent_name,
@@ -361,7 +371,7 @@ def _run_typed_agent(
             output_type=output_type,
             run_id=run_id,
             input_summary=input_summary,
-            config=config,
+            config=call_config,
             offline_output=fallback_output,
             source_ids=source_ids,
             confidence=confidence,
@@ -369,13 +379,13 @@ def _run_typed_agent(
         )
 
     agent = object()
-    if not config.disabled:
+    if not call_config.disabled:
         Agent, _, _, _ = load_agents_sdk()
         agent = Agent(
             name=agent_name,
             instructions=instructions,
-            model=config.model,
-            output_type=output_type,
+            model=call_config.model,
+            output_type=agents_sdk_output_schema(output_type),
         )
     return run_structured_agent(
         agent=agent,
@@ -384,12 +394,18 @@ def _run_typed_agent(
         agent_name=agent_name,
         run_id=run_id,
         input_summary=input_summary,
-        config=config,
+        config=call_config,
         offline_output=fallback_output,
         source_ids=source_ids,
         confidence=confidence,
         rationale_summary=rationale_summary,
     )
+
+
+def _agent5_route(agent_name: str) -> str:
+    if agent_name in {"ProtocolDesignManagerAgent", "DevelopmentStrategyAgent", "ProtocolBriefWriterAgent"}:
+        return "agent5_manager"
+    return "agent5_subagent"
 
 
 def _run_section_agent(
@@ -405,7 +421,7 @@ def _run_section_agent(
     benchmark_bundle: AnalogBenchmarkBundle,
     benchmark_interpretation: BenchmarkInterpretation,
     source_ids: tuple[str, ...],
-    config: AgentRuntimeConfig,
+    config: AgentRuntimeConfig | None,
 ) -> StructuredAgentResult:
     return _run_typed_agent(
         agent_name=agent_name,

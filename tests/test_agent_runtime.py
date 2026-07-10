@@ -7,8 +7,10 @@ from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
     AgentRuntimeError,
     StructuredAgentResult,
+    resolve_model_for_route,
     run_structured_agent,
     run_structured_llm_call,
+    runtime_config_from_env,
     runtime_config_for_live_agents,
 )
 from pharma_os.schemas import StrictSchema
@@ -18,6 +20,54 @@ class FixtureOutput(StrictSchema):
     output_id: str = Field(..., min_length=1)
     summary: str = Field(..., min_length=1)
     confidence: float = Field(..., ge=0, le=1)
+
+
+class TransientRateLimitError(RuntimeError):
+    status_code = 429
+
+
+def test_model_route_specific_env_overrides_global_model(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_MODEL", "global-model")
+    monkeypatch.setenv("PHARMA_OS_MODEL_CONTROL_TOWER", "control-model")
+
+    config = runtime_config_from_env(model_route="control_tower")
+
+    assert config.model == "control-model"
+    assert config.model_route == "control_tower"
+    assert resolve_model_for_route("control_tower") == "control-model"
+
+
+def test_global_model_preserves_backward_compatible_override(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_MODEL", "global-model")
+    monkeypatch.delenv("PHARMA_OS_MODEL_REQUEST_UNDERSTANDING", raising=False)
+
+    config = runtime_config_from_env(model_route="request_understanding")
+
+    assert config.model == "global-model"
+    assert config.model_route == "request_understanding"
+
+
+def test_model_route_tier_defaults_apply_without_env(monkeypatch) -> None:
+    for key in (
+        "PHARMA_OS_MODEL",
+        "PHARMA_OS_MODEL_REQUEST_UNDERSTANDING",
+        "PHARMA_OS_MODEL_CONTROL_TOWER",
+        "PHARMA_OS_MODEL_AGENT5_MANAGER",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert runtime_config_from_env(model_route="request_understanding").model == "gpt-5.6-luna"
+    assert runtime_config_from_env(model_route="control_tower").model == "gpt-5.6-terra"
+    assert runtime_config_from_env(model_route="agent5_manager").model == "gpt-5.6-sol"
+
+
+def test_unknown_model_route_falls_back_safely(monkeypatch) -> None:
+    monkeypatch.delenv("PHARMA_OS_MODEL", raising=False)
+
+    config = runtime_config_from_env(model_route="not-a-real-route")
+
+    assert config.model_route == "default"
+    assert config.model == "gpt-5.6-terra"
 
 
 def test_run_structured_agent_offline_validates_output_and_trace() -> None:
@@ -185,6 +235,74 @@ def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> No
     assert result.trace_metadata["fallback"] is True
     assert result.trace_metadata["execution_mode"] == "deterministic_fallback"
     assert result.trace_metadata["error_type"] == "RuntimeError"
+    assert result.trace_metadata["retry_count"] == 0
+
+
+def test_run_structured_llm_call_retries_rate_limit_before_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_RETRIES", "3")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    monkeypatch.delenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", raising=False)
+    monkeypatch.setattr("pharma_os.agent_runtime.time.sleep", lambda _: None)
+    calls = {"count": 0}
+
+    def fail_call(**kwargs):
+        calls["count"] += 1
+        raise TransientRateLimitError("rate limit")
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fail_call)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", model_route="test_route", disabled=False),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+    )
+
+    assert calls["count"] == 3
+    assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["fallback_cause"] == "rate_limit"
+    assert result.trace_metadata["retry_count"] == 2
+    assert result.trace_metadata["retry_exhausted"] is True
+    assert result.trace.model == "test-model"
+    assert result.trace.model_route == "test_route"
+    assert result.trace.retry_count == 2
+    assert result.trace.fallback_cause == "rate_limit"
+
+
+def test_run_structured_llm_call_does_not_retry_non_transient_failure(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_RETRIES", "3")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    calls = {"count": 0}
+
+    def fail_call(**kwargs):
+        calls["count"] += 1
+        raise RuntimeError("schema rejected")
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fail_call)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+    )
+
+    assert calls["count"] == 1
+    assert result.trace_metadata["retry_count"] == 0
 
 
 def test_run_structured_llm_call_can_disable_api_failure_fallback(monkeypatch) -> None:
@@ -273,6 +391,74 @@ def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:
     assert result.trace_metadata["fallback"] is True
     assert result.trace_metadata["execution_mode"] == "deterministic_fallback"
     assert result.trace_metadata["error_type"] == "RuntimeError"
+    assert result.trace_metadata["retry_count"] == 0
+
+
+def test_run_structured_agent_retries_transient_sdk_failure_before_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_RETRIES", "3")
+    monkeypatch.delenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", raising=False)
+    monkeypatch.setattr("pharma_os.agent_runtime.time.sleep", lambda _: None)
+    calls = {"count": 0}
+
+    class FailingRunner:
+        @staticmethod
+        def run_sync(*args, **kwargs):
+            calls["count"] += 1
+            raise TransientRateLimitError("rate limit")
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, FailingRunner, object),
+    )
+
+    result = run_structured_agent(
+        agent=object(),
+        payload={"prompt": "fixture"},
+        output_type=FixtureOutput,
+        agent_name="fixture_agent",
+        run_id="RUN",
+        input_summary="Fixture input.",
+        config=AgentRuntimeConfig(model="test-model", model_route="sdk_route", disabled=False),
+        offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+    )
+
+    assert calls["count"] == 3
+    assert result.trace_metadata["fallback"] is True
+    assert result.trace_metadata["fallback_cause"] == "rate_limit"
+    assert result.trace_metadata["retry_count"] == 2
+    assert result.trace.model_route == "sdk_route"
+
+
+def test_run_structured_agent_raises_after_transient_retries_when_fallbacks_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_RETRIES", "2")
+    monkeypatch.setenv("PHARMA_OS_DISABLE_AGENT_FALLBACKS", "true")
+    monkeypatch.setattr("pharma_os.agent_runtime.time.sleep", lambda _: None)
+    calls = {"count": 0}
+
+    class FailingRunner:
+        @staticmethod
+        def run_sync(*args, **kwargs):
+            calls["count"] += 1
+            raise TransientRateLimitError("rate limit")
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, FailingRunner, object),
+    )
+
+    with pytest.raises(AgentRuntimeError, match="transient error"):
+        run_structured_agent(
+            agent=object(),
+            payload={"prompt": "fixture"},
+            output_type=FixtureOutput,
+            agent_name="fixture_agent",
+            run_id="RUN",
+            input_summary="Fixture input.",
+            config=AgentRuntimeConfig(model="test-model", disabled=False),
+            offline_output={"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7},
+        )
+
+    assert calls["count"] == 2
 
 
 def test_run_structured_agent_can_disable_sdk_failure_fallback(monkeypatch) -> None:

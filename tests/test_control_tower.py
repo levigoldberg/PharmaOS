@@ -7,13 +7,36 @@ from types import SimpleNamespace
 import pharma_os.orchestrator as orchestrator_module
 import pharma_os.control_tower as control_tower_module
 from pharma_os.cli import main
-from pharma_os.agent_runtime import AgentRuntimeConfig
+from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult
+from pharma_os.request_understanding import _request_understanding_error_message
 from pharma_os.control_tower import build_deterministic_execution_plan, run_control_tower_agent, validate_execution_plan
+from pharma_os.html_report import build_run_html
 from pharma_os.request_understanding import RequestUnderstandingError
 from pharma_os.memory import MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.registry import WorkflowRegistry
-from pharma_os.schemas import HumanGate, OrchestrationRequest, RequestUnderstandingOutput, SourceMetadata, WorkflowRun
+from pharma_os.schemas import (
+    AgentRunTrace,
+    HumanGate,
+    OrchestrationRequest,
+    RequestUnderstandingAssumption,
+    RequestUnderstandingOutput,
+    SourceMetadata,
+    WorkflowRun,
+)
+
+
+def _json_payload_from_stdout(stdout: str, *, base_dir: object) -> dict[str, object]:
+    for line in stdout.splitlines():
+        if line.startswith("json: "):
+            path = line.removeprefix("json: ").strip()
+            from pathlib import Path
+
+            json_path = Path(path)
+            if not json_path.is_absolute():
+                json_path = Path(base_dir) / json_path
+            return json.loads(json_path.read_text(encoding="utf-8"))
+    raise AssertionError(f"stdout did not include a json path: {stdout}")
 
 
 def test_control_tower_plans_minimum_clinical_risk_path() -> None:
@@ -312,6 +335,72 @@ def test_plan_validator_rejects_reuse_of_missing_artifact() -> None:
     assert any(result.status == "failed" and "reuse references missing" in result.message for result in results)
 
 
+def test_plan_validator_accepts_referenced_older_compatible_reuse_artifact() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(
+        store,
+        "clinical_outcome_prediction",
+        "NCT12345678",
+        "older-agent3-output",
+        run_id="older-agent3-run",
+    )
+    _save_completed_run(
+        store,
+        "clinical_outcome_prediction",
+        "NCT12345678",
+        "newer-agent3-output",
+        validation_status="needs_human_review",
+        gate_decision="needs_human_review",
+        run_id="newer-agent3-run",
+    )
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Build clinical stage due diligence", nct_id="NCT12345678")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+    reuse_step = next(step for step in plan.steps if step.capability_name == "clinical_outcome_prediction")
+    referenced_reuse_step = reuse_step.model_copy(
+        update={
+            "action": "reuse",
+            "reuse_run_id": "older-agent3-run",
+            "reuse_output_id": "older-agent3-output",
+        }
+    )
+    due_step = next(step for step in plan.steps if step.capability_name == "due_diligence")
+    due_step = due_step.model_copy(update={"depends_on": (referenced_reuse_step.step_id,)})
+    referenced_plan = plan.model_copy(update={"steps": (referenced_reuse_step, due_step)})
+
+    results = validate_execution_plan(run_id="run", plan=referenced_plan, snapshot=snapshot, registry=registry)
+
+    reuse_result = next(result for result in results if result.target_id == referenced_reuse_step.step_id)
+    assert reuse_result.status == "passed"
+
+
+def test_plan_validator_rejects_reuse_with_wrong_output_reference_even_when_run_exists() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(
+        store,
+        "clinical_outcome_prediction",
+        "NCT12345678",
+        "agent3-output",
+        run_id="agent3-run",
+    )
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Assess clinical risk", nct_id="NCT12345678")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+    bad_step = plan.steps[0].model_copy(
+        update={
+            "reuse_run_id": "agent3-run",
+            "reuse_output_id": "wrong-output",
+        }
+    )
+    bad_plan = plan.model_copy(update={"steps": (bad_step,)})
+
+    results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(result.status == "failed" and "reuse references missing" in result.message for result in results)
+
+
 def test_plan_validator_rejects_unjustified_refresh_and_unnecessary_rerun() -> None:
     store = MemoryStore(":memory:")
     _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
@@ -368,6 +457,48 @@ def test_plan_validator_rejects_reuse_that_does_not_satisfy_requirement() -> Non
     results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
 
     assert any(result.status == "failed" and "reuse does not satisfy cited decision evidence requirements" in result.message for result in results)
+
+
+def test_plan_validator_rejects_duplicate_capability_steps() -> None:
+    store = MemoryStore(":memory:")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(objective="Assess clinical risk", nct_id="NCT12345678")
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+    duplicate_step = plan.steps[0].model_copy(
+        update={
+            "step_id": "duplicate-step",
+            "action": "skip",
+            "executable": False,
+            "reason": "Conflicting duplicate step.",
+        }
+    )
+    bad_plan = plan.model_copy(update={"steps": (*plan.steps, duplicate_step)})
+
+    results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(result.status == "failed" and "duplicate capability step" in result.message for result in results)
+
+
+def test_plan_validator_rejects_capability_outside_requested_target_path() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(
+        objective="Assess clinical risk",
+        nct_id="NCT12345678",
+        identifiers={"target_capability": "clinical_outcome_prediction"},
+    )
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    due_request = OrchestrationRequest(objective="Build clinical stage due diligence", nct_id="NCT12345678")
+    due_snapshot = store.build_scientific_state_snapshot(due_request, registry=registry)
+    due_plan = build_deterministic_execution_plan(run_id="run", request=due_request, snapshot=due_snapshot, registry=registry)
+    due_step = next(step for step in due_plan.steps if step.capability_name == "due_diligence")
+    bad_plan = due_plan.model_copy(update={"request": request, "steps": (due_step,)})
+
+    results = validate_execution_plan(run_id="run", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(result.status == "failed" and "outside requested target path" in result.message for result in results)
 
 
 def test_skeleton_requirements_are_present_and_blocked() -> None:
@@ -430,6 +561,108 @@ def test_orchestrate_reuses_existing_artifact_without_rerun(monkeypatch) -> None
     assert record.step_results[0].reused_output_id == "agent3-output"
     assert record.step_results[0].execution_mode == "reused_artifact"
     assert record.execution_mode_summary.reused_artifacts_used == 1
+    assert calls == {}
+
+
+def test_goal_only_execution_intent_refreshes_existing_target_artifact(capsys, tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "memory.sqlite"
+    store = MemoryStore(db_path)
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT04903795", "agent3-output")
+    calls = _install_fake_runners(monkeypatch)
+
+    monkeypatch.setattr(
+        "pharma_os.cli.understand_orchestration_goal",
+        lambda **_: RequestUnderstandingOutput(
+            normalized_objective="Do the clinical trial prediction for NCT04903795",
+            target_capability="clinical_outcome_prediction",
+            decision_type="clinical_risk_assessment",
+            nct_id="NCT04903795",
+            asset_name=None,
+            indication=None,
+            assumptions=(),
+            force_refresh=(),
+            skip_capabilities=(),
+            requested_outputs=("clinical_outcome_prediction_output",),
+            missing_required_fields=(),
+            clarifying_questions=(),
+            confidence=0.95,
+            rationale_summary="Clinical trial prediction request with an NCT ID.",
+        ),
+    )
+
+    exit_code = main(
+        [
+            "orchestrate",
+            "--goal",
+            "Do the clinical trial prediction for NCT04903795",
+            "--db-path",
+            str(db_path),
+            "--output-json",
+            str(tmp_path / "out.json"),
+            "--output-html",
+            str(tmp_path / "out.html"),
+        ]
+    )
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "Orchestration completed" in stdout
+    payload = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert payload["request"]["identifiers"]["execution_intent"] == "run_fresh"
+    assert payload["request"]["force_refresh"] == ["clinical_outcome_prediction"]
+    assert payload["step_results"][0]["capability_name"] == "clinical_outcome_prediction"
+    assert payload["step_results"][0]["status"] == "refreshed"
+    assert calls == {"clinical_outcome_prediction": 1}
+
+
+def test_goal_only_explicit_reuse_intent_keeps_existing_artifact(capsys, tmp_path, monkeypatch) -> None:
+    db_path = tmp_path / "memory.sqlite"
+    store = MemoryStore(db_path)
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT04903795", "agent3-output")
+    calls = _install_fake_runners(monkeypatch)
+
+    monkeypatch.setattr(
+        "pharma_os.cli.understand_orchestration_goal",
+        lambda **_: RequestUnderstandingOutput(
+            normalized_objective="Reuse existing clinical trial prediction for NCT04903795",
+            target_capability="clinical_outcome_prediction",
+            decision_type="clinical_risk_assessment",
+            nct_id="NCT04903795",
+            asset_name=None,
+            indication=None,
+            assumptions=(),
+            force_refresh=(),
+            skip_capabilities=(),
+            requested_outputs=("clinical_outcome_prediction_output",),
+            missing_required_fields=(),
+            clarifying_questions=(),
+            confidence=0.95,
+            rationale_summary="Explicit reuse request with an NCT ID.",
+        ),
+    )
+
+    exit_code = main(
+        [
+            "orchestrate",
+            "--goal",
+            "Reuse existing clinical trial prediction for NCT04903795",
+            "--db-path",
+            str(db_path),
+            "--output-json",
+            str(tmp_path / "out.json"),
+            "--output-html",
+            str(tmp_path / "out.html"),
+        ]
+    )
+
+    assert exit_code == 0
+    stdout = capsys.readouterr().out
+    assert "Orchestration completed" in stdout
+    payload = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
+    assert payload["request"]["identifiers"]["execution_intent"] == "reuse_existing"
+    assert payload["request"]["force_refresh"] == []
+    assert payload["step_results"][0]["status"] == "reused"
+    assert payload["step_results"][0]["reused_output_id"] == "agent3-output"
     assert calls == {}
 
 
@@ -514,6 +747,71 @@ def test_orchestrate_parent_child_audit_provenance(monkeypatch) -> None:
     assert bundle.output_json["step_results"][0]["child_run_id"] == record.child_run_ids[0]
 
 
+def test_orchestrate_records_failed_step_when_ai_plan_retry_still_invalid(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    registry = WorkflowRegistry.default()
+    calls = {"count": 0}
+
+    def invalid_control_tower_agent(*, run_id, request, snapshot, registry=None, config=None, plan_feedback=()):
+        calls["count"] += 1
+        base_plan = build_deterministic_execution_plan(
+            run_id=f"{run_id}-{calls['count']}",
+            request=request,
+            snapshot=snapshot,
+            registry=registry or WorkflowRegistry.default(),
+        )
+        bad_step = base_plan.steps[0].model_copy(
+            update={
+                "action": "reuse",
+                "executable": False,
+                "reuse_run_id": "missing-run",
+                "reuse_output_id": "missing-output",
+                "reason": "Invalid AI reuse plan.",
+            }
+        )
+        bad_plan = base_plan.model_copy(
+            update={
+                "output_id": f"bad-plan-{calls['count']}",
+                "steps": (bad_step,),
+                "provenance": "test.invalid_ai_plan",
+            }
+        )
+        return StructuredAgentResult(
+            output=bad_plan,
+            trace=AgentRunTrace(
+                trace_id=f"trace-{calls['count']}",
+                run_id=run_id,
+                agent_name="ControlTowerAgent",
+                output_id=bad_plan.output_id,
+                output_type="ExecutionPlan",
+                provenance="test",
+                execution_mode="deterministic_fallback",
+            ),
+            trace_metadata={
+                "agent_name": "ControlTowerAgent",
+                "fallback": True,
+                "execution_mode": "deterministic_fallback",
+                "error_type": "RuntimeError",
+                "error": "fixture live planner failure",
+            },
+        )
+
+    monkeypatch.setattr(orchestrator_module, "run_control_tower_agent", invalid_control_tower_agent)
+
+    record = Orchestrator(memory=store, registry=registry).orchestrate(
+        OrchestrationRequest(objective="Assess clinical risk", nct_id="NCT12345678")
+    )
+
+    assert calls["count"] == 2
+    assert record.step_results
+    assert record.step_results[0].capability_name == "control_tower"
+    assert record.step_results[0].status == "failed"
+    assert "plan validation failed" in record.step_results[0].rationale
+    assert record.report is not None
+    assert "ControlTowerAgent used deterministic fallback" in record.report.fallback_summaries[0]
+    assert "fixture live planner failure" in record.report.fallback_summaries[0]
+
+
 def test_orchestrate_no_unnecessary_agent_3_4_5_reruns(monkeypatch) -> None:
     store = MemoryStore(":memory:")
     _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output")
@@ -555,7 +853,32 @@ def test_orchestrate_cli_writes_json_and_html(capsys, tmp_path) -> None:
     assert "control_tower_orchestration" in output_html.read_text(encoding="utf-8")
     assert "Control Tower Orchestration" in output_html.read_text(encoding="utf-8")
     assert "step_results" in output_json.read_text(encoding="utf-8")
-    assert "step_results" in capsys.readouterr().out
+    stdout = capsys.readouterr().out
+    assert "Orchestration completed" in stdout
+    assert "json:" in stdout
+
+
+def test_control_tower_html_starts_with_executive_audit(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    _install_fake_runners(monkeypatch)
+
+    record = Orchestrator(memory=store).orchestrate(
+        OrchestrationRequest(
+            objective="Assess clinical risk",
+            nct_id="NCT12345678",
+            identifiers={"target_capability": "clinical_outcome_prediction", "execution_intent": "run_fresh"},
+            force_refresh=("clinical_outcome_prediction",),
+        )
+    )
+
+    html = build_run_html(record.run_id, memory=store)
+
+    assert "What Happened" in html
+    assert "inferred_capability" in html
+    assert "clinical_outcome_prediction" in html
+    assert "workflow_executed" in html
+    assert "child_run_ids" in html
+    assert "Human Attention Needed" in html
 
 
 def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys, tmp_path, monkeypatch) -> None:
@@ -569,7 +892,14 @@ def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys,
             target_capability="protocol_design",
             decision_type="protocol_design",
             nct_id="NCT04903795",
+            asset_name=None,
+            indication=None,
+            assumptions=(),
+            force_refresh=(),
+            skip_capabilities=(),
             requested_outputs=("json", "html"),
+            missing_required_fields=(),
+            clarifying_questions=(),
             confidence=0.86,
             rationale_summary="Protocol design request anchored to an NCT ID.",
         )
@@ -587,7 +917,9 @@ def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys,
     )
 
     assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    assert "Orchestration completed" in stdout
+    payload = _json_payload_from_stdout(stdout, base_dir=tmp_path)
     assert payload["request"]["nct_id"] == "NCT04903795"
     assert [result["capability_name"] for result in payload["step_results"]] == [
         "clinical_outcome_prediction",
@@ -599,8 +931,25 @@ def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys,
         "due_diligence": 1,
         "protocol_design": 1,
     }
-    assert list((tmp_path / "outputs").glob("control_tower_orchestration_*.json"))
-    assert list((tmp_path / "outputs").glob("control_tower_orchestration_*.html"))
+    exported = payload["exported_files"]
+    parent_json = tmp_path / exported["parent_json"]
+    parent_html = tmp_path / exported["parent_html"]
+    family_dir = parent_json.parent
+    assert parent_json.exists()
+    assert parent_html.exists()
+    assert parent_html.parent == family_dir
+    assert len(exported["child_runs"]) == 3
+    for child in exported["child_runs"]:
+        child_json = tmp_path / child["json"]
+        child_html = tmp_path / child["html"]
+        assert child_json.exists()
+        assert child_html.exists()
+        assert child_json.parent == family_dir
+        assert child_html.parent == family_dir
+    assert list(family_dir.glob("control_tower_orchestration_*.json"))
+    assert list(family_dir.glob("clinical_outcome_prediction_*.json"))
+    assert list(family_dir.glob("due_diligence_*.json"))
+    assert list(family_dir.glob("protocol_design_*.json"))
 
 
 def test_orchestrate_goal_only_ai_unavailable_returns_clear_error(capsys, tmp_path, monkeypatch) -> None:
@@ -623,6 +972,32 @@ def test_orchestrate_goal_only_ai_unavailable_returns_clear_error(capsys, tmp_pa
     assert "Natural-language goal parsing requires live AI" in capsys.readouterr().out
 
 
+def test_request_understanding_error_reports_live_api_failure(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config = AgentRuntimeConfig(model="gpt-test", model_route="request_understanding", disabled=False)
+
+    message = _request_understanding_error_message(RuntimeError("model not found"), config)
+
+    assert "attempted a live OpenAI call but it failed" in message
+    assert "Route=request_understanding" in message
+    assert "model=gpt-test" in message
+    assert "model not found" in message
+
+
+def test_request_understanding_error_reports_key_not_visible(monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = AgentRuntimeConfig(
+        model="gpt-test",
+        model_route="request_understanding",
+        disabled=True,
+        provenance="pharma_os.request_understanding.missing_openai_api_key",
+    )
+
+    message = _request_understanding_error_message(RuntimeError("offline"), config)
+
+    assert "OPENAI_API_KEY is not visible" in message
+
+
 def test_orchestrate_goal_only_blocks_registered_unimplemented_capability(capsys, tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -631,6 +1006,15 @@ def test_orchestrate_goal_only_blocks_registered_unimplemented_capability(capsys
             normalized_objective="Create a manufacturing CMC control plan for this asset",
             target_capability="manufacturing_biofactory",
             decision_type="manufacturing_control",
+            nct_id=None,
+            asset_name=None,
+            indication=None,
+            assumptions=(),
+            force_refresh=(),
+            skip_capabilities=(),
+            requested_outputs=(),
+            missing_required_fields=(),
+            clarifying_questions=(),
             confidence=0.82,
             rationale_summary="Manufacturing request maps to a registered skeleton capability.",
         ),
@@ -647,7 +1031,9 @@ def test_orchestrate_goal_only_blocks_registered_unimplemented_capability(capsys
     )
 
     assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
+    stdout = capsys.readouterr().out
+    assert "Orchestration completed" in stdout
+    payload = _json_payload_from_stdout(stdout, base_dir=tmp_path)
     assert payload["step_results"][0]["capability_name"] == "manufacturing_biofactory"
     assert payload["step_results"][0]["status"] == "blocked"
 
@@ -660,6 +1046,14 @@ def test_ai_extracted_nct_conflict_is_rejected() -> None:
         target_capability="due_diligence",
         decision_type="clinical_stage_due_diligence",
         nct_id="NCT11111111",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=(),
+        clarifying_questions=(),
         confidence=0.9,
         rationale_summary="Diligence request anchored to an NCT ID.",
     )
@@ -681,17 +1075,173 @@ def test_ai_extracted_nct_conflict_is_rejected() -> None:
         raise AssertionError("expected conflicting NCT IDs to fail")
 
 
+def test_ai_assumptions_are_limited_to_workflow_inputs() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Build diligence for NCT11111111",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT11111111",
+        asset_name=None,
+        indication=None,
+        assumptions=(
+            RequestUnderstandingAssumption(key="annual_patients", value="1200"),
+            RequestUnderstandingAssumption(key="workflow_intent", value="The user wants diligence."),
+        ),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=(),
+        clarifying_questions=(),
+        confidence=0.9,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    request = _request_from_understanding(
+        goal="Build diligence for NCT11111111",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.assumptions == {"annual_patients": 1200}
+
+
+def test_optional_commercial_assumption_gap_does_not_block_due_diligence_goal() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Do the commercial due diligence for NCT05966480",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT05966480",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=("reviewed_commercial_assumptions",),
+        clarifying_questions=(
+            "What reviewed commercial assumptions should be used for the due diligence?",
+        ),
+        confidence=0.84,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    request = _request_from_understanding(
+        goal="Do the commercial due diligence for NCT05966480",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.nct_id == "NCT05966480"
+    assert request.identifiers["target_capability"] == "due_diligence"
+    assert request.identifiers["optional_assumption_gaps"] == "reviewed_commercial_assumptions"
+    assert request.identifiers["execution_intent"] == "run_fresh"
+    assert request.force_refresh == ("due_diligence",)
+
+
+def test_optional_commercial_and_identity_question_does_not_block_when_nct_present() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Do the commercial due diligence for NCT05966480",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT05966480",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=("reviewed_commercial_assumptions",),
+        clarifying_questions=(
+            "Do you want to provide any reviewed_commercial_assumptions for this diligence run "
+            "(e.g., discount_rate, development_cost, launch_year, loe_year, annual_patients, "
+            "peak_penetration, gross_to_net, operating_margin, wac_data_path, pos_workbook_path)? "
+            "If not, should the workflow use its default commercial assumptions? Is it acceptable "
+            "to proceed without an explicit asset_name/indication (NCT will be used as the primary identifier)?",
+        ),
+        confidence=0.84,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    request = _request_from_understanding(
+        goal="Do the commercial due diligence for NCT05966480",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.nct_id == "NCT05966480"
+    assert request.identifiers["optional_assumption_gaps"] == "reviewed_commercial_assumptions"
+
+
+def test_missing_nct_still_blocks_due_diligence_goal() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Do the commercial due diligence",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id=None,
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=("reviewed_commercial_assumptions",),
+        clarifying_questions=("What reviewed commercial assumptions should be used?",),
+        confidence=0.84,
+        rationale_summary="Diligence request missing NCT ID.",
+    )
+
+    try:
+        _request_from_understanding(
+            goal="Do the commercial due diligence",
+            parsed=parsed,
+            explicit_nct=None,
+            explicit_asset_name=None,
+            explicit_indication=None,
+            explicit_assumptions={},
+            explicit_force_refresh=(),
+            registry=WorkflowRegistry.default(),
+        )
+    except ValueError as exc:
+        assert "nct_id" in str(exc)
+    else:
+        raise AssertionError("expected missing NCT ID to block")
+
+
 def _save_completed_run(
     store: MemoryStore,
     workflow_name: str,
     nct_id: str,
     output_id: str,
     *,
+    run_id: str | None = None,
     validation_status: str = "passed",
     gate_decision: str | None = None,
     output_payload: dict | None = None,
 ) -> None:
-    run_id = f"{workflow_name}-run"
+    run_id = run_id or f"{workflow_name}-run"
     run = WorkflowRun(
         run_id=run_id,
         workflow_name=workflow_name,

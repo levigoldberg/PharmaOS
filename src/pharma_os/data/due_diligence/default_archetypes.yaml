@@ -18,6 +18,22 @@ archetypes:
   chronic_specialty_prevalence:
     description: Chronic specialty drug market where prevalent patients define the commercial opportunity.
     market_basis: prevalence_stock
+    diagnosed_fraction:
+      low: 0.55
+      base: 0.70
+      high: 0.85
+    treated_fraction:
+      low: 0.45
+      base: 0.60
+      high: 0.75
+    eligibility_fraction:
+      low: 0.25
+      base: 0.40
+      high: 0.55
+    commercially_addressable_fraction:
+      low: 0.50
+      base: 0.65
+      high: 0.80
     peak_penetration:
       low: 0.05
       base: 0.12
@@ -36,6 +52,22 @@ archetypes:
   incidence_flow_specialty:
     description: Specialty drug market where annual incident patients define yearly opportunity.
     market_basis: incidence_flow
+    diagnosed_fraction:
+      low: 0.60
+      base: 0.75
+      high: 0.90
+    treated_fraction:
+      low: 0.45
+      base: 0.60
+      high: 0.75
+    eligibility_fraction:
+      low: 0.30
+      base: 0.45
+      high: 0.60
+    commercially_addressable_fraction:
+      low: 0.50
+      base: 0.65
+      high: 0.80
     peak_penetration:
       low: 0.06
       base: 0.14
@@ -54,6 +86,22 @@ archetypes:
   procedure_flow:
     description: Procedure-linked market where annual procedures or episodes define opportunity.
     market_basis: procedure_flow
+    diagnosed_fraction:
+      low: 0.70
+      base: 0.82
+      high: 0.92
+    treated_fraction:
+      low: 0.50
+      base: 0.65
+      high: 0.80
+    eligibility_fraction:
+      low: 0.35
+      base: 0.50
+      high: 0.65
+    commercially_addressable_fraction:
+      low: 0.55
+      base: 0.70
+      high: 0.85
     peak_penetration:
       low: 0.08
       base: 0.18

@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from pharma_os.agent_runtime import StructuredAgentResult, run_structured_llm_call
+from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, run_structured_llm_call, runtime_config_for_live_agents
 from pharma_os.schemas import HumanReadableFinding, HumanReadableModuleOutput
 
 
@@ -24,6 +24,26 @@ def build_human_readable_module_output(
 
     source_output_id = str(getattr(typed_output, "output_id", f"{module_name}-{run_id}"))
     source_ids = _source_ids(typed_output)
+    existing = getattr(typed_output, "human_readable_summary", None)
+    if isinstance(existing, HumanReadableModuleOutput) and existing.source_output_id == source_output_id:
+        return run_structured_llm_call(
+            agent_name=f"{_module_agent_prefix(module_name)}HumanReadableSummaryAgent",
+            instructions=_instructions(module_display_name),
+            payload={"summary_reuse": True, "source_output_id": source_output_id},
+            output_type=HumanReadableModuleOutput,
+            run_id=run_id,
+            input_summary=f"Reuse existing human-readable structured summary for {module_display_name}.",
+            config=AgentRuntimeConfig(
+                model="deterministic-reuse",
+                model_route="human_summary",
+                disabled=True,
+                provenance="pharma_os.human_readable.reuse_existing_summary",
+            ),
+            offline_output=existing,
+            source_ids=source_ids,
+            confidence=existing.confidence,
+            rationale_summary=f"{module_display_name} human-readable summary already matched this typed output.",
+        )
     fallback = _fallback_summary(
         module_name=module_name,
         module_display_name=module_display_name,
@@ -50,6 +70,10 @@ def build_human_readable_module_output(
         output_type=HumanReadableModuleOutput,
         run_id=run_id,
         input_summary=f"Create a human-readable structured summary for {module_display_name}.",
+        config=runtime_config_for_live_agents(
+            disabled_provenance="pharma_os.human_readable",
+            model_route="human_summary",
+        ),
         offline_output=fallback,
         source_ids=source_ids,
         confidence=fallback.confidence,

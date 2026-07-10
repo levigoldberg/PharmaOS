@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from pydantic import ValidationError
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 from pharma_os.html_report import write_run_html
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
@@ -20,6 +20,20 @@ from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntel
 
 
 NCT_RE = re.compile(r"^NCT\d{8}$", re.IGNORECASE)
+AI_ASSUMPTION_KEYS = frozenset(
+    {
+        "pos_workbook_path",
+        "wac_data_path",
+        "annual_patients",
+        "peak_penetration",
+        "gross_to_net",
+        "operating_margin",
+        "discount_rate",
+        "development_cost",
+        "launch_year",
+        "loe_year",
+    }
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     view_parser = subparsers.add_parser("view", help="Generate a simple HTML run viewer")
     view_parser.add_argument("--run-id", required=True, help="Workflow run id")
     view_parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite Scientific Memory path")
-    view_parser.add_argument("--output-html", required=True, help="HTML output path")
+    view_parser.add_argument("--output-html", help="Optional HTML output path")
 
     return parser
 
@@ -92,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Run the PharmaOS CLI."""
 
-    load_dotenv(dotenv_path=Path(".env"))
+    _load_environment()
     args = build_parser().parse_args(argv)
     try:
         if args.command == "run":
@@ -100,44 +114,84 @@ def main(argv: list[str] | None = None) -> int:
             input_data = _workflow_input(args)
             result = Orchestrator(memory=store).run(args.workflow, input_data)
             payload = result.model_dump_json() if hasattr(result, "model_dump_json") else json.dumps(result)
-            _write_output(args.output_json, payload)
-            if args.output_html:
-                run_id = getattr(result, "run_id", None)
-                if not run_id:
-                    raise ValueError("run output does not include run_id for HTML generation")
-                write_run_html(run_id, args.output_html, memory=store)
-            print(payload)
+            run_id = getattr(result, "run_id", None)
+            if not run_id:
+                raise ValueError("run output does not include run_id for JSON/HTML generation")
+            output_json, output_html = _run_output_paths(
+                run_id=run_id,
+                workflow_name=args.workflow,
+                output_json=args.output_json,
+                output_html=args.output_html,
+            )
+            _write_output(output_json, payload)
+            write_run_html(run_id, output_html, memory=store)
+            print(_run_completion_summary(workflow_name=args.workflow, run_id=run_id, output_json=output_json, output_html=output_html))
             return 0
 
         if args.command == "orchestrate":
             store = MemoryStore(args.db_path)
             request = _orchestration_request(args)
             result = Orchestrator(memory=store).orchestrate(request)
-            payload = result.model_dump_json()
             output_json, output_html = _orchestration_output_paths(args, result.run_id)
+            parent_html_path = write_run_html(result.run_id, output_html, memory=store)
+            child_exports = []
+            family_dir = Path(output_json).parent
+            for child_run_id in result.child_run_ids:
+                child_exports.append(_export_persisted_run(child_run_id, memory=store, output_dir=family_dir))
+            payload_data = result.model_dump(mode="json")
+            payload_data["exported_files"] = _exported_files_manifest(
+                parent_json=output_json,
+                parent_html=str(parent_html_path),
+                child_exports=child_exports,
+            )
+            payload = json.dumps(payload_data, default=str)
             _write_output(output_json, payload)
-            write_run_html(result.run_id, output_html, memory=store)
-            print(payload)
+            print(
+                _orchestration_completion_summary(
+                    run_id=result.run_id,
+                    output_json=output_json,
+                    output_html=str(parent_html_path),
+                    child_exports=child_exports,
+                    step_results=payload_data.get("step_results", []),
+                )
+            )
             return 0
 
         if args.command == "report":
             store = MemoryStore(args.db_path)
             report = build_report(args.run_id, memory=store)
             payload = report.model_dump_json()
-            _write_output(args.output_json, payload)
-            if args.output_html:
-                write_run_html(args.run_id, args.output_html, memory=store)
-            print(payload)
+            output_json, output_html = _report_output_paths(
+                run_id=args.run_id,
+                output_json=args.output_json,
+                output_html=args.output_html,
+            )
+            _write_output(output_json, payload)
+            write_run_html(args.run_id, output_html, memory=store)
+            print(_report_completion_summary(run_id=args.run_id, output_json=output_json, output_html=output_html))
             return 0
         if args.command == "view":
             store = MemoryStore(args.db_path)
-            output_path = write_run_html(args.run_id, args.output_html, memory=store)
-            print(json.dumps({"run_id": args.run_id, "output_html": str(output_path)}))
+            output_html = args.output_html or _default_output_path("run_view", args.run_id, "html")
+            output_path = write_run_html(args.run_id, output_html, memory=store)
+            print(f"View generated\nrun_id: {args.run_id}\nhtml: {output_path}")
             return 0
     except (OSError, RuntimeError, ValueError, ValidationError, RequestUnderstandingError) as exc:
         print(f"error: {exc}")
         return 2
     return 1
+
+
+def _load_environment() -> None:
+    """Load local PharmaOS environment variables for CLI invocations."""
+
+    cwd_env = Path(".env")
+    if cwd_env.exists():
+        load_dotenv(dotenv_path=cwd_env)
+        return
+    discovered = find_dotenv(usecwd=True)
+    if discovered:
+        load_dotenv(dotenv_path=discovered)
 
 
 def _workflow_input(
@@ -303,6 +357,11 @@ def _request_from_understanding(
     if executable_target and not resolved_nct:
         missing = tuple(dict.fromkeys((*missing, "nct_id")))
         questions = tuple(dict.fromkeys((*questions, "Which ClinicalTrials.gov NCT ID should PharmaOS use?")))
+    optional_gaps: tuple[str, ...] = ()
+    if executable_target and resolved_nct:
+        optional_gaps, missing = _split_optional_goal_gaps(missing)
+        if optional_gaps and not missing:
+            questions = tuple(question for question in questions if not _is_optional_goal_question(question))
     if (confidence < 0.6 or missing or questions) and (capability is None or executable_target):
         details = []
         if confidence < 0.6:
@@ -313,8 +372,13 @@ def _request_from_understanding(
             details.append("Clarifying questions: " + " ".join(questions))
         raise ValueError("Cannot safely orchestrate from the goal. " + " ".join(details))
 
+    parsed_assumptions = {
+        item.key: _coerce_assumption_value(item.value)
+        for item in (getattr(parsed, "assumptions", ()) or ())
+        if item.key in AI_ASSUMPTION_KEYS
+    }
     assumptions = {
-        **(getattr(parsed, "assumptions", {}) or {}),
+        **parsed_assumptions,
         **explicit_assumptions,
     }
     identifiers = {
@@ -322,6 +386,8 @@ def _request_from_understanding(
     }
     if target_capability:
         identifiers["target_capability"] = str(target_capability)
+    if optional_gaps:
+        identifiers["optional_assumption_gaps"] = ",".join(optional_gaps)
     skip_capabilities = tuple(getattr(parsed, "skip_capabilities", ()) or ())
     if skip_capabilities:
         identifiers["skip_capabilities"] = ",".join(str(item) for item in skip_capabilities)
@@ -330,7 +396,13 @@ def _request_from_understanding(
         identifiers["requested_outputs"] = ",".join(str(item) for item in requested_outputs)
 
     parsed_force_refresh = tuple(str(item) for item in (getattr(parsed, "force_refresh", ()) or ()))
+    execution_intent = "reuse_existing" if _goal_requests_reuse(goal) else None
+    if executable_target and execution_intent is None and _goal_requests_fresh_execution(goal):
+        execution_intent = "run_fresh"
+        parsed_force_refresh = tuple(dict.fromkeys((*parsed_force_refresh, str(target_capability))))
     normalized_objective = str(getattr(parsed, "normalized_objective", None) or goal)
+    if execution_intent:
+        identifiers["execution_intent"] = execution_intent
     return OrchestrationRequest(
         objective=normalized_objective,
         nct_id=resolved_nct,
@@ -352,10 +424,250 @@ def _normalize_nct(value: str | None, *, field_name: str) -> str | None:
     return normalized
 
 
+def _goal_requests_fresh_execution(goal: str) -> bool:
+    return bool(re.search(r"\b(do|run|draft|build|generate|create)\b", goal, flags=re.IGNORECASE))
+
+
+OPTIONAL_GOAL_FIELDS = {
+    "reviewed_commercial_assumptions",
+    "commercial_assumptions",
+    "annual_patients",
+    "peak_penetration",
+    "gross_to_net",
+    "operating_margin",
+    "discount_rate",
+    "development_cost",
+    "launch_year",
+    "loe_year",
+    "asset_name",
+    "asset",
+    "indication",
+}
+
+
+def _split_optional_goal_gaps(missing: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    optional = []
+    required = []
+    for field in missing:
+        normalized = field.strip().casefold()
+        if normalized in OPTIONAL_GOAL_FIELDS:
+            optional.append(field)
+        else:
+            required.append(field)
+    return tuple(dict.fromkeys(optional)), tuple(dict.fromkeys(required))
+
+
+def _is_optional_goal_question(question: str) -> bool:
+    text = question.casefold()
+    return any(
+        term in text
+        for term in (
+            "reviewed_commercial_assumptions",
+            "commercial_assumptions",
+            "commercial assumption",
+            "reviewed assumption",
+            "default commercial assumption",
+            "operating margin",
+            "operating_margin",
+            "discount rate",
+            "discount_rate",
+            "development cost",
+            "development_cost",
+            "launch year",
+            "launch_year",
+            "loe year",
+            "loe_year",
+            "annual patients",
+            "annual_patients",
+            "peak penetration",
+            "peak_penetration",
+            "gross-to-net",
+            "gross_to_net",
+            "wac_data_path",
+            "pos_workbook_path",
+            "asset_name",
+            "asset name",
+            "explicit asset",
+            "indication",
+            "primary identifier",
+            "nct will be used",
+        )
+    )
+
+
+def _goal_requests_reuse(goal: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(reuse|use existing|existing artifact|from memory|do not rerun|don't rerun|without rerun)\b",
+            goal,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _coerce_assumption_value(value: str) -> object:
+    text = value.strip()
+    lowered = text.casefold()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
 def _orchestration_output_paths(args: argparse.Namespace, run_id: str) -> tuple[str, str]:
-    output_json = args.output_json or str(Path("outputs") / f"control_tower_orchestration_{run_id}.json")
-    output_html = args.output_html or str(Path("outputs") / f"control_tower_orchestration_{run_id}.html")
+    family_dir = _default_output_dir("control_tower_orchestration", run_id)
+    stem = f"control_tower_orchestration_{_safe_output_part(run_id)}"
+    if args.output_json and not args.output_html:
+        family_dir = Path(args.output_json).parent
+    if args.output_html and not args.output_json:
+        family_dir = Path(args.output_html).parent
+    output_json = args.output_json or str(family_dir / f"{stem}.json")
+    output_html = args.output_html or str(family_dir / f"{stem}.html")
     return output_json, output_html
+
+
+def _run_output_paths(
+    *,
+    run_id: str,
+    workflow_name: str,
+    output_json: str | None,
+    output_html: str | None,
+) -> tuple[str, str]:
+    return (
+        output_json or _default_output_path(workflow_name, run_id, "json"),
+        output_html or _default_output_path(workflow_name, run_id, "html"),
+    )
+
+
+def _report_output_paths(
+    *,
+    run_id: str,
+    output_json: str | None,
+    output_html: str | None,
+) -> tuple[str, str]:
+    return (
+        output_json or _default_output_path("report", run_id, "json"),
+        output_html or _default_output_path("report", run_id, "html"),
+    )
+
+
+def _default_output_path(prefix: str, run_id: str, suffix: str) -> str:
+    stem = f"{_safe_output_part(prefix)}_{_safe_output_part(run_id)}"
+    return str(_default_output_dir(prefix, run_id) / f"{stem}.{suffix}")
+
+
+def _default_output_dir(prefix: str, run_id: str) -> Path:
+    return Path("outputs") / f"{_safe_output_part(prefix)}_{_safe_output_part(run_id)}"
+
+
+def _safe_output_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "run"
+
+
+def _export_persisted_run(run_id: str, *, memory: MemoryStore, output_dir: Path | None = None) -> dict[str, str]:
+    bundle = memory.get_run_bundle(run_id)
+    if bundle.run is None:
+        raise ValueError(f"Cannot export missing run {run_id}")
+    stem = f"{_safe_output_part(bundle.run.workflow_name)}_{_safe_output_part(run_id)}"
+    if output_dir is not None:
+        output_json = str(output_dir / f"{stem}.json")
+        output_html = str(output_dir / f"{stem}.html")
+    else:
+        output_json, output_html = _run_output_paths(
+            run_id=run_id,
+            workflow_name=bundle.run.workflow_name,
+            output_json=None,
+            output_html=None,
+        )
+    _write_output(output_json, json.dumps(bundle.output_json or {}, default=str))
+    write_run_html(run_id, output_html, memory=memory)
+    return {
+        "run_id": run_id,
+        "workflow_name": bundle.run.workflow_name,
+        "json": output_json,
+        "html": output_html,
+    }
+
+
+def _exported_files_manifest(
+    *,
+    parent_json: str,
+    parent_html: str,
+    child_exports: list[dict[str, str]],
+) -> dict[str, object]:
+    return {
+        "parent_json": parent_json,
+        "parent_html": parent_html,
+        "child_runs": child_exports,
+    }
+
+
+def _run_completion_summary(*, workflow_name: str, run_id: str, output_json: str, output_html: str) -> str:
+    return "\n".join(
+        (
+            "Run completed",
+            f"workflow: {workflow_name}",
+            f"run_id: {run_id}",
+            f"json: {output_json}",
+            f"html: {output_html}",
+        )
+    )
+
+
+def _orchestration_completion_summary(
+    *,
+    run_id: str,
+    output_json: str,
+    output_html: str,
+    child_exports: list[dict[str, str]],
+    step_results: object,
+) -> str:
+    steps = step_results if isinstance(step_results, list) else []
+    executed = [
+        str(step.get("capability_name"))
+        for step in steps
+        if isinstance(step, dict) and step.get("status") in {"executed", "refreshed"}
+    ]
+    reused = [
+        str(step.get("capability_name"))
+        for step in steps
+        if isinstance(step, dict) and step.get("status") == "reused"
+    ]
+    blocked_or_failed = [
+        f"{step.get('capability_name')}:{step.get('status')}"
+        for step in steps
+        if isinstance(step, dict) and step.get("status") in {"blocked", "failed"}
+    ]
+    lines = [
+        "Orchestration completed",
+        f"run_id: {run_id}",
+        f"steps: {len(steps)}",
+        f"executed: {', '.join(executed) if executed else 'none'}",
+        f"reused: {', '.join(reused) if reused else 'none'}",
+    ]
+    if blocked_or_failed:
+        lines.append(f"attention: {', '.join(blocked_or_failed)}")
+    if child_exports:
+        lines.append(f"child_runs: {len(child_exports)}")
+    lines.extend((f"json: {output_json}", f"html: {output_html}"))
+    return "\n".join(lines)
+
+
+def _report_completion_summary(*, run_id: str, output_json: str, output_html: str) -> str:
+    return "\n".join(
+        (
+            "Report generated",
+            f"run_id: {run_id}",
+            f"json: {output_json}",
+            f"html: {output_html}",
+        )
+    )
 
 
 def _write_output(path: str | None, payload: str) -> None:

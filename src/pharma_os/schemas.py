@@ -8,7 +8,7 @@ confidence, validation, or human-gate fields.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
@@ -401,21 +401,28 @@ class OrchestrationRequest(StrictSchema):
     decision_type: DecisionType | None = None
 
 
+class RequestUnderstandingAssumption(StrictSchema):
+    """One assumption extracted from a natural-language orchestration goal."""
+
+    key: str = Field(..., min_length=1)
+    value: str = Field(..., min_length=1)
+
+
 class RequestUnderstandingOutput(StrictSchema):
     """Structured parse of a natural-language orchestration goal."""
 
     normalized_objective: str = Field(..., min_length=1)
-    target_capability: str | None = None
-    decision_type: DecisionType = "unknown"
-    nct_id: str | None = None
-    asset_name: str | None = None
-    indication: str | None = None
-    assumptions: dict[str, MetadataValue] = Field(default_factory=dict)
-    force_refresh: tuple[str, ...] = Field(default_factory=tuple)
-    skip_capabilities: tuple[str, ...] = Field(default_factory=tuple)
-    requested_outputs: tuple[str, ...] = Field(default_factory=tuple)
-    missing_required_fields: tuple[str, ...] = Field(default_factory=tuple)
-    clarifying_questions: tuple[str, ...] = Field(default_factory=tuple)
+    target_capability: str | None
+    decision_type: DecisionType
+    nct_id: str | None
+    asset_name: str | None
+    indication: str | None
+    assumptions: tuple[RequestUnderstandingAssumption, ...]
+    force_refresh: tuple[str, ...]
+    skip_capabilities: tuple[str, ...]
+    requested_outputs: tuple[str, ...]
+    missing_required_fields: tuple[str, ...]
+    clarifying_questions: tuple[str, ...]
     confidence: float = Field(..., ge=0.0, le=1.0)
     rationale_summary: str = Field(..., min_length=1)
 
@@ -578,6 +585,7 @@ class ControlTowerReport(StrictSchema):
     unresolved_gates: tuple[str, ...] = Field(default_factory=tuple)
     unavailable_modules: tuple[str, ...] = Field(default_factory=tuple)
     replan_summaries: tuple[str, ...] = Field(default_factory=tuple)
+    fallback_summaries: tuple[str, ...] = Field(default_factory=tuple)
     execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
 
 
@@ -973,6 +981,149 @@ class RevenueForecastYear(StrictSchema):
     net_revenue: float
 
 
+CaseName = Literal["downside", "base", "upside"]
+MarketBasis = Literal[
+    "prevalence_stock",
+    "incidence_flow",
+    "procedure_flow",
+    "hybrid_prevalent_plus_incident",
+]
+AssumptionSourceType = Literal[
+    "source_derived",
+    "model_inferred",
+    "default_assumption",
+    "user_override",
+    "fallback",
+    "missing",
+]
+
+
+class ValueTriplet(StrictSchema):
+    """Low/base/high numeric assumption values."""
+
+    low: float | None = None
+    base: float | None = None
+    high: float | None = None
+
+
+class CommercialAssumptionTriplet(StrictSchema):
+    """AI-selected or defaulted market-sizing fraction with provenance."""
+
+    low: float | None = None
+    base: float | None = None
+    high: float | None = None
+    source_type: AssumptionSourceType
+    rationale: str = Field(..., min_length=1)
+    evidence_reference: str | None = None
+    confidence_score: int = Field(default=0, ge=0, le=10)
+    human_review_required: bool = True
+
+
+class SelectedPopulationMeasure(StrictSchema):
+    """Selected population denominator for commercial market sizing."""
+
+    value: float | None = None
+    unit: str | None = None
+    measure_type: str | None = None
+    condition: str | None = None
+    geography: str | None = None
+    source_type: AssumptionSourceType
+    rationale: str = Field(..., min_length=1)
+    evidence_reference: str | None = None
+    confidence_score: int = Field(default=0, ge=0, le=10)
+    human_review_required: bool = True
+
+
+class MarketSizingInterpretation(StrictSchema):
+    """Structured Agent 4 market-sizing interpretation for deterministic calculation."""
+
+    calculable: bool
+    selected_market_archetype: str | None = None
+    market_basis: MarketBasis | None = None
+    selected_population_measure: SelectedPopulationMeasure
+    yearly_eligible_patient_logic: str = Field(..., min_length=1)
+    diagnosed_fraction: CommercialAssumptionTriplet
+    treated_fraction: CommercialAssumptionTriplet
+    eligibility_fraction: CommercialAssumptionTriplet
+    commercially_addressable_fraction: CommercialAssumptionTriplet
+    rationale: str = Field(..., min_length=1)
+    confidence_score: int = Field(default=0, ge=0, le=10)
+    key_evidence_used: tuple[str, ...] = Field(default_factory=tuple)
+    assumption_flags: tuple[str, ...] = Field(default_factory=tuple)
+    human_review_flags: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class CommercialInputBundle(StrictSchema):
+    """Compact evidence bundle supplied to the market-sizing interpretation agent."""
+
+    asset_summary: dict[str, Any] = Field(default_factory=dict)
+    disease_population_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    prevalence_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    incidence_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    segmentation_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    trial_eligibility_criteria: dict[str, Any] = Field(default_factory=dict)
+    pricing_benchmark: dict[str, Any] = Field(default_factory=dict)
+    missing_inputs: tuple[str, ...] = Field(default_factory=tuple)
+    user_overrides: dict[str, Any] = Field(default_factory=dict)
+    predefined_archetype_assumptions: dict[str, Any] = Field(default_factory=dict)
+
+
+class PatientFunnel(StrictSchema):
+    """Base-case patient funnel used by commercial model calculations."""
+
+    starting_population: float
+    diagnosed_patients: float
+    treated_or_managed_patients: float
+    eligible_patients: float
+    commercially_addressable_patients: float
+    diagnosed_fraction: float
+    treated_fraction: float
+    eligibility_fraction: float
+    commercially_addressable_fraction: float
+
+
+class CommercialPricingCase(StrictSchema):
+    """Pricing assumptions for one commercial case."""
+
+    annual_gross_wac: float
+    gross_to_net: float
+    net_price: float
+
+
+class CommercialPenetrationCase(StrictSchema):
+    """Penetration assumptions for one commercial case."""
+
+    peak_penetration: float
+    launch_ramp: tuple[float, ...] = Field(default_factory=tuple)
+
+
+class CommercialCaseOutput(StrictSchema):
+    """One downside/base/upside commercial forecast case."""
+
+    patient_funnel: PatientFunnel
+    pricing: CommercialPricingCase
+    penetration: CommercialPenetrationCase
+    revenue_forecast: tuple[RevenueForecastYear, ...] = Field(default_factory=tuple)
+    peak_gross_sales: float
+    peak_net_sales: float
+
+
+class CommercialAssumptionLedgerRecord(StrictSchema):
+    """Human-reviewable assumption ledger entry for Agent 4 commercial sizing."""
+
+    assumption_name: str = Field(..., min_length=1)
+    value: Any = None
+    low: float | None = None
+    base: float | None = None
+    high: float | None = None
+    unit: str | None = None
+    source_type: AssumptionSourceType
+    rationale: str = Field(..., min_length=1)
+    evidence_reference: str | None = None
+    confidence_score: int = Field(default=0, ge=0, le=10)
+    human_review_required: bool = True
+
+
 class CommercialModelOutput(StrictSchema):
     """Deterministic commercial model section."""
 
@@ -983,6 +1134,15 @@ class CommercialModelOutput(StrictSchema):
     net_price: float | None = None
     peak_net_sales: float | None = None
     revenue_forecast: tuple[RevenueForecastYear, ...] = Field(default_factory=tuple)
+    selected_market_archetype: str | None = None
+    market_basis: MarketBasis | None = None
+    selected_population_measure: SelectedPopulationMeasure | None = None
+    patient_funnel: PatientFunnel | None = None
+    cases: dict[CaseName, CommercialCaseOutput] = Field(default_factory=dict)
+    assumption_ledger: tuple[CommercialAssumptionLedgerRecord, ...] = Field(default_factory=tuple)
+    commercial_input_bundle_summary: dict[str, Any] = Field(default_factory=dict)
+    confidence_flags: tuple[str, ...] = Field(default_factory=tuple)
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
     assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
@@ -1523,6 +1683,13 @@ class AgentRunTrace(StrictSchema):
     completed_at: datetime | None = None
     provenance: str = Field(..., min_length=1)
     execution_mode: ExecutionMode = "deterministic_fallback"
+    model: str | None = None
+    model_route: str | None = None
+    retry_count: int = Field(default=0, ge=0)
+    retry_attempts: int = Field(default=1, ge=1)
+    retry_exhausted: bool = False
+    fallback_cause: str | None = None
+    final_retry_reason: str | None = None
 
 
 class OrchestrationRunRecord(StrictSchema):
