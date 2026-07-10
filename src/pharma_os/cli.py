@@ -329,7 +329,7 @@ def _orchestration_request(args: argparse.Namespace) -> OrchestrationRequest:
 
 
 def _requires_ai_request_understanding(args: argparse.Namespace) -> bool:
-    return not any((args.nct_id, args.asset_name, args.indication))
+    return bool(args.goal)
 
 
 def _request_from_understanding(
@@ -360,8 +360,7 @@ def _request_from_understanding(
     optional_gaps: tuple[str, ...] = ()
     if executable_target and resolved_nct:
         optional_gaps, missing = _split_optional_goal_gaps(missing)
-        if optional_gaps and not missing:
-            questions = tuple(question for question in questions if not _is_optional_goal_question(question))
+        questions = ()
     if (confidence < 0.6 or missing or questions) and (capability is None or executable_target):
         details = []
         if confidence < 0.6:
@@ -396,13 +395,12 @@ def _request_from_understanding(
         identifiers["requested_outputs"] = ",".join(str(item) for item in requested_outputs)
 
     parsed_force_refresh = tuple(str(item) for item in (getattr(parsed, "force_refresh", ()) or ()))
-    execution_intent = "reuse_existing" if _goal_requests_reuse(goal) else None
-    if executable_target and execution_intent is None and _goal_requests_fresh_execution(goal):
-        execution_intent = "run_fresh"
-        parsed_force_refresh = tuple(dict.fromkeys((*parsed_force_refresh, str(target_capability))))
+    execution_scope = str(getattr(parsed, "execution_scope", "unspecified") or "unspecified")
+    if execution_scope != "unspecified":
+        identifiers["execution_scope"] = execution_scope
+    if explicit_force_refresh or parsed_force_refresh:
+        identifiers["execution_intent"] = "run_fresh"
     normalized_objective = str(getattr(parsed, "normalized_objective", None) or goal)
-    if execution_intent:
-        identifiers["execution_intent"] = execution_intent
     return OrchestrationRequest(
         objective=normalized_objective,
         nct_id=resolved_nct,
@@ -422,10 +420,6 @@ def _normalize_nct(value: str | None, *, field_name: str) -> str | None:
     if not NCT_RE.match(normalized):
         raise ValueError(f"{field_name} must be a valid ClinicalTrials.gov identifier like NCT12345678.")
     return normalized
-
-
-def _goal_requests_fresh_execution(goal: str) -> bool:
-    return bool(re.search(r"\b(do|run|draft|build|generate|create)\b", goal, flags=re.IGNORECASE))
 
 
 OPTIONAL_GOAL_FIELDS = {
@@ -455,54 +449,6 @@ def _split_optional_goal_gaps(missing: tuple[str, ...]) -> tuple[tuple[str, ...]
         else:
             required.append(field)
     return tuple(dict.fromkeys(optional)), tuple(dict.fromkeys(required))
-
-
-def _is_optional_goal_question(question: str) -> bool:
-    text = question.casefold()
-    return any(
-        term in text
-        for term in (
-            "reviewed_commercial_assumptions",
-            "commercial_assumptions",
-            "commercial assumption",
-            "reviewed assumption",
-            "default commercial assumption",
-            "operating margin",
-            "operating_margin",
-            "discount rate",
-            "discount_rate",
-            "development cost",
-            "development_cost",
-            "launch year",
-            "launch_year",
-            "loe year",
-            "loe_year",
-            "annual patients",
-            "annual_patients",
-            "peak penetration",
-            "peak_penetration",
-            "gross-to-net",
-            "gross_to_net",
-            "wac_data_path",
-            "pos_workbook_path",
-            "asset_name",
-            "asset name",
-            "explicit asset",
-            "indication",
-            "primary identifier",
-            "nct will be used",
-        )
-    )
-
-
-def _goal_requests_reuse(goal: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(reuse|use existing|existing artifact|from memory|do not rerun|don't rerun|without rerun)\b",
-            goal,
-            flags=re.IGNORECASE,
-        )
-    )
 
 
 def _coerce_assumption_value(value: str) -> object:

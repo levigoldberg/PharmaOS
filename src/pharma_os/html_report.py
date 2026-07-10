@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from pharma_os.due_diligence_report import build_due_diligence_report_payload
 from pharma_os.memory import MemoryStore
 
 
@@ -536,6 +537,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
     patent = _dict(output.get("patent_loe_review"))
     red_flags = _list(output.get("red_flags"))
     missing_flags = _list(output.get("missing_data_flags"))
+    investment = _dict(output.get("investment_report")) or build_due_diligence_report_payload(output)
 
     title = memo.get("title") or f"Clinical-Stage Due Diligence Memo: {_display(asset.get('asset_name') or target.get('nct_id'))}"
     review_points = [item.get("reason") for item in red_flags[:6] if isinstance(item, dict)]
@@ -564,6 +566,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
                     ("Confidence", _percent(output.get("confidence")), "Workflow-level confidence before human review."),
                 ]
             ),
+            _section("Panoptic-Style Investment Snapshot", _investment_snapshot_section(investment)),
             _section(
                 "Investment Snapshot",
                 _two_col(
@@ -594,10 +597,12 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
             ),
             _section("Pricing Source Logic", _pricing_section(pricing)),
             _section("Deterministic Commercial Calculations", _commercial_section(commercial)),
+            _section("Market Conversion Assumptions", _dict_table(_list(investment.get("market_conversion_assumptions")), ("conversion", "step", "base_fraction", "resulting_patients", "source", "human_review_required"))),
             _section("Deterministic rNPV Calculation", _rnpv_section(rnpv, commercial)),
+            _section("Sensitivity Summary", _dict_table(_list(investment.get("sensitivity_summary")), ("variable", "low_input", "low_case_rnpv", "base_case_rnpv", "high_input", "high_case_rnpv"))),
             _section(
                 "Forecast Charts",
-                _charts_section(commercial, rnpv),
+                _chart_specs_section(_list(investment.get("chart_specs"))) or _charts_section(commercial, rnpv),
             ),
             _section(
                 "Human Review Surface",
@@ -887,6 +892,287 @@ def _charts_section(commercial: dict[str, Any], rnpv: dict[str, Any]) -> str:
     if not rows:
         return "<p class='muted'>No commercial forecast was available for charts.</p>"
     return _two_col(_revenue_svg(rows), _rnpv_bar_svg(rnpv, commercial))
+
+
+def _investment_snapshot_section(investment: dict[str, Any]) -> str:
+    snapshot = _dict(investment.get("investment_snapshot"))
+    flags = _list(investment.get("top_confidence_flags"))
+    return _two_col(
+        _kv_table(snapshot),
+        _cards(
+            [
+                (
+                    "Top Confidence Flags",
+                    _bullets(
+                        [
+                            f"{item.get('severity')}: {item.get('message')}"
+                            for item in flags
+                            if isinstance(item, dict)
+                        ]
+                        or ["None emitted."]
+                    ),
+                )
+            ]
+        ),
+    )
+
+
+def _chart_specs_section(charts: list[Any]) -> str:
+    if not charts:
+        return ""
+    blocks = []
+    for chart in charts:
+        if not isinstance(chart, dict):
+            continue
+        blocks.append(
+            "<div class='chart-spec'>"
+            f"<h3>{escape(_display(chart.get('title')))}</h3>"
+            f"{_render_investment_chart(chart)}"
+            f"<p>{escape(_display(chart.get('notes')))}</p>"
+            "</div>"
+        )
+    return "".join(blocks)
+
+
+def _render_investment_chart(chart: dict[str, Any]) -> str:
+    chart_id = chart.get("chart_id")
+    if chart_id == "revenue_forecast":
+        return _investment_revenue_line_chart(chart)
+    if chart_id == "patient_funnel":
+        return _investment_patient_funnel_chart(chart)
+    if chart_id == "rnpv_sensitivity":
+        return _investment_rnpv_tornado_chart(chart)
+    return _investment_bar_chart(chart)
+
+
+def _investment_revenue_line_chart(chart: dict[str, Any]) -> str:
+    data = _list(chart.get("data"))
+    series = (
+        ("revenue", "Revenue", "#2563eb"),
+        ("risk_adjusted_revenue", "Risk-adjusted", "#c2410c"),
+    )
+    values = [
+        value
+        for row in data
+        for key, _, _ in series
+        if isinstance(row, dict) and (value := _float(row.get(key))) is not None
+    ]
+    if not values:
+        return "<p class='muted'>Not available.</p>"
+    width, height = 820, 340
+    left, right, top, bottom = 78, 28, 30, 58
+    plot_w, plot_h = width - left - right, height - top - bottom
+    max_value = _nice_max(max(values))
+    steps = max(1, len(data) - 1)
+    grid = []
+    for index in range(5):
+        value = max_value * index / 4
+        y = top + plot_h - (value / max_value) * plot_h
+        grid.append(
+            f"<line class='grid' x1='{left}' y1='{y:.1f}' x2='{left + plot_w}' y2='{y:.1f}' />"
+            f"<text class='axis' x='{left - 12}' y='{y + 4:.1f}' text-anchor='end'>{escape(_money_m(value))}</text>"
+        )
+    x_labels = []
+    for index, row in enumerate(data):
+        if not isinstance(row, dict):
+            continue
+        x = left + (index / steps) * plot_w
+        x_labels.append(f"<text class='axis' x='{x:.1f}' y='{height - 22}' text-anchor='middle'>{escape(_forecast_year_label(row))}</text>")
+    paths = []
+    final_labels = []
+    legends = []
+    for key, label, color in series:
+        coords = []
+        last_coord = None
+        last_value = None
+        for index, row in enumerate(data):
+            if not isinstance(row, dict):
+                continue
+            value = _float(row.get(key))
+            if value is None:
+                continue
+            x = left + (index / steps) * plot_w
+            y = top + plot_h - (value / max_value) * plot_h
+            coords.append(f"{x:.1f},{y:.1f}")
+            last_coord = (x, y)
+            last_value = value
+        if coords:
+            paths.append(f"<polyline class='revenue-line' fill='none' stroke='{color}' points='{' '.join(coords)}' />")
+            for coord in coords:
+                x, y = coord.split(",")
+                paths.append(f"<circle cx='{x}' cy='{y}' r='3.5' fill='{color}' />")
+            legends.append(f"<span><i style='background:{color}'></i>{escape(label)}</span>")
+        if last_coord and last_value is not None:
+            final_labels.append(
+                f"<text class='data-label' x='{last_coord[0] - 8:.1f}' y='{last_coord[1] - 8:.1f}' text-anchor='end'>{escape(label)}: {escape(_money_m(last_value))}</text>"
+            )
+    return (
+        "<div class='chart-wrap'>"
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{escape(_display(chart.get('title')))}'>"
+        + "".join(grid)
+        + f"<line class='axis-line' x1='{left}' y1='{top + plot_h}' x2='{left + plot_w}' y2='{top + plot_h}' />"
+        + f"<line class='axis-line' x1='{left}' y1='{top}' x2='{left}' y2='{top + plot_h}' />"
+        + "".join(paths)
+        + "".join(final_labels)
+        + "".join(x_labels)
+        + "</svg>"
+        f"<div class='legend'>{''.join(legends)}</div>"
+        "</div>"
+    )
+
+
+def _investment_patient_funnel_chart(chart: dict[str, Any]) -> str:
+    data = _list(chart.get("data"))
+    values = [_float(row.get("patients")) for row in data if isinstance(row, dict)]
+    values = [value for value in values if value is not None]
+    if not values:
+        return "<p class='muted'>Not available.</p>"
+    width = 820
+    row_h = 48
+    top = 28
+    left = 210
+    right = 150
+    height = top + row_h * len(data) + 30
+    plot_w = width - left - right
+    max_value = max(values) or 1.0
+    rows = []
+    for index, row in enumerate(data):
+        if not isinstance(row, dict):
+            continue
+        value = _float(row.get("patients"))
+        if value is None:
+            continue
+        y = top + index * row_h
+        bar_w = max(3, (value / max_value) * plot_w)
+        conversion = _float(row.get("conversion_from_prior"))
+        conversion_text = "" if conversion is None else f"{conversion:.0%} from prior"
+        rows.append(f"<text class='funnel-label' x='{left - 12}' y='{y + 25}' text-anchor='end'>{escape(_display(row.get('population_step')))}</text>")
+        rows.append(f"<rect class='funnel-bar' x='{left}' y='{y}' width='{bar_w:.1f}' height='30' rx='8' />")
+        rows.append(f"<text class='data-label' x='{left + bar_w + 10:.1f}' y='{y + 20}'>{escape(_patients(value))}</text>")
+        if conversion_text:
+            rows.append(f"<text class='axis' x='{left + bar_w + 10:.1f}' y='{y + 37}'>{escape(conversion_text)}</text>")
+    return (
+        "<div class='chart-wrap'>"
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{escape(_display(chart.get('title')))}'>"
+        + "".join(rows)
+        + "</svg>"
+        "</div>"
+    )
+
+
+def _investment_rnpv_tornado_chart(chart: dict[str, Any]) -> str:
+    rows = []
+    for row in _list(chart.get("data")):
+        if not isinstance(row, dict):
+            continue
+        low = _float(row.get("low_case_rnpv"))
+        base = _float(row.get("base_case_rnpv"))
+        high = _float(row.get("high_case_rnpv"))
+        if low is None or base is None or high is None:
+            continue
+        rows.append(
+            {
+                "variable": row.get("variable"),
+                "low": low,
+                "base": base,
+                "high": high,
+                "swing": max(abs(low - base), abs(high - base)),
+            }
+        )
+    if not rows:
+        return "<p class='muted'>Not available.</p>"
+    rows.sort(key=lambda row: row["swing"], reverse=True)
+    base_value = rows[0]["base"]
+    min_value = min(min(row["low"], row["high"], row["base"]) for row in rows)
+    max_value = max(max(row["low"], row["high"], row["base"]) for row in rows)
+    if min_value == max_value:
+        min_value -= 1
+        max_value += 1
+    width = 820
+    row_h = 52
+    top = 42
+    left = 190
+    right = 82
+    height = top + row_h * len(rows) + 42
+    plot_w = width - left - right
+
+    def x_for(value: float) -> float:
+        return left + ((value - min_value) / (max_value - min_value)) * plot_w
+
+    base_x = x_for(base_value)
+    svg_rows = [
+        f"<line class='grid emphasis' x1='{base_x:.1f}' y1='{top - 18}' x2='{base_x:.1f}' y2='{height - 34}' />",
+        f"<text class='axis' x='{base_x:.1f}' y='{top - 24}' text-anchor='middle'>Base {escape(_money_m(base_value))}</text>",
+    ]
+    for index, row in enumerate(rows):
+        y = top + index * row_h
+        low_x = x_for(row["low"])
+        high_x = x_for(row["high"])
+        low_left = min(low_x, base_x)
+        high_left = min(high_x, base_x)
+        low_class = "tornado-better" if row["low"] > row["base"] else "tornado-worse"
+        high_class = "tornado-better" if row["high"] > row["base"] else "tornado-worse"
+        svg_rows.append(f"<text class='funnel-label' x='{left - 14}' y='{y + 23}' text-anchor='end'>{escape(_display(row.get('variable')))}</text>")
+        svg_rows.append(f"<rect class='{low_class}' x='{low_left:.1f}' y='{y}' width='{abs(base_x - low_x):.1f}' height='20' rx='5' />")
+        svg_rows.append(f"<rect class='{high_class}' x='{high_left:.1f}' y='{y + 22}' width='{abs(high_x - base_x):.1f}' height='20' rx='5' />")
+        svg_rows.append(f"<text class='axis' x='{low_x:.1f}' y='{y - 4}' text-anchor='middle'>Low {escape(_money_m(row['low']))}</text>")
+        svg_rows.append(f"<text class='axis' x='{high_x:.1f}' y='{y + 56}' text-anchor='middle'>High {escape(_money_m(row['high']))}</text>")
+    return (
+        "<div class='chart-wrap'>"
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{escape(_display(chart.get('title')))}'>"
+        + "".join(svg_rows)
+        + "</svg>"
+        "<div class='legend'><span><i style='background:#dc2626'></i>Worse rNPV outcome</span><span><i style='background:#16a34a'></i>Better rNPV outcome</span></div>"
+        "</div>"
+    )
+
+
+def _investment_bar_chart(chart: dict[str, Any]) -> str:
+    data = _list(chart.get("data"))
+    y_keys = _list(chart.get("y_keys"))
+    values = [
+        value
+        for row in data
+        for key in y_keys
+        if isinstance(row, dict) and (value := _float(row.get(key))) is not None
+    ]
+    if not values:
+        return "<p class='muted'>Not available.</p>"
+    width, height, left, top, bottom = 720, 300, 70, 24, 92
+    plot_w, plot_h = width - left - 24, height - top - bottom
+    max_value = max(abs(value) for value in values) or 1.0
+    group_w = plot_w / max(1, len(data))
+    bar_w = max(8, group_w / max(1, len(y_keys)) * 0.68)
+    colors = ("#1f6f78", "#9a4f18", "#4e5f2f")
+    bars = []
+    labels = []
+    zero_y = top + plot_h if min(values) >= 0 else top + plot_h / 2
+    for group_index, row in enumerate(data):
+        if not isinstance(row, dict):
+            continue
+        group_x = left + group_index * group_w + group_w * 0.15
+        for key_index, key in enumerate(y_keys):
+            value = _float(row.get(key))
+            if value is None:
+                continue
+            x = group_x + key_index * (bar_w + 3)
+            bar_h = min(plot_h, abs(value) / max_value * plot_h)
+            y = zero_y - bar_h if value >= 0 else zero_y
+            bars.append(f"<rect x='{x:.1f}' y='{y:.1f}' width='{bar_w:.1f}' height='{bar_h:.1f}' fill='{colors[key_index % len(colors)]}' />")
+        label = row.get(chart.get("x_key"))
+        labels.append(f"<text x='{left + group_index * group_w + group_w / 2:.1f}' y='252' text-anchor='middle'>{escape(_truncate(str(label), 18))}</text>")
+    legends = "".join(f"<span><i style='background:{colors[index % len(colors)]}'></i>{escape(str(key).replace('_', ' ').title())}</span>" for index, key in enumerate(y_keys))
+    return (
+        "<div class='chart-wrap'>"
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='{escape(_display(chart.get('title')))}'>"
+        f"<line x1='{left}' y1='{zero_y:.1f}' x2='{left + plot_w}' y2='{zero_y:.1f}' />"
+        f"<text x='8' y='28'>{escape(_short_money(max_value))}</text>"
+        + "".join(bars)
+        + "".join(labels)
+        + "</svg>"
+        f"<div class='legend'>{legends}</div>"
+        "</div>"
+    )
 
 
 def _analog_benchmark_section(benchmark: dict[str, Any]) -> str:
@@ -1375,6 +1661,57 @@ def _number(value: Any) -> str:
     return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
+def _money_m(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{sign}${absolute / 1_000_000_000:.1f}B"
+    if absolute >= 1_000_000:
+        return f"{sign}${absolute / 1_000_000:.0f}M"
+    if absolute >= 1_000:
+        return f"{sign}${absolute / 1_000:.0f}K"
+    return f"{sign}${absolute:.0f}"
+
+
+def _short_money(value: float) -> str:
+    absolute = abs(value)
+    if absolute >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:.0f}"
+
+
+def _forecast_year_label(row: dict[str, Any]) -> str:
+    calendar_year = row.get("calendar_year")
+    commercial_year = row.get("year")
+    if calendar_year not in (None, "", "Not available") and commercial_year not in (None, "", "Not available"):
+        return f"{calendar_year} (Y{commercial_year})"
+    if calendar_year not in (None, "", "Not available"):
+        return str(calendar_year)
+    return f"Y{commercial_year}"
+
+
+def _nice_max(value: float) -> float:
+    if value <= 0:
+        return 1.0
+    magnitude = 10 ** (len(str(int(value))) - 1)
+    scaled = value / magnitude
+    if scaled <= 2:
+        nice = 2
+    elif scaled <= 5:
+        nice = 5
+    else:
+        nice = 10
+    return nice * magnitude
+
+
+def _truncate(value: str, length: int) -> str:
+    return value if len(value) <= length else value[: length - 1] + "..."
+
+
 _CSS = """
 :root{color-scheme:light;--ink:#18202a;--muted:#657282;--line:#dce3ea;--soft:#f5f7f9;--panel:#fff;--accent:#0e6f68;--warn:#a94f13}
 *{box-sizing:border-box}
@@ -1413,6 +1750,22 @@ li{margin:4px 0}
 .formula{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#edf6f5;border:1px solid #cfe5e2;border-radius:6px;padding:10px;color:#164a47}
 .sources{font-size:12px;color:var(--muted)}
 .chart{border:1px solid var(--line);border-radius:8px;padding:14px;background:#fbfcfd}
+.chart-spec{border:1px solid var(--line);border-radius:8px;padding:16px;background:#fbfcfd;margin:12px 0}
+.chart-spec p{font-size:12px;color:var(--muted)}
+.chart-wrap svg{width:100%;height:auto;display:block}
+.legend{display:flex;flex-wrap:wrap;gap:14px;margin:8px 0 0;font-size:12px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:10px;height:10px;display:inline-block;border-radius:3px}
+.grid{stroke:#dce3ea;stroke-width:1}
+.grid.emphasis{stroke:#475569;stroke-width:1.2;stroke-dasharray:4 4}
+.axis-line{stroke:#94a3b8;stroke-width:1}
+.axis{fill:#64748b;font-size:11px}
+.data-label{fill:#18202a;font-weight:650;font-size:11px}
+.revenue-line{stroke-width:3.5;stroke-linecap:round;stroke-linejoin:round}
+.funnel-label{fill:#18202a;font-size:12px;font-weight:650}
+.funnel-bar{fill:#2563eb;opacity:.88}
+.tornado-worse{fill:#dc2626;opacity:.8}
+.tornado-better{fill:#16a34a;opacity:.8}
 svg{width:100%;height:auto}
 svg line{stroke:#9aa8b5;stroke-width:1}
 svg polyline{fill:none;stroke:var(--accent);stroke-width:4;stroke-linecap:round;stroke-linejoin:round}

@@ -141,8 +141,9 @@ def _title_code_aliases(trial: ClinicalTrialRecord) -> tuple[str, ...]:
 def _infer_indication(trial: ClinicalTrialRecord) -> tuple[str | None, str | None, str | None]:
     text = " | ".join([*trial.conditions, trial.brief_title or "", trial.official_title or ""]).casefold()
     for rule in load_rule_config("indication_rules.yaml").get("rules", []):
+        all_terms = [str(term).casefold() for term in rule.get("all_terms", [])]
         terms = [str(term).casefold() for term in rule.get("terms", [])]
-        if any(term in text for term in terms):
+        if (all_terms and all(term in text for term in all_terms)) or any(term in text for term in terms):
             return (
                 str(rule.get("normalized_indication")),
                 str(rule.get("therapeutic_area")),

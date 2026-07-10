@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from pharma_os.cli import main
 from pharma_os.agent_runtime import AgentRuntimeConfig
@@ -534,6 +535,112 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> No
     assert result.section_outputs
     assert all(output.source_ids for output in result.section_outputs)
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in result.traces)
+
+
+def test_protocol_section_assembly_uses_stable_ids_when_live_titles_change() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = _target_trial()
+    benchmark = _benchmark_for_trials((_analog("NCT00000001", enrollment=120),))
+    intent = protocol_design_agents.build_next_study_intent(
+        run_id="manager-run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=(target.source_id,),
+        missing_data_flags=(),
+    )
+    interpretation = protocol_design_agents._fallback_benchmark_interpretation(
+        "manager-run",
+        target,
+        intent,
+        benchmark,
+    )
+    specs = protocol_design_agents._section_agent_specs(
+        run_id="manager-run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        next_study_intent=intent,
+        benchmark_bundle=benchmark,
+        benchmark_interpretation=interpretation,
+        source_ids=(target.source_id,),
+    )
+    outputs = []
+    for _, _, fallback_output in specs:
+        sections = tuple(
+            section.model_copy(update={"title": "Executive Summary"})
+            if section.section_id.endswith("executive-synopsis")
+            else section
+            for section in fallback_output.sections
+        )
+        outputs.append(fallback_output.model_copy(update={"sections": sections}))
+
+    grouped = protocol_design_agents._sections_by_brief_field(tuple(outputs))
+
+    assert grouped["strategy_sections"]["executive_synopsis"].title == "Executive Summary"
+    assert grouped["strategy_sections"]["study_design"].title == "Study Design"
+
+
+def test_protocol_section_agent_falls_back_when_live_output_omits_required_section(monkeypatch) -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = _target_trial()
+    benchmark = _benchmark_for_trials((_analog("NCT00000001", enrollment=120),))
+    intent = protocol_design_agents.build_next_study_intent(
+        run_id="manager-run",
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=(target.source_id,),
+        missing_data_flags=(),
+    )
+    interpretation = protocol_design_agents._fallback_benchmark_interpretation(
+        "manager-run",
+        target,
+        intent,
+        benchmark,
+    )
+    comparator_spec = next(
+        spec
+        for spec in protocol_design_agents._section_agent_specs(
+            run_id="manager-run",
+            target_trial=target,
+            agent3_output=agent3,
+            agent4_output=agent4,
+            next_study_intent=intent,
+            benchmark_bundle=benchmark,
+            benchmark_interpretation=interpretation,
+            source_ids=(target.source_id,),
+        )
+        if spec[0] == "ComparatorDesignAgent"
+    )
+    agent_name, instructions, fallback_output = comparator_spec
+    bad_output = fallback_output.model_copy(
+        update={"sections": tuple(section for section in fallback_output.sections if not section.section_id.endswith("executive-synopsis"))}
+    )
+    monkeypatch.setattr(
+        protocol_design_agents,
+        "_run_typed_agent",
+        lambda **_: SimpleNamespace(output=bad_output),
+    )
+
+    result = protocol_design_agents._run_section_agent(
+        run_id="manager-run",
+        agent_name=agent_name,
+        instructions=instructions,
+        fallback_output=fallback_output,
+        target_trial=target,
+        agent3_output=agent3,
+        agent4_output=agent4,
+        next_study_intent=intent,
+        benchmark_bundle=benchmark,
+        benchmark_interpretation=interpretation,
+        source_ids=(target.source_id,),
+        config=AgentRuntimeConfig(disabled=True),
+    )
+
+    assert result.output == fallback_output
+    assert any(section.title == "Executive Synopsis" for section in result.output.sections)
+    assert result.trace_metadata["fallback_reason"].startswith("section_or_agent_mismatch")
 
 
 def test_protocol_design_llm_base_payload_is_compact() -> None:

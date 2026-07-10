@@ -16,6 +16,7 @@ from pharma_os.execution_modes import (
     summarize_execution_modes,
 )
 from pharma_os.human_readable import build_human_readable_module_output
+from pharma_os.due_diligence_report import build_due_diligence_report_payload
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.components.due_diligence_sections import (
@@ -142,6 +143,7 @@ def run_due_diligence_workflow(
         *patent_sources,
         pos_source,
         *pricing_sources,
+        *commercial_result.sources,
         *config_sources,
         user_source,
     ))
@@ -270,6 +272,7 @@ def run_due_diligence_workflow(
         missing_data_flags=missing_data_flags,
         confidence=_confidence(missing_data_flags),
     )
+    output = output.model_copy(update={"investment_report": build_due_diligence_report_payload(output)})
 
     validation_results = (
         validate_schema(
@@ -342,7 +345,7 @@ def run_due_diligence_workflow(
         run_id=run_id,
         typed_output=output,
     )
-    market_sizing_traces = (commercial_result.agent_trace,) if commercial_result.agent_trace is not None else ()
+    market_sizing_traces = commercial_result.agent_traces or ((commercial_result.agent_trace,) if commercial_result.agent_trace is not None else ())
     all_agent_traces = (*market_sizing_traces, *manager_result.traces, human_readable_result.trace)
     execution_mode_summary = summarize_execution_modes(
         all_agent_traces,
@@ -426,6 +429,13 @@ def run_due_diligence_workflow(
             "execution_mode_summary": execution_mode_summary.model_dump(mode="json"),
         },
     )
+    if completed_run.status == "completed" and validation_status != "failed":
+        store.mark_workflow_output_current(
+            workflow_name="due_diligence",
+            nct_id=input_data.nct_id,
+            current_run_id=run_id,
+            current_output_id=output.output_id,
+        )
     build_report(run_id, memory=store)
     return output
 

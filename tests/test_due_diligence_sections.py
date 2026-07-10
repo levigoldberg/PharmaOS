@@ -243,7 +243,9 @@ def test_pos_maps_sle_to_autoimmune_workbook_row() -> None:
     assert not pos.missing_data_flags
 
 
-def test_pricing_uses_sle_analog_wac_and_openfda_dosing() -> None:
+def test_pricing_uses_sle_analog_wac_and_openfda_dosing(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_AGENTS_DISABLED", "true")
+
     def handler(request: httpx.Request) -> httpx.Response:
         query = str(request.url.params.get("search", ""))
         if "Benlysta" not in query and "belimumab" not in query:
@@ -280,6 +282,48 @@ def test_pricing_uses_sle_analog_wac_and_openfda_dosing() -> None:
     assert not any(flag.flag_id == "pricing-no-wac-match" for flag in pricing.missing_data_flags)
     assert "wac:california-wac-data-xlsx" in {source.source_id for source in sources}
     assert "openfda_label:benlysta" in {source.source_id for source in sources}
+
+
+def test_pricing_uses_atopic_dermatitis_source_constrained_analog(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_AGENTS_DISABLED", "true")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = str(request.url.params.get("search", ""))
+        if "Cibinqo" not in query and "abrocitinib" not in query:
+            return httpx.Response(404, json={})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "dosage_and_administration": [
+                            "Recommended dosage for adults with atopic dermatitis is CIBINQO 100 mg orally once daily."
+                        ]
+                    }
+                ]
+            },
+        )
+
+    pricing, sources = lookup_pricing(
+        AssetIdentityOutput(
+            nct_id="NCT07011706",
+            asset_name="ATI-045",
+            aliases=("ATI-045",),
+            normalized_indication="Atopic Dermatitis",
+            modality="unknown",
+            confidence=0.4,
+        ),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert pricing.wac_value == 6167.2
+    assert pricing.annual_wac == 75034.27
+    assert pricing.matched_product and "Cibinqo" in pricing.matched_product
+    assert pricing.matched_product and "pricing analog" in pricing.matched_product
+    assert pricing.annualization_details["units_per_package"] == 30
+    assert not pricing.missing_data_flags
+    assert "wac:california-wac-data-xlsx" in {source.source_id for source in sources}
+    assert "openfda_label:cibinqo" in {source.source_id for source in sources}
 
 
 def test_red_flags_and_memo_assembly_cover_noncalculable_sections() -> None:

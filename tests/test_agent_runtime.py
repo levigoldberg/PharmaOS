@@ -206,6 +206,46 @@ def test_run_structured_llm_call_live_path_returns_structured_result(monkeypatch
     assert result.trace_metadata["execution_mode"] == "direct_llm"
 
 
+def test_run_structured_llm_call_compacts_large_payload_before_live_call(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_INPUT_CHARS", "4000")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_STRING_CHARS", "400")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_ARRAY_ITEMS", "3")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_call(**kwargs):
+        captured["payload"] = kwargs["payload"]
+        return {"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7}, {"last_response_id": "resp_123"}
+
+    monkeypatch.setattr("pharma_os.agent_runtime._call_openai_structured_output", fake_call)
+
+    result = run_structured_llm_call(
+        agent_name="fixture_direct_agent",
+        instructions="Return FixtureOutput.",
+        payload={
+            "prompt": "x" * 6000,
+            "claims": [{"summary": "y" * 1200, "source_ids": [f"source:{index}" for index in range(40)]} for _ in range(10)],
+        },
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture direct input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OFFLINE", "summary": "Offline summary.", "confidence": 0.5},
+    )
+
+    compacted_payload = captured["payload"]
+    assert isinstance(compacted_payload, dict)
+    assert "... " in compacted_payload["prompt"]
+    assert len(compacted_payload["claims"]) == 4
+    assert result.trace.context_compaction_applied is True
+    assert result.trace.context_original_chars > result.trace.context_compacted_chars
+    assert result.trace_metadata["context_truncated_strings"] >= 1
+    assert result.trace_metadata["context_truncated_arrays"] >= 1
+
+
 def test_run_structured_llm_call_falls_back_after_api_failure(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
@@ -359,6 +399,44 @@ def test_run_structured_agent_live_path_marks_live_agent(monkeypatch) -> None:
     assert result.output.output_id == "OUT"
     assert result.trace.execution_mode == "live_agent"
     assert result.trace_metadata["execution_mode"] == "live_agent"
+
+
+def test_run_structured_agent_compacts_sdk_runner_input(monkeypatch) -> None:
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_INPUT_CHARS", "3000")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_STRING_CHARS", "300")
+    monkeypatch.setenv("PHARMA_OS_LLM_MAX_ARRAY_ITEMS", "2")
+    captured: dict[str, str] = {}
+
+    class Response:
+        final_output = {"output_id": "OUT", "summary": "Fixture summary.", "confidence": 0.7}
+
+    class SuccessRunner:
+        @staticmethod
+        def run_sync(agent, sdk_input, **kwargs):
+            del agent, kwargs
+            captured["input"] = sdk_input
+            return Response()
+
+    monkeypatch.setattr(
+        "pharma_os.agent_runtime.load_agents_sdk",
+        lambda: (object, object, SuccessRunner, object),
+    )
+
+    result = run_structured_agent(
+        agent=object(),
+        payload={"prompt": "x" * 5000, "items": [{"text": "y" * 1000} for _ in range(8)]},
+        output_type=FixtureOutput,
+        agent_name="fixture_agent",
+        run_id="RUN",
+        input_summary="Fixture input.",
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        offline_output={"output_id": "OFFLINE", "summary": "Offline summary.", "confidence": 0.5},
+    )
+
+    assert len(captured["input"]) < 3000
+    assert "context compaction" in captured["input"]
+    assert result.trace.context_compaction_applied is True
+    assert result.trace_metadata["context_truncated_arrays"] >= 1
 
 
 def test_run_structured_agent_falls_back_after_sdk_failure(monkeypatch) -> None:

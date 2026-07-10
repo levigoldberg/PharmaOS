@@ -87,6 +87,8 @@ Primary interface is CLI.
 
 Optional UI or dashboard can be added after the CLI workflows and report outputs are working.
 
+For `pharma_os orchestrate --goal ...`, natural-language understanding is AI-first. The RequestUnderstandingAgent chooses the registered target capability, extracts identifiers, and returns structured fields. Deterministic CLI code validates the AI output, checks explicit flag conflicts, filters optional assumption gaps, and builds `OrchestrationRequest`; it must not replace the agent with keyword routing. `--input-json` is the structured non-AI bypass.
+
 ## Data policy
 
 Use real APIs and open-source tools wherever possible.
@@ -129,6 +131,10 @@ The legacy `trial_intelligence` CLI route is compatibility-only Agent 3 landscap
 Agent 4 consumes Agent 3 through a typed handoff, not by recomputing Agent 3-only clinical-risk logic. `due_diligence` reuses the latest completed, non-failed `clinical_outcome_prediction` output for the same NCT ID unless `refresh_agent3` is requested; otherwise it generates and persists a new Agent 3 run. The Agent 4 output stores `agent3_handoff` and `clinical_risk_summary`, then runs reusable cross-agent consistency validation.
 
 The Clinical Stage Due Diligence Agent expands Agent 4 with deterministic sections only from allowed sources: Agent 3 output, ClinicalTrials.gov, PubMed, openFDA labels, Lens, local PoS/WAC workbooks, and reviewed/config assumptions. `clinical_evidence`, `competitive_landscape`, `safety_label_summary`, `patent_loe_review`, `red_flags`, and `asset_memo` are assembled inside PharmaOS and persisted to Scientific Memory. The asset memo is a draft requiring human review and must not contain final recommendations, approvals, legal/regulatory conclusions, or invented values.
+
+Agent 4's internal manager may use discretionary specialist tools, such as red-team critique, through the OpenAI Agents SDK `Agent.as_tool()` pattern. These are manager-loop tools only. They do not replace Python-owned retrieval, validation, or calculation, and they do not become SDK handoffs between Agent 3, Agent 4, and Agent 5. A deterministic red-team safety shadow is still preserved so reports and typed outputs remain stable even when the manager does not call the optional critique tool.
+
+All live LLM calls pass through the shared PharmaOS runtime context-compaction layer before reaching the Responses API or Agents SDK. The full typed state remains in Scientific Memory and output artifacts; model-facing JSON is recursively bounded for long strings, large arrays, and deep objects. Agent traces record compaction status, original/compacted character counts, and truncated-path summaries.
 
 ## Agent 5 Protocol Design Brief boundary
 

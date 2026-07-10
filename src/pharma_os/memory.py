@@ -158,6 +158,8 @@ class MemoryStore:
         normalized_nct = nct_id.strip().upper()
         for row in rows:
             metadata = json.loads(row["metadata_json"] or "{}") or {}
+            if metadata.get("artifact_lineage_status") == "superseded":
+                continue
             input_payload = json.loads(row["input_json"] or "{}") or {}
             output_payload = json.loads(row["output_json"] or "{}") or {}
             candidate_nct = (
@@ -183,6 +185,83 @@ class MemoryStore:
                 output_payload,
             )
         return None
+
+    def mark_workflow_output_current(
+        self,
+        *,
+        workflow_name: str,
+        nct_id: str,
+        current_run_id: str,
+        current_output_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Mark the latest successful workflow output as current and older matching outputs as superseded."""
+
+        normalized_nct = nct_id.strip().upper()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM runs
+            WHERE workflow_name = ?
+              AND status = 'completed'
+              AND validation_status != 'failed'
+              AND output_json IS NOT NULL
+            ORDER BY COALESCE(completed_at, started_at) DESC, started_at DESC
+            """,
+            (workflow_name,),
+        ).fetchall()
+        matching_rows = []
+        for row in rows:
+            metadata = _json_loads(row["metadata_json"]) or {}
+            input_payload = _json_loads(row["input_json"]) or {}
+            output_payload = _json_loads(row["output_json"]) or {}
+            if _payload_nct(metadata, input_payload, output_payload) == normalized_nct:
+                matching_rows.append(row)
+        current_row = next((row for row in matching_rows if row["run_id"] == current_run_id), None)
+        if current_row is None:
+            return ()
+
+        now = datetime.now(timezone.utc).isoformat()
+        superseded_run_ids: list[str] = []
+        superseded_output_ids: list[str] = []
+        for row in matching_rows:
+            if row["run_id"] == current_run_id:
+                continue
+            metadata = _json_loads(row["metadata_json"]) or {}
+            output_payload = _json_loads(row["output_json"]) or {}
+            output_id = _extract_output_id(output_payload)
+            metadata.update(
+                {
+                    "artifact_lineage_status": "superseded",
+                    "superseded_by_run_id": current_run_id,
+                    "lineage_updated_at": now,
+                }
+            )
+            if current_output_id:
+                metadata["superseded_by_output_id"] = current_output_id
+            self._connection.execute(
+                "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+                (_json(metadata), row["run_id"]),
+            )
+            superseded_run_ids.append(str(row["run_id"]))
+            if output_id:
+                superseded_output_ids.append(output_id)
+
+        current_metadata = _json_loads(current_row["metadata_json"]) or {}
+        current_metadata.update(
+            {
+                "artifact_lineage_status": "current",
+                "lineage_updated_at": now,
+            }
+        )
+        if superseded_run_ids:
+            current_metadata["supersedes_run_ids"] = superseded_run_ids
+        if superseded_output_ids:
+            current_metadata["supersedes_output_ids"] = superseded_output_ids
+        self._connection.execute(
+            "UPDATE runs SET metadata_json = ? WHERE run_id = ?",
+            (_json(current_metadata), current_run_id),
+        )
+        self._connection.commit()
+        return tuple(superseded_run_ids)
 
     def build_scientific_state_snapshot(
         self,
@@ -274,7 +353,8 @@ class MemoryStore:
                 metadata=json.loads(row["metadata_json"] or "{}"),
             )
             gates = self._human_gates_for_run(run.run_id)
-            freshness = self._run_freshness(run.run_id, completed_at=completed_at)
+            lineage_status = str(run.metadata.get("artifact_lineage_status") or "")
+            freshness = "stale" if lineage_status == "superseded" else self._run_freshness(run.run_id, completed_at=completed_at)
             compatibility, reasons = _artifact_compatibility(
                 request=request,
                 capability=capability,
@@ -907,6 +987,13 @@ def _artifact_compatibility(
         reasons.append(f"run status is {run.status}, not completed")
     if run.validation_status == "failed":
         reasons.append("run validation failed")
+    if run.metadata.get("artifact_lineage_status") == "superseded":
+        superseded_by = run.metadata.get("superseded_by_run_id")
+        reasons.append(
+            f"artifact was superseded by run {superseded_by}"
+            if superseded_by
+            else "artifact was superseded by a newer run"
+        )
     if request.nct_id:
         observed_nct = _payload_nct(run.metadata, input_payload, output_payload)
         if observed_nct != request.nct_id.strip().upper():

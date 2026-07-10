@@ -90,6 +90,10 @@ def run_due_diligence_manager_agent(
     runtime_config = config
     traces: list[AgentRunTrace] = []
     payloads: list[BaseModel] = []
+    manager_tools = _manager_discretionary_tools(
+        run_id=run_id,
+        config=config,
+    )
 
     manager_plan = _run_typed_agent(
         agent_name="DueDiligenceManagerAgent",
@@ -119,6 +123,7 @@ def run_due_diligence_manager_agent(
         confidence=0.7,
         config=runtime_config,
         rationale_summary="Coordinate Agent 4 synthesis and critique after deterministic retrieval/math.",
+        tools=manager_tools,
     )
     traces.append(manager_plan.trace)
     payloads.append(manager_plan.output)
@@ -259,36 +264,22 @@ def run_due_diligence_manager_agent(
             ),
             config=runtime_config,
         ),
-        _run_synthesis_agent(
-            agent_name="DiligenceRedTeamAgent",
-            section="red_team",
-            instructions=_red_team_instructions(),
-            fallback_output=_red_team_fallback(run_id, red_flags, missing_data_flags, source_ids),
-            run_id=run_id,
-            source_ids=source_ids,
-            confidence=0.65,
-            payload=_base_payload(
-                agent3_output=agent3_output,
-                asset=asset,
-                clinical_risk=clinical_risk,
-                clinical_evidence=clinical_evidence,
-                landscape=landscape,
-                safety=safety,
-                patent=patent,
-                pricing=pricing,
-                commercial=commercial,
-                rnpv=rnpv,
-                red_flags=red_flags,
-                claims=claims,
-                assumptions=assumptions,
-                missing_data_flags=missing_data_flags,
-                source_ids=source_ids,
-            ),
-            config=runtime_config,
-        ),
     ]
-    synthesis_outputs = tuple(result.output for result in subagent_results)
-    for result in subagent_results:
+    red_team_shadow_result = _synthesis_fallback_result(
+        agent_name="DiligenceRedTeamAgent",
+        run_id=run_id,
+        input_summary="Preserve deterministic Agent 4 red-team safety review.",
+        fallback_output=_red_team_fallback(run_id, red_flags, missing_data_flags, source_ids),
+        source_ids=source_ids,
+        confidence=0.65,
+        rationale_summary=(
+            "DueDiligenceManagerAgent may invoke the red-team specialist as an SDK tool when useful; "
+            "PharmaOS also preserves a deterministic red-team safety review for typed output compatibility."
+        ),
+        reason="manager_discretionary_specialist_tool_or_deterministic_shadow",
+    )
+    synthesis_outputs = tuple(result.output for result in (*subagent_results, red_team_shadow_result))
+    for result in (*subagent_results, red_team_shadow_result):
         traces.append(result.trace)
         payloads.append(result.output)
 
@@ -483,6 +474,7 @@ def _run_typed_agent(
     confidence: float,
     config: AgentRuntimeConfig | None,
     rationale_summary: str,
+    tools: tuple[Any, ...] = (),
 ) -> StructuredAgentResult:
     route = "agent4_manager" if agent_name == "DueDiligenceManagerAgent" else "agent4_subagent"
     call_config = runtime_config_for_route(
@@ -508,12 +500,15 @@ def _run_typed_agent(
     agent = object()
     if not call_config.disabled:
         Agent, _, _, _ = load_agents_sdk()
-        agent = Agent(
-            name=agent_name,
-            instructions=instructions,
-            model=call_config.model,
-            output_type=agents_sdk_output_schema(output_type),
-        )
+        agent_kwargs: dict[str, Any] = {
+            "name": agent_name,
+            "instructions": instructions,
+            "model": call_config.model,
+            "output_type": agents_sdk_output_schema(output_type),
+        }
+        if tools:
+            agent_kwargs["tools"] = list(tools)
+        agent = Agent(**agent_kwargs)
     return run_structured_agent(
         agent=agent,
         payload=payload,
@@ -526,6 +521,40 @@ def _run_typed_agent(
         source_ids=source_ids,
         confidence=confidence,
         rationale_summary=rationale_summary,
+    )
+
+
+def _manager_discretionary_tools(
+    *,
+    run_id: str,
+    config: AgentRuntimeConfig | None,
+) -> tuple[Any, ...]:
+    """Return optional specialist tools available to the Agent 4 manager loop."""
+
+    del run_id
+    call_config = runtime_config_for_route(
+        model_route="agent4_subagent",
+        disabled_provenance="pharma_os.agents.due_diligence",
+        config=config,
+    )
+    if call_config.disabled:
+        return ()
+    Agent, _, _, _ = load_agents_sdk()
+    red_team_agent = Agent(
+        name="DiligenceRedTeamAgent",
+        instructions=_red_team_tool_instructions(),
+        model=call_config.model,
+        output_type=agents_sdk_output_schema(DueDiligenceSynthesisOutput),
+    )
+    return (
+        red_team_agent.as_tool(
+            tool_name="run_diligence_red_team",
+            tool_description=(
+                "Optional Agent 4 red-team critique. Use only when the manager needs an extra check for "
+                "unsupported diligence claims, overconfidence, missing sources, or decision-like language."
+            ),
+            max_turns=min(call_config.max_turns, 4),
+        ),
     )
 
 
@@ -780,7 +809,14 @@ def _shared_guardrails() -> str:
 
 
 def _manager_instructions() -> str:
-    return _shared_guardrails() + " Coordinate subagents after deterministic retrieval and math. Preserve DueDiligenceOutput shape."
+    return (
+        _shared_guardrails()
+        + " Coordinate Agent 4 after deterministic retrieval and math. Python-owned tools have already retrieved, "
+        "normalized, validated, and calculated the mandatory clinical, safety, IP, pricing, commercial, and rNPV "
+        "inputs. Decide whether any discretionary critique tool is useful for unsupported claims, overconfidence, "
+        "missing sources, or decision-like language. Do not use SDK handoffs for Agent 3/4/5 workflow dependencies. "
+        "Preserve DueDiligenceOutput shape."
+    )
 
 
 def _clinical_evidence_instructions() -> str:
@@ -805,6 +841,14 @@ def _commercial_instructions() -> str:
 
 def _red_team_instructions() -> str:
     return _shared_guardrails() + " Identify unsupported claims, overconfidence, missing sources, gaps, and decision-like language."
+
+
+def _red_team_tool_instructions() -> str:
+    return (
+        _red_team_instructions()
+        + " Return a DueDiligenceSynthesisOutput with agent_name='DiligenceRedTeamAgent' and section='red_team'. "
+        "Focus only on critique. Do not rerun retrieval, perform calculations, or alter workflow dependencies."
+    )
 
 
 def _asset_memo_instructions() -> str:

@@ -212,6 +212,13 @@ def run_clinical_outcome_prediction_workflow(
             "execution_mode_summary": execution_mode_summary.model_dump(mode="json"),
         },
     )
+    if completed_run.status == "completed" and validation_status != "failed":
+        store.mark_workflow_output_current(
+            workflow_name="clinical_outcome_prediction",
+            nct_id=input_data.nct_id,
+            current_run_id=run_id,
+            current_output_id=output.output_id,
+        )
     build_report(run_id, memory=store)
     return output
 

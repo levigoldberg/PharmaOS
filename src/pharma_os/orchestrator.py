@@ -435,6 +435,15 @@ class Orchestrator:
         after_snapshot = self.memory.build_scientific_state_snapshot(request, registry=self.registry)
         child_run_id = getattr(output, "run_id", None)
         output_id = getattr(output, "output_id", None)
+        output_validation_status = getattr(output, "validation_status", "passed")
+        if request.nct_id and child_run_id and output_validation_status != "failed":
+            self.memory.mark_workflow_output_current(
+                workflow_name=capability.name,
+                nct_id=request.nct_id,
+                current_run_id=child_run_id,
+                current_output_id=output_id,
+            )
+            after_snapshot = self.memory.build_scientific_state_snapshot(request, registry=self.registry)
         gates = (getattr(output, "human_gate", None),)
         gates = tuple(gate for gate in gates if gate is not None)
         child_execution_summary = getattr(output, "execution_mode_summary", None)
@@ -449,7 +458,7 @@ class Orchestrator:
                 after_snapshot=after_snapshot,
                 child_run_id=child_run_id,
                 output_id=output_id,
-                validation_status=getattr(output, "validation_status", "passed"),
+                validation_status=output_validation_status,
                 gates=gates,
                 state_changed=_snapshot_material_signature(before_snapshot) != _snapshot_material_signature(after_snapshot),
                 execution_mode=primary_execution_mode(child_execution_summary) if child_execution_summary is not None else "deterministic_fallback",

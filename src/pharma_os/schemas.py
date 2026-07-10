@@ -421,6 +421,7 @@ class RequestUnderstandingOutput(StrictSchema):
     force_refresh: tuple[str, ...]
     skip_capabilities: tuple[str, ...]
     requested_outputs: tuple[str, ...]
+    execution_scope: Literal["target_only", "target_with_dependencies", "full_path", "unspecified"] = "unspecified"
     missing_required_fields: tuple[str, ...]
     clarifying_questions: tuple[str, ...]
     confidence: float = Field(..., ge=0.0, le=1.0)
@@ -953,6 +954,7 @@ class ClinicalOutcomePredictionOutput(StrictSchema):
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
     human_readable_summary: HumanReadableModuleOutput | None = None
+    investment_report: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
     execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
@@ -1690,6 +1692,12 @@ class AgentRunTrace(StrictSchema):
     retry_exhausted: bool = False
     fallback_cause: str | None = None
     final_retry_reason: str | None = None
+    context_compaction_applied: bool = False
+    context_original_chars: int = Field(default=0, ge=0)
+    context_compacted_chars: int = Field(default=0, ge=0)
+    context_truncated_strings: int = Field(default=0, ge=0)
+    context_truncated_arrays: int = Field(default=0, ge=0)
+    context_truncated_paths: str | None = None
 
 
 class OrchestrationRunRecord(StrictSchema):

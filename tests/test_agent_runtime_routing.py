@@ -173,6 +173,75 @@ def test_workflow_agents_use_expected_model_routes(module: Any, agent_name: str,
     assert seen_routes == [expected_route]
 
 
+def test_agent4_manager_accepts_discretionary_specialist_tools(monkeypatch) -> None:
+    captured_tools: list[list[Any]] = []
+
+    class FakeAgent:
+        def __init__(self, *, name: str, instructions: str, model: str, output_type: type[Any], tools: list[Any] | None = None) -> None:
+            del instructions, model, output_type
+            self.name = name
+            self.tools = tools or []
+            captured_tools.append(self.tools)
+
+    def fake_sdk(**kwargs: Any) -> StructuredAgentResult:
+        assert kwargs["agent"].name == "DueDiligenceManagerAgent"
+        assert kwargs["agent"].tools == ["red-team-tool"]
+        return _direct_result(**kwargs)
+
+    monkeypatch.setattr(due_diligence, "run_structured_llm_call", lambda **_: pytest.fail("Direct API path should not run"))
+    monkeypatch.setattr(due_diligence, "load_agents_sdk", lambda: (FakeAgent, object, object, object))
+    monkeypatch.setattr(due_diligence, "run_structured_agent", fake_sdk)
+
+    result = due_diligence._run_typed_agent(
+        agent_name="DueDiligenceManagerAgent",
+        instructions="Return FixtureOutput.",
+        output_type=FixtureOutput,
+        run_id="RUN",
+        input_summary="Fixture routing input.",
+        payload={"prompt": "fixture"},
+        fallback_output=FixtureOutput(output_id="manager-OUT", summary="Fixture summary.", confidence=0.7),
+        source_ids=("ctgov:NCT12345678",),
+        confidence=0.7,
+        config=AgentRuntimeConfig(model="test-model", disabled=False),
+        rationale_summary="Fixture routing rationale.",
+        tools=("red-team-tool",),
+    )
+
+    assert isinstance(result.output, FixtureOutput)
+    assert captured_tools == [["red-team-tool"]]
+
+
+def test_agent4_discretionary_specialist_tool_uses_as_tool_and_subagent_route(monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class FakeAgent:
+        def __init__(self, *, name: str, instructions: str, model: str, output_type: type[Any]) -> None:
+            self.name = name
+            self.instructions = instructions
+            self.model = model
+            self.output_type = output_type
+
+        def as_tool(self, **kwargs: Any) -> str:
+            calls.append({"agent_name": self.name, "model": self.model, **kwargs})
+            return "red-team-tool"
+
+    monkeypatch.setenv("PHARMA_OS_MODEL_AGENT4_MANAGER", "manager-model")
+    monkeypatch.setenv("PHARMA_OS_MODEL_AGENT4_SUBAGENT", "subagent-model")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.delenv("PHARMA_OS_AGENTS_DISABLED", raising=False)
+    monkeypatch.delenv("PHARMA_OS_OFFLINE", raising=False)
+    monkeypatch.delenv("PHARMA_OS_ENABLE_LIVE_AGENTS", raising=False)
+    monkeypatch.setattr(due_diligence, "load_agents_sdk", lambda: (FakeAgent, object, object, object))
+    monkeypatch.setattr(due_diligence, "agents_sdk_output_schema", lambda output_type: output_type)
+
+    tools = due_diligence._manager_discretionary_tools(run_id="RUN", config=None)
+
+    assert tools == ("red-team-tool",)
+    assert calls[0]["agent_name"] == "DiligenceRedTeamAgent"
+    assert calls[0]["model"] == "subagent-model"
+    assert calls[0]["tool_name"] == "run_diligence_red_team"
+
+
 def test_human_readable_summary_uses_human_summary_route(monkeypatch) -> None:
     seen_routes: list[str] = []
 

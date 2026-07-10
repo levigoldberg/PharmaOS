@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
+import re
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pharma_os.agent_runtime import AgentRuntimeConfig, run_structured_llm_call, runtime_config_for_route
 from pharma_os.schemas import (
@@ -25,6 +27,7 @@ from pharma_os.schemas import (
     PricingOutput,
     RevenueForecastYear,
     SelectedPopulationMeasure,
+    SourceMetadata,
     ValueTriplet,
 )
 from pharma_os.tools._due_diligence_common import (
@@ -34,6 +37,7 @@ from pharma_os.tools._due_diligence_common import (
     to_float,
     triplet_base,
 )
+from pharma_os.tools.pubmed import PubMedArticle, PubMedClient, PubMedError
 from pharma_os.tools.rules import config_provenance, config_source_id, load_config
 
 
@@ -42,7 +46,37 @@ class CommercialModelRunResult(BaseModel):
 
     output: CommercialModelOutput
     agent_trace: object | None = None
+    agent_traces: tuple[object, ...] = ()
+    sources: tuple[SourceMetadata, ...] = ()
     trace_metadata: dict[str, str | int | float | bool | None] = {}
+
+
+class EpidemiologyPopulationCandidate(BaseModel):
+    """Candidate market-sizing denominator extracted from epidemiology evidence."""
+
+    value: float | None = None
+    unit: str | None = None
+    measure_type: str | None = None
+    condition: str | None = None
+    geography: str | None = None
+    source_type: str = "source_derived"
+    evidence_reference: str | None = None
+    source_id: str | None = None
+    rationale: str = ""
+    confidence_score: int = Field(default=0, ge=0, le=10)
+    human_review_required: bool = True
+
+
+class EpidemiologyEvidenceExtraction(BaseModel):
+    """AI-extracted epidemiology inputs for the commercial market-sizing bundle."""
+
+    evidence_status: str = "not_run"
+    selected_population_measure: SelectedPopulationMeasure | None = None
+    selected_source_id: str | None = None
+    candidate_population_measures: tuple[EpidemiologyPopulationCandidate, ...] = ()
+    assumption_flags: tuple[str, ...] = ()
+    human_review_questions: tuple[str, ...] = ()
+    confidence_score: int = Field(default=0, ge=0, le=10)
 
 
 MARKET_SIZING_INSTRUCTIONS = """You are a market-sizing interpretation subagent for PharmaOS Agent 4 due diligence.
@@ -52,6 +86,16 @@ Your job is only to select or infer market-sizing assumptions for a deterministi
 If no usable population measure exists, set calculable false, set the selected population measure value to null, and explain the missing evidence.
 You may infer missing diagnosed, treated, eligibility, or commercially addressable fractions only when the source_type is model_inferred, default_assumption, or fallback.
 Return structured output matching the schema only."""
+
+
+EPIDEMIOLOGY_EXTRACTION_INSTRUCTIONS = """You are an epidemiology evidence extraction subagent for PharmaOS Agent 4 due diligence.
+Use only the supplied PubMed titles and abstract snippets. Do not use outside knowledge.
+Extract only explicit numeric epidemiology estimates relevant to the target indication and geography.
+Prefer United States-specific patient-count estimates for the same disease or indicated severity segment.
+If a source gives only a prevalence percentage, do not convert it unless the input payload provides a source-backed population denominator and the formula is stated in your rationale.
+Do not use clinical trial enrollment counts as market denominators.
+Return a selected_population_measure only when a usable patient-count denominator or source-backed converted denominator exists.
+Every selected or candidate value must include the PMID/source_id and a short rationale tied to the evidence."""
 
 
 def build_commercial_model(
@@ -97,6 +141,17 @@ def build_commercial_model_with_trace(
 
     default_config = load_config("default_archetypes.yaml", section="due_diligence")
     config_id = config_source_id("default_archetypes.yaml", section="due_diligence")
+    market_evidence = (
+        _collect_market_population_evidence(
+            trial=trial,
+            asset=asset,
+            clinical_evidence=clinical_evidence,
+            run_id=run_id,
+            config=config,
+        )
+        if annual_patients is None and trial is not None
+        else _empty_market_evidence()
+    )
     bundle = assemble_commercial_input_bundle(
         trial=trial,
         asset=asset,
@@ -106,6 +161,7 @@ def build_commercial_model_with_trace(
         peak_penetration=peak_penetration,
         gross_to_net=gross_to_net,
         default_archetypes=default_config,
+        market_evidence=market_evidence,
     )
     if annual_patients is not None:
         interpretation = _interpretation_from_reviewed_population(
@@ -113,6 +169,7 @@ def build_commercial_model_with_trace(
             default_config=default_config,
         )
         agent_trace = None
+        agent_traces: tuple[object, ...] = ()
         trace_metadata: dict[str, str | int | float | bool | None] = {}
     else:
         fallback = _fallback_interpretation(default_config, reason="No source-backed population measure was available.")
@@ -135,7 +192,13 @@ def build_commercial_model_with_trace(
         )
         interpretation = result.output
         agent_trace = result.trace
-        trace_metadata = result.trace_metadata
+        agent_traces = tuple(item for item in (market_evidence.get("trace"), result.trace) if item is not None)
+        trace_metadata = _combined_trace_metadata(
+            {
+                "epidemiology_extraction": market_evidence.get("trace_metadata"),
+                "market_sizing": result.trace_metadata,
+            }
+        )
 
     output = calculate_commercial_model(
         bundle=bundle,
@@ -144,7 +207,16 @@ def build_commercial_model_with_trace(
         pricing=pricing,
         config_id=config_id,
     )
-    return CommercialModelRunResult(output=output, agent_trace=agent_trace, trace_metadata=trace_metadata)
+    source_ids = tuple(dict.fromkeys((*output.source_ids, *_market_source_ids(market_evidence))))
+    if source_ids != output.source_ids:
+        output = output.model_copy(update={"source_ids": source_ids})
+    return CommercialModelRunResult(
+        output=output,
+        agent_trace=agent_trace,
+        agent_traces=agent_traces,
+        sources=tuple(market_evidence.get("sources") or ()),
+        trace_metadata=trace_metadata,
+    )
 
 
 def assemble_commercial_input_bundle(
@@ -157,9 +229,11 @@ def assemble_commercial_input_bundle(
     peak_penetration: float | None,
     gross_to_net: float | None,
     default_archetypes: dict[str, Any],
+    market_evidence: dict[str, Any] | None = None,
 ) -> CommercialInputBundle:
     """Assemble a compact commercial evidence bundle from existing Agent 4 context."""
 
+    market_evidence = market_evidence or _empty_market_evidence()
     user_overrides = {
         key: value
         for key, value in {
@@ -183,6 +257,9 @@ def assemble_commercial_input_bundle(
                 "rationale": "User-reviewed annual eligible patient assumption supplied to PharmaOS.",
             }
         )
+    for item in market_evidence.get("population_evidence") or ():
+        if isinstance(item, dict):
+            population_evidence.append(item)
     pubmed_titles = tuple(clinical_evidence.pubmed_titles if clinical_evidence else ())
     segmentation = [
         {
@@ -197,10 +274,19 @@ def assemble_commercial_input_bundle(
         }
         for title in pubmed_titles
     ]
+    segmentation.extend(item for item in market_evidence.get("segmentation_evidence") or () if isinstance(item, dict))
     missing_inputs = list(pricing.missing_data_flags)
-    if annual_patients is None:
+    market_flags = [str(item) for item in market_evidence.get("confidence_flags") or () if item]
+    missing_inputs.extend(market_flags)
+    has_numeric_population = any(_float_or_none(item.get("value")) is not None for item in population_evidence if isinstance(item, dict))
+    if annual_patients is None and not has_numeric_population:
         missing_inputs.append(missing("commercial-population-measure-missing", "commercial_model", "selected_population_measure", "No source-backed or reviewed population measure is available.", "high"))
-    missing_labels = tuple(dict.fromkeys(flag.flag_id for flag in missing_inputs))
+    missing_labels = tuple(
+        dict.fromkeys(
+            flag.flag_id if isinstance(flag, MissingDataFlag) else str(flag)
+            for flag in missing_inputs
+        )
+    )
     return CommercialInputBundle(
         asset_summary={
             "asset_name": asset.asset_name if asset else None,
@@ -223,9 +309,265 @@ def assemble_commercial_input_bundle(
         },
         pricing_benchmark=_pricing_benchmark(pricing, default_archetypes),
         missing_inputs=missing_labels,
-        user_overrides=user_overrides,
+        user_overrides={**user_overrides, **_market_user_overrides(market_evidence)},
         predefined_archetype_assumptions=default_archetypes,
     )
+
+
+def _collect_market_population_evidence(
+    *,
+    trial: ClinicalTrialRecord | None,
+    asset: AssetIdentityOutput | None,
+    clinical_evidence: ClinicalEvidenceSummary | None,
+    run_id: str | None,
+    config: AgentRuntimeConfig | None,
+) -> dict[str, Any]:
+    if trial is None:
+        return _empty_market_evidence(confidence_flags=("market_trial_missing",))
+    query_config = load_config("market_query_templates.yaml", section="due_diligence")
+    queries = _generate_market_queries(trial=trial, asset=asset, query_config=query_config)
+    if not queries:
+        return _empty_market_evidence(confidence_flags=("market_queries_missing",))
+    articles: list[PubMedArticle] = []
+    flags: list[str] = []
+    client = PubMedClient()
+    for query in queries[: _env_int("PHARMA_OS_MARKET_MAX_QUERIES", 8, minimum=1, maximum=40)]:
+        try:
+            articles.extend(
+                client.search(
+                    query,
+                    max_results=_env_int("PHARMA_OS_MARKET_PUBMED_RESULTS_PER_QUERY", 5, minimum=1, maximum=25),
+                )
+            )
+        except PubMedError as exc:
+            flags.append(f"pubmed_market_query_failed:{_slug(query)}:{exc.__class__.__name__}")
+    articles = _dedupe_articles(articles)
+    sources = tuple(article.source() for article in articles)
+    if not articles:
+        return _empty_market_evidence(
+            sources=sources,
+            confidence_flags=tuple((*flags, "market_pubmed_no_articles")),
+        )
+    selected = _select_epi_articles(trial=trial, asset=asset, articles=articles)
+    payload = {
+        "target_indication": _target_indication(trial, asset),
+        "condition_terms": list(trial.conditions),
+        "geography": "United States",
+        "nct_id": trial.nct_id,
+        "clinical_evidence_query": clinical_evidence.pubmed_query if clinical_evidence else None,
+        "articles": [
+            {
+                "pmid": article.pmid,
+                "source_id": article.source_id,
+                "title": article.title,
+                "journal": article.journal,
+                "year": article.year,
+                "abstract_snippet": article.abstract_snippet,
+            }
+            for article in selected
+        ],
+    }
+    fallback = EpidemiologyEvidenceExtraction(
+        evidence_status="ai_unavailable",
+        selected_population_measure=None,
+        candidate_population_measures=(),
+        assumption_flags=tuple((*flags, "ai_epi_extraction_unavailable")),
+        human_review_questions=("Confirm the source-backed disease population or provide reviewed annual eligible patients.",),
+        confidence_score=0,
+    )
+    result = run_structured_llm_call(
+        agent_name="CommercialEpidemiologyEvidenceAgent",
+        instructions=EPIDEMIOLOGY_EXTRACTION_INSTRUCTIONS,
+        payload=payload,
+        output_type=EpidemiologyEvidenceExtraction,
+        run_id=run_id or f"commercial-epi-{datetime.now(timezone.utc).isoformat()}",
+        input_summary="Extract source-backed epidemiology market denominators for Agent 4 commercial sizing.",
+        config=runtime_config_for_route(
+            model_route="agent4_subagent",
+            disabled_provenance="pharma_os.tools.commercial_model.epidemiology_extraction",
+            config=config,
+        ),
+        offline_output=fallback,
+        source_ids=tuple(source.source_id for source in sources),
+        confidence=None,
+        rationale_summary="Epidemiology evidence extraction supplies market-sizing denominator candidates.",
+    )
+    population_evidence = _population_evidence_from_extraction(result.output)
+    segmentation = tuple(
+        candidate.model_dump(mode="json")
+        for candidate in result.output.candidate_population_measures
+    )
+    confidence_flags = tuple(
+        dict.fromkeys(
+            (
+                *flags,
+                *result.output.assumption_flags,
+                *("literature_population_measure_missing" for _ in [1] if not population_evidence),
+            )
+        )
+    )
+    return {
+        "population_evidence": population_evidence,
+        "segmentation_evidence": segmentation,
+        "sources": sources,
+        "source_ids": tuple(source.source_id for source in sources),
+        "confidence_flags": confidence_flags,
+        "human_review_questions": result.output.human_review_questions,
+        "trace": result.trace,
+        "trace_metadata": result.trace_metadata,
+    }
+
+
+def _empty_market_evidence(
+    *,
+    sources: tuple[SourceMetadata, ...] = (),
+    confidence_flags: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    return {
+        "population_evidence": (),
+        "segmentation_evidence": (),
+        "sources": sources,
+        "source_ids": tuple(source.source_id for source in sources),
+        "confidence_flags": confidence_flags,
+        "human_review_questions": (),
+        "trace": None,
+        "trace_metadata": {},
+    }
+
+
+def _generate_market_queries(*, trial: ClinicalTrialRecord, asset: AssetIdentityOutput | None, query_config: dict[str, Any]) -> list[str]:
+    templates = query_config.get("templates") if isinstance(query_config, dict) else None
+    if not isinstance(templates, dict):
+        return []
+    geography = "United States"
+    conditions = tuple(dict.fromkeys(term for term in trial.conditions if term))
+    target = _target_indication(trial, asset)
+    title_phrases, title_acronyms = _title_indication_phrases(trial)
+    candidates: list[str] = []
+    for condition in conditions[:4]:
+        for key in ("disease_prevalence", "disease_epidemiology", "disease_population"):
+            template = templates.get(key)
+            if isinstance(template, str):
+                candidates.append(template.format(condition=condition, geography=geography))
+    for phrase in tuple(dict.fromkeys(term for term in (target, *title_phrases, " and ".join(conditions) if len(conditions) > 1 else None) if term))[:4]:
+        for key in ("combined_indication_prevalence", "combined_indication_epidemiology", "combined_indication_population"):
+            template = templates.get(key)
+            if isinstance(template, str):
+                candidates.append(template.format(indication_phrase=phrase, geography=geography))
+    for acronym in title_acronyms[:3]:
+        for key in ("indication_acronym_prevalence", "indication_acronym_epidemiology"):
+            template = templates.get(key)
+            if isinstance(template, str):
+                candidates.append(template.format(acronym=acronym, geography=geography))
+    template = templates.get("trial_indication_prevalence")
+    if isinstance(template, str) and target:
+        candidates.append(template.format(normalized_indication=target, geography=geography))
+    title = trial.brief_title or trial.official_title
+    template = templates.get("trial_eligibility_population")
+    if isinstance(template, str) and title:
+        candidates.append(template.format(trial_title=title))
+    return list(dict.fromkeys(candidates))
+
+
+def _title_indication_phrases(trial: ClinicalTrialRecord) -> tuple[list[str], list[str]]:
+    phrases: list[str] = []
+    acronyms: list[str] = []
+    for title in (trial.brief_title, trial.official_title):
+        if not title:
+            continue
+        match = re.search(r"patients with (?P<phrase>.+?)(?:\s+\([^)]*\)|$)", title, re.I)
+        if match:
+            phrases.append(match.group("phrase").strip(" .,:;"))
+        acronyms.extend(
+            token
+            for token in re.findall(r"\(([A-Za-z][A-Za-z0-9-]{2,20})\)", title)
+            if any(char.isupper() for char in token) and "study" not in token.casefold()
+        )
+    return list(dict.fromkeys(phrases)), list(dict.fromkeys(acronyms))
+
+
+def _target_indication(trial: ClinicalTrialRecord, asset: AssetIdentityOutput | None) -> str | None:
+    return (asset.normalized_indication if asset else None) or (trial.conditions[0] if trial.conditions else None)
+
+
+def _dedupe_articles(articles: list[PubMedArticle]) -> list[PubMedArticle]:
+    deduped: dict[str, PubMedArticle] = {}
+    for article in articles:
+        deduped[article.pmid] = article
+    return list(deduped.values())
+
+
+def _select_epi_articles(*, trial: ClinicalTrialRecord, asset: AssetIdentityOutput | None, articles: list[PubMedArticle]) -> list[PubMedArticle]:
+    target = (_target_indication(trial, asset) or "").casefold()
+    conditions = [condition.casefold() for condition in trial.conditions if condition]
+    scored: list[tuple[int, int, PubMedArticle]] = []
+    for index, article in enumerate(articles):
+        text = f"{article.title} {article.abstract_snippet or ''}".casefold()
+        score = 0
+        if target and target in text:
+            score += 75
+        score += 20 * sum(1 for condition in conditions if condition and condition in text)
+        for pattern, weight in (
+            (r"\bprevalence\b", 10),
+            (r"\bepidemiolog(?:y|ic|ical)\b", 8),
+            (r"\bpopulation\b", 6),
+            (r"\bUnited States\b|\bU\.?S\.?\b", 8),
+            (r"\bmillion\b|\bpatients\b|\badults\b", 5),
+            (r"\brandomi[sz]ed\b|\bclinical trial\b", -8),
+        ):
+            if re.search(pattern, text, re.I):
+                score += weight
+        scored.append((score, -index, article))
+    scored.sort(reverse=True)
+    limit = _env_int("PHARMA_OS_MARKET_EPI_MAX_ABSTRACTS", 8, minimum=1, maximum=25)
+    return [article for _, _, article in scored[:limit]]
+
+
+def _population_evidence_from_extraction(extraction: EpidemiologyEvidenceExtraction) -> tuple[dict[str, Any], ...]:
+    items: list[dict[str, Any]] = []
+    selected = extraction.selected_population_measure
+    if selected and selected.value is not None:
+        payload = selected.model_dump(mode="json")
+        if extraction.selected_source_id:
+            payload["source_id"] = extraction.selected_source_id
+        items.append(payload)
+    for candidate in extraction.candidate_population_measures:
+        if candidate.value is None:
+            continue
+        payload = candidate.model_dump(mode="json")
+        if not any(item.get("value") == payload.get("value") and item.get("source_id") == payload.get("source_id") for item in items):
+            items.append(payload)
+    return tuple(items)
+
+
+def _market_source_ids(market_evidence: dict[str, Any]) -> tuple[str, ...]:
+    return tuple(str(source_id) for source_id in market_evidence.get("source_ids") or () if source_id)
+
+
+def _market_user_overrides(market_evidence: dict[str, Any]) -> dict[str, Any]:
+    del market_evidence
+    return {}
+
+
+def _combined_trace_metadata(items: dict[str, Any]) -> dict[str, str | int | float | bool | None]:
+    flattened: dict[str, str | int | float | bool | None] = {}
+    for prefix, value in items.items():
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    flattened[f"{prefix}_{key}"] = item
+    return flattened
+
+
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
 
 
 def calculate_commercial_model(
@@ -582,15 +924,22 @@ def _legacy_assumptions(
     user_overrides: dict[str, Any],
 ) -> list[Any]:
     selected_annual_patients = interpretation.selected_population_measure.value
+    population_reference = interpretation.selected_population_measure.evidence_reference
+    population_source_ids = (
+        (population_reference,)
+        if isinstance(population_reference, str)
+        and (population_reference.startswith("pubmed:") or population_reference.startswith("ctgov:"))
+        else (config_id,) if selected_annual_patients is not None else ()
+    )
     assumptions = [
         assumption(
             "commercial-annual-patients",
             "annual_patients",
             selected_annual_patients,
             "patients",
-            interpretation.selected_population_measure.evidence_reference or "commercial_market_sizing",
+            population_reference or "commercial_market_sizing",
             assumption_type="user_reviewed" if interpretation.selected_population_measure.source_type == "user_override" else "source_derived" if selected_annual_patients is not None else "missing",
-            source_ids=() if interpretation.selected_population_measure.source_type == "user_override" else (config_id,) if selected_annual_patients is not None else (),
+            source_ids=() if interpretation.selected_population_measure.source_type == "user_override" else population_source_ids,
             requires_human_review=interpretation.selected_population_measure.human_review_required,
         ),
         select_assumption_value(

@@ -46,6 +46,7 @@ def understand_orchestration_goal(
             "decision_type",
             "target_capability",
             "requested_outputs",
+            "execution_scope",
         ),
         "constraints": (
             "Return only structured RequestUnderstandingOutput. Extract NCT IDs exactly when present. "
@@ -57,9 +58,17 @@ def understand_orchestration_goal(
             "and do not invent missing implementation details. For executable clinical workflows, nct_id is the only "
             "hard required goal-only field. Commercial assumptions are optional reviewed inputs for due_diligence and "
             "protocol_design; extract them when present, but do not mark reviewed_commercial_assumptions or individual "
-            "commercial assumptions as missing_required_fields when an NCT ID is present. If an executable clinical "
-            "workflow lacks hard required inputs, populate missing_required_fields and clarifying_questions. If the user explicitly asks to reuse existing "
-            "memory/artifacts, reflect that in the rationale and do not add force_refresh."
+            "commercial assumptions as missing_required_fields when an NCT ID is present. Do not ask the user to choose "
+            "output formats, full-vs-limited deliverables, reuse behavior, or commercial defaults for an implemented "
+            "workflow; map to the registered capability and let Control Tower plan run/reuse/refresh from memory. Do not "
+            "put run/reuse/refresh intent into assumptions. Use force_refresh only when the user explicitly requests a "
+            "fresh rerun or refresh; otherwise leave it empty and let Control Tower decide from Scientific Memory. If an "
+            "explicit fresh rerun/refresh is scoped with words like only, just, solely, or specifically, set execution_scope "
+            "to target_only for the requested target capability. If the user asks for the full dependency chain or all related "
+            "workflows, set execution_scope to full_path. If dependencies may be reused but not refreshed unless required, set "
+            "execution_scope to target_with_dependencies. "
+            "executable clinical workflow lacks hard required inputs, populate missing_required_fields and clarifying_questions. "
+            "If the user explicitly asks to reuse existing memory/artifacts, reflect that in the rationale and leave force_refresh empty."
         ),
     }
     try:
@@ -88,30 +97,30 @@ def _request_understanding_error_message(exc: AgentRuntimeError, runtime_config:
         if not os.getenv("OPENAI_API_KEY"):
             return (
                 "Natural-language goal parsing requires live AI, but OPENAI_API_KEY is not visible to this Python process. "
-                "Run from the PharmaOS project directory with .env present, export OPENAI_API_KEY, or pass explicit "
-                "structured flags such as --nct-id / --input-json."
+                "Run from the PharmaOS project directory with .env present, export OPENAI_API_KEY, or pass --input-json "
+                "with a complete OrchestrationRequest."
             )
         if _truthy_env("PHARMA_OS_AGENTS_DISABLED") or _truthy_env("PHARMA_OS_OFFLINE"):
             return (
                 "Natural-language goal parsing requires live AI, but live agents are disabled "
                 f"({runtime_config.provenance}). Set PHARMA_OS_AGENTS_DISABLED=false and PHARMA_OS_OFFLINE=false/unset, "
-                "or pass explicit structured flags such as --nct-id / --input-json."
+                "or pass --input-json with a complete OrchestrationRequest."
             )
         live_setting = os.getenv("PHARMA_OS_ENABLE_LIVE_AGENTS")
         if live_setting is not None and live_setting.strip() and not _truthy_env("PHARMA_OS_ENABLE_LIVE_AGENTS"):
             return (
                 "Natural-language goal parsing requires live AI, but PHARMA_OS_ENABLE_LIVE_AGENTS is set to false. "
-                "Set PHARMA_OS_ENABLE_LIVE_AGENTS=true or pass explicit structured flags such as --nct-id / --input-json."
+                "Set PHARMA_OS_ENABLE_LIVE_AGENTS=true or pass --input-json with a complete OrchestrationRequest."
             )
         return (
             "Natural-language goal parsing requires live AI, but the request-understanding route is disabled "
-            f"({runtime_config.provenance}). Pass explicit structured flags such as --nct-id / --input-json."
+            f"({runtime_config.provenance}). Pass --input-json with a complete OrchestrationRequest."
         )
     return (
         "Natural-language goal parsing attempted a live OpenAI call but it failed. "
         f"Route={route}; model={model}; error={exc.__class__.__name__}: {str(exc)[:700]}. "
         "Check model access/availability for this account, API key validity, billing/project permissions, and rate limits. "
-        "You can temporarily bypass AI parsing with --nct-id or --input-json."
+        "You can temporarily bypass AI parsing with --input-json containing a complete OrchestrationRequest."
     )
 
 
@@ -129,5 +138,7 @@ def _instructions() -> str:
         "workbook paths, launch year, or LOE year; they are not summaries of the user's intent. Prefer target_capability "
         "values from the registry. For currently executable clinical workflows, an NCT ID is required. For unsupported "
         "registered capabilities, return the capability and let the Control Tower block. If the user asks to reuse existing "
-        "memory/artifacts, do not convert that into a fresh-run request."
+        "memory/artifacts, do not convert that into a fresh-run request. If the user explicitly asks to remake, rerun, refresh, "
+        "regenerate, or redo a capability, put that capability in force_refresh. If the user scopes that request to only one "
+        "capability, set execution_scope to target_only; otherwise distinguish target_with_dependencies, full_path, or unspecified."
     )

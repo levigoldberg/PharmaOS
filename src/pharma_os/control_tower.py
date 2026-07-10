@@ -119,6 +119,12 @@ def build_deterministic_execution_plan(
             blocked = True
             block_reasons.extend(step.blocked_by)
         steps.append(step)
+        if (
+            step.action == "block"
+            and _target_only_requested(request)
+            and step.capability_name != _scoped_target_capability(request, snapshot)
+        ):
+            break
 
     if not steps:
         blocked = True
@@ -181,6 +187,12 @@ def validate_execution_plan(
                         failures.append(f"missing dependency: {', '.join(missing_deps)}")
             if step.action in {"run", "refresh"} and (not capability.executable or capability.implementation_status != "implemented"):
                 failures.append("non-implemented capability cannot be executed")
+            if (
+                _target_only_requested(plan.request)
+                and step.action in {"run", "refresh"}
+                and step.capability_name != _scoped_target_capability(plan.request, snapshot)
+            ):
+                failures.append("target-only request cannot execute non-target dependency")
             if step.action in {"run", "refresh"} and snapshot.evidence_requirements and not relevant_requirements:
                 failures.append("capability does not address pending decision requirements")
             if step.action in {"run", "refresh"} and relevant_requirements and not set(step.requirements_addressed):
@@ -238,6 +250,8 @@ def _planned_step(
     requirements = _requirements_for_capability(snapshot, capability)
     unsatisfied = _unsatisfied_requirements_for_capability(snapshot, capability)
     requirements_addressed = tuple(requirement.requirement_id for requirement in (unsatisfied or requirements))
+    scoped_target = _scoped_target_capability(request, snapshot)
+    target_only_dependency = _target_only_requested(request) and scoped_target is not None and capability.name != scoped_target
     if _skip_requested(capability, request):
         return PlannedStep(
             step_id=f"step-{uuid4()}",
@@ -252,6 +266,23 @@ def _planned_step(
             requirements_addressed=requirements_addressed,
             decision_rationale="Explicit user-requested skip; skipped requirements remain unsatisfied.",
             stop_reason="Skipped by objective.",
+        )
+    if target_only_dependency and (not artifact or artifact.compatibility != "compatible"):
+        return PlannedStep(
+            step_id=f"step-{uuid4()}",
+            capability_name=capability.name,
+            action="block",
+            reason=f"{capability.name} is required by {scoped_target}, but target-only scope forbids running or refreshing dependencies.",
+            required_artifacts=capability.required_artifacts,
+            produced_artifacts=capability.produced_artifacts,
+            depends_on=dependencies,
+            blocked_by=(f"target-only scope requires an existing compatible {capability.name} artifact",),
+            human_gate_required=True,
+            executable=False,
+            confidence=0.85,
+            requirements_addressed=requirements_addressed,
+            decision_rationale="The user scoped execution to only the requested target workflow; missing dependencies require clarification or a broader scope.",
+            stop_reason="Run the dependency first or request the full dependency path.",
         )
     if not capability.executable or capability.implementation_status != "implemented":
         return PlannedStep(
@@ -350,6 +381,9 @@ def _planned_step(
 
 
 def _infer_target_capabilities(request: OrchestrationRequest, registry: WorkflowRegistry, *, snapshot: ScientificStateSnapshot | None = None) -> tuple[str, ...]:
+    explicit_target = request.identifiers.get("target_capability")
+    if explicit_target in registry.names():
+        return (explicit_target,)
     text = f"{request.objective} {' '.join(request.identifiers.values())}".casefold()
     targets: list[str] = []
     if snapshot and snapshot.pending_decision and snapshot.pending_decision.target_capability_name in registry.names():
@@ -454,6 +488,17 @@ def _allowed_target_path_capabilities(
     if not target or target not in registry.names():
         return set()
     return set(_dependency_order((target,), registry))
+
+
+def _scoped_target_capability(request: OrchestrationRequest, snapshot: ScientificStateSnapshot | None) -> str | None:
+    target = request.identifiers.get("target_capability")
+    if not target and snapshot and snapshot.pending_decision:
+        target = snapshot.pending_decision.target_capability_name
+    return target or None
+
+
+def _target_only_requested(request: OrchestrationRequest) -> bool:
+    return request.identifiers.get("execution_scope") == "target_only"
 
 
 def _refresh_justified(
@@ -574,7 +619,8 @@ def _control_tower_instructions() -> str:
         "dependencies, and force_refresh to choose run, reuse, refresh, skip, or block. "
         "If prior_plan_validation_feedback is supplied, correct the plan so it passes those deterministic validation checks. "
         "Only plan the requested target capability and its registry dependencies; do not add downstream workflows that the "
-        "objective did not request. "
+        "objective did not request. If request.identifiers.execution_scope is target_only, reuse compatible dependencies when "
+        "needed but do not run or refresh non-target dependencies unless the request explicitly broadens scope. "
         "Do not blindly plan Agent 3 to Agent 4 to Agent 5; choose the minimum justified path. "
         "Block unavailable skeleton capabilities and state missing connectors."
     )

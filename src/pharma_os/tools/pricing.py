@@ -11,10 +11,33 @@ from typing import Any
 
 import httpx
 from openpyxl import load_workbook
+from pydantic import Field
 
-from pharma_os.schemas import AssetIdentityOutput, MissingDataFlag, PricingOutput, SourceMetadata
+from pharma_os.agent_runtime import AgentRuntimeError, run_structured_llm_call, runtime_config_for_route
+from pharma_os.schemas import AssetIdentityOutput, MissingDataFlag, PricingOutput, SourceMetadata, StrictSchema
 from pharma_os.tools._due_diligence_common import DEFAULT_WAC_DATA, OPENFDA_LABEL_URL, first_text, missing, norm, slug, to_float
 from pharma_os.tools.rules import config_provenance, config_source, load_config
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+WAC_COLUMN_ALIASES = {
+    "brand_name": ("brand_name", "brand", "proprietary_name", "drug name"),
+    "generic_name": ("generic_name", "generic", "nonproprietary_name", "generic name"),
+    "manufacturer": ("manufacturer", "labeler_name", "company", "manufacturer_name", "manufacturer name"),
+    "ndc": ("ndc", "ndc11", "ndc code", "product_ndc", "ndc number"),
+    "product_description": ("product_description", "description", "drugname", "product", "drug product description"),
+    "strength": ("strength", "strengths"),
+    "dosage_form": ("dosage_form", "form"),
+    "package_size": ("package_size", "package", "pkg_size"),
+    "wac_value": ("wac_value", "wac", "current wac", "price", "unit_wac", "wac after increase"),
+    "currency": ("currency",),
+    "wac_unit_basis": ("wac_unit_basis", "unit basis", "pricing unit"),
+    "effective_date": ("effective_date", "effective date", "date", "wac effective date"),
+    "date_reported": ("date_reported", "date reported"),
+    "source_file": ("source_file",),
+    "source_sheet": ("source_sheet",),
+    "source_year": ("source_year",),
+}
 
 
 @dataclass(frozen=True)
@@ -24,6 +47,9 @@ class PricingSearchTerm:
     value: str
     is_analog: bool = False
     reason: str | None = None
+    relevance_score: int = 100
+    brand_name: str | None = None
+    generic_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -32,6 +58,25 @@ class AnnualizedWAC:
 
     annual_wac: float
     details: dict[str, str | int | float | bool | None]
+
+
+class PricingAnalogCandidate(StrictSchema):
+    """Approved pricing analog candidate before WAC source matching."""
+
+    brand_name: str | None = None
+    generic_name: str | None = None
+    approved_indication: str | None = None
+    route: str | None = None
+    modality: str | None = None
+    rationale: str = Field(..., min_length=1)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class PricingAnalogSelectionOutput(StrictSchema):
+    """Candidate approved analogs for source-constrained WAC matching."""
+
+    candidates: tuple[PricingAnalogCandidate, ...] = Field(default_factory=tuple)
+    human_review_flags: tuple[str, ...] = Field(default_factory=tuple)
 
 
 def lookup_pricing(
@@ -57,33 +102,41 @@ def lookup_pricing(
     wac_value = None
     matched_product = None
     matched_term: PricingSearchTerm | None = None
-    if not path.exists():
-        flags.append(missing("pricing-wac-file-missing", "pricing", "wac_value", f"WAC workbook not found: {path}", "high"))
+    resolved_path = _resolve_wac_path(path)
+    if not resolved_path.exists():
+        flags.append(missing("pricing-wac-file-missing", "pricing", "wac_value", f"WAC workbook not found: {resolved_path}", "high"))
     elif not asset.asset_name:
         flags.append(missing("pricing-asset-missing", "pricing", "matched_product", "No asset name available for WAC lookup.", "high"))
     else:
         try:
             terms = _pricing_terms(asset)
-            wb = load_workbook(path, data_only=True, read_only=True)
-            ws = wb["combined_wac_increases"]
-            headers = [str(cell.value).strip() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+            rows = _load_wac_rows(resolved_path)
             matches: list[tuple[dict[str, Any], PricingSearchTerm]] = []
-            for row in ws.iter_rows(min_row=2, values_only=True):
-                row_map = dict(zip(headers, row))
+            for row_map in rows:
                 match = _match_wac_row(row_map, terms)
                 if match is not None:
                     matches.append((row_map, match))
             if matches:
                 row_map, matched_term = _select_wac_match(matches)
-                wac_value = to_float(row_map.get("WAC After Increase"))
-                description = str(row_map.get("Drug Product Description") or "")
+                wac_value = to_float(row_map.get("wac_value"))
+                description = str(row_map.get("product_description") or "")
                 matched_product = (
                     f"{description} (pricing analog: {matched_term.value}; {matched_term.reason})"
                     if matched_term.is_analog and matched_term.reason
                     else description
                 )
             if wac_value is None:
-                flags.append(missing("pricing-no-wac-match", "pricing", "wac_value", f"No WAC row matched {asset.asset_name}.", "high"))
+                flags.append(
+                    missing(
+                        "pricing-no-wac-match",
+                        "pricing",
+                        "wac_value",
+                        f"No exact or source-constrained pricing analog WAC row matched {asset.asset_name}.",
+                        "high",
+                    )
+                )
+        except AgentRuntimeError:
+            raise
         except Exception as exc:
             flags.append(missing("pricing-wac-error", "pricing", "wac_value", f"WAC lookup failed: {exc.__class__.__name__}.", "high"))
 
@@ -159,50 +212,177 @@ def lookup_pricing(
 
 
 def _pricing_terms(asset: AssetIdentityOutput) -> tuple[PricingSearchTerm, ...]:
-    terms = [PricingSearchTerm(term) for term in [asset.asset_name, *asset.aliases] if term]
+    terms = [
+        PricingSearchTerm(term, relevance_score=100, brand_name=asset.asset_name)
+        for term in [asset.asset_name, *asset.aliases]
+        if term
+    ]
     if asset.rxnorm_match:
-        terms.extend(PricingSearchTerm(term) for term in [asset.rxnorm_match.matched_name, *asset.rxnorm_match.aliases] if term)
+        terms.extend(
+            PricingSearchTerm(term, relevance_score=100, brand_name=asset.rxnorm_match.matched_name)
+            for term in [asset.rxnorm_match.matched_name, *asset.rxnorm_match.aliases]
+            if term
+        )
     terms.extend(_pricing_analog_terms(asset))
     deduped: dict[str, PricingSearchTerm] = {}
     for term in terms:
         key = norm(term.value)
-        if key and key not in deduped:
+        if key and (key not in deduped or term.relevance_score > deduped[key].relevance_score):
             deduped[key] = term
     return tuple(deduped.values())
 
 
 def _pricing_analog_terms(asset: AssetIdentityOutput) -> tuple[PricingSearchTerm, ...]:
+    candidates = _pricing_analog_candidates(asset)
+    terms: list[PricingSearchTerm] = []
+    for index, candidate in enumerate(candidates):
+        score = max(1, min(99, int(candidate.confidence * 100))) - index
+        reason = candidate.rationale
+        if candidate.brand_name:
+            terms.append(
+                PricingSearchTerm(
+                    candidate.brand_name,
+                    is_analog=True,
+                    reason=reason,
+                    relevance_score=score,
+                    brand_name=candidate.brand_name,
+                    generic_name=candidate.generic_name,
+                )
+            )
+        if candidate.generic_name:
+            terms.append(
+                PricingSearchTerm(
+                    candidate.generic_name,
+                    is_analog=True,
+                    reason=reason,
+                    relevance_score=score,
+                    brand_name=candidate.brand_name,
+                    generic_name=candidate.generic_name,
+                )
+            )
+    return tuple(terms)
+
+
+def _pricing_analog_candidates(asset: AssetIdentityOutput) -> tuple[PricingAnalogCandidate, ...]:
+    fallback = _fallback_pricing_analog_selection(asset)
+    result = run_structured_llm_call(
+        agent_name="PricingAnalogSelectionAgent",
+        instructions=_pricing_analog_selection_instructions(),
+        payload={"asset_context": _pricing_asset_context(asset)},
+        output_type=PricingAnalogSelectionOutput,
+        run_id=f"pricing-analog-selection-{slug(asset.nct_id or asset.asset_name or 'asset')}",
+        input_summary=f"Select approved pricing analogs for {asset.asset_name or asset.nct_id}.",
+        config=runtime_config_for_route(
+            model_route="agent4_subagent",
+            disabled_provenance="pharma_os.tools.pricing",
+        ),
+        offline_output=fallback,
+        source_ids=asset.source_ids,
+        confidence=asset.confidence,
+        rationale_summary="Select approved commercial pricing analog candidates before deterministic WAC source matching.",
+    )
+    selected = result.output
+    return _dedupe_analog_candidates((*selected.candidates, *fallback.candidates))
+
+
+def _fallback_pricing_analog_selection(asset: AssetIdentityOutput) -> PricingAnalogSelectionOutput:
     text = _word_text(asset.asset_name, asset.normalized_indication, asset.therapeutic_area, *asset.aliases)
-    analogs: list[PricingSearchTerm] = []
+    analogs: list[PricingAnalogCandidate] = []
     if any(term in text for term in ("sle", "lupus", "systemic lupus erythematosus")):
         if "nephritis" in text:
             analogs.extend(
                 [
-                    PricingSearchTerm("Lupkynis", is_analog=True, reason="lupus nephritis approved pricing analog"),
-                    PricingSearchTerm("voclosporin", is_analog=True, reason="lupus nephritis approved pricing analog"),
+                    _analog("Lupkynis", "voclosporin", "lupus nephritis approved pricing analog", indication="lupus nephritis", route="oral", modality="small molecule", confidence=0.85),
                 ]
             )
         analogs.extend(
             [
-                PricingSearchTerm("Benlysta", is_analog=True, reason="systemic lupus erythematosus approved pricing analog"),
-                PricingSearchTerm("belimumab", is_analog=True, reason="systemic lupus erythematosus approved pricing analog"),
+                _analog("Benlysta", "belimumab", "systemic lupus erythematosus approved pricing analog", indication="systemic lupus erythematosus", route="subcutaneous", modality="biologic", confidence=0.82),
+            ]
+        )
+    if any(term in text for term in ("atopic dermatitis", "eczema", "dermatitis", "ad ")):
+        analogs.extend(
+            [
+                _analog("Cibinqo", "abrocitinib", "atopic dermatitis oral JAK inhibitor approved pricing analog", indication="atopic dermatitis", route="oral", modality="small molecule", confidence=0.88),
+                _analog("Rinvoq", "upadacitinib", "atopic dermatitis oral JAK inhibitor approved pricing analog", indication="atopic dermatitis", route="oral", modality="small molecule", confidence=0.84),
+                _analog("Dupixent", "dupilumab", "atopic dermatitis biologic approved pricing analog", indication="atopic dermatitis", route="subcutaneous", modality="biologic", confidence=0.78),
+                _analog("Adbry", "tralokinumab", "atopic dermatitis biologic approved pricing analog", indication="atopic dermatitis", route="subcutaneous", modality="biologic", confidence=0.72),
             ]
         )
     if any(term in text for term in ("psoriasis", "psoriatic", "tyk2", "tyrosine kinase 2")):
         analogs.extend(
             [
-                PricingSearchTerm("Sotyktu", is_analog=True, reason="TYK2/psoriasis approved pricing analog"),
-                PricingSearchTerm("deucravacitinib", is_analog=True, reason="TYK2/psoriasis approved pricing analog"),
+                _analog("Sotyktu", "deucravacitinib", "TYK2/psoriasis approved pricing analog", indication="plaque psoriasis", route="oral", modality="small molecule", confidence=0.85),
             ]
         )
     if "rheumatoid arthritis" in text or ("autoimmune" in text and "small molecule" in text):
         analogs.extend(
             [
-                PricingSearchTerm("Rinvoq", is_analog=True, reason="autoimmune oral small-molecule approved pricing analog"),
-                PricingSearchTerm("upadacitinib", is_analog=True, reason="autoimmune oral small-molecule approved pricing analog"),
+                _analog("Rinvoq", "upadacitinib", "autoimmune oral small-molecule approved pricing analog", route="oral", modality="small molecule", confidence=0.78),
             ]
         )
-    return tuple(analogs)
+    return PricingAnalogSelectionOutput(candidates=_dedupe_analog_candidates(tuple(analogs)))
+
+
+def _analog(
+    brand_name: str,
+    generic_name: str,
+    rationale: str,
+    *,
+    indication: str | None = None,
+    route: str | None = None,
+    modality: str | None = None,
+    confidence: float = 0.7,
+) -> PricingAnalogCandidate:
+    return PricingAnalogCandidate(
+        brand_name=brand_name,
+        generic_name=generic_name,
+        approved_indication=indication,
+        route=route,
+        modality=modality,
+        rationale=rationale,
+        confidence=confidence,
+    )
+
+
+def _dedupe_analog_candidates(candidates: tuple[PricingAnalogCandidate, ...]) -> tuple[PricingAnalogCandidate, ...]:
+    deduped: dict[tuple[str, str], PricingAnalogCandidate] = {}
+    for candidate in candidates:
+        key = (norm(candidate.brand_name or ""), norm(candidate.generic_name or ""))
+        if not any(key):
+            continue
+        existing = deduped.get(key)
+        if existing is None or candidate.confidence > existing.confidence:
+            deduped[key] = candidate
+    return tuple(deduped.values())
+
+
+def _pricing_asset_context(asset: AssetIdentityOutput) -> dict[str, Any]:
+    return {
+        "nct_id": asset.nct_id,
+        "asset_name": asset.asset_name,
+        "aliases": asset.aliases,
+        "raw_intervention_names": asset.raw_intervention_names,
+        "intervention_type": asset.intervention_type,
+        "sponsor": asset.sponsor,
+        "normalized_indication": asset.normalized_indication,
+        "therapeutic_area": asset.therapeutic_area,
+        "modality": asset.modality,
+        "guardrails": (
+            "Return approved commercial drug analogs only. Do not invent WAC values, dosing, labels, or unapproved products. "
+            "Prefer analogs likely to have public label dosing and approved WAC workbook rows."
+        ),
+    }
+
+
+def _pricing_analog_selection_instructions() -> str:
+    return (
+        "You are PricingAnalogSelectionAgent for PharmaOS Agent 4. Select approved commercial pricing analog candidates "
+        "for the target investigational asset using only the supplied asset context. Prefer analogs by indication, route, "
+        "modality, mechanism/class, prescriber setting, and commercial use. Return candidates only; deterministic code will "
+        "match candidates to the approved WAC workbook and fetch openFDA dosing. Do not calculate price, claim WAC "
+        "availability, fetch labels, or fabricate evidence."
+    )
 
 
 def _label_terms(asset: AssetIdentityOutput, matched_term: PricingSearchTerm | None) -> tuple[PricingSearchTerm, ...]:
@@ -223,9 +403,11 @@ def _label_terms(asset: AssetIdentityOutput, matched_term: PricingSearchTerm | N
 
 def _match_wac_row(row_map: dict[str, Any], terms: tuple[PricingSearchTerm, ...]) -> PricingSearchTerm | None:
     haystacks = [
-        str(row_map.get("Drug Product Description") or ""),
-        str(row_map.get("Manufacturer Name") or ""),
-        str(row_map.get("NDC Number") or ""),
+        str(row_map.get("brand_name") or ""),
+        str(row_map.get("generic_name") or ""),
+        str(row_map.get("product_description") or ""),
+        str(row_map.get("manufacturer") or ""),
+        str(row_map.get("ndc") or ""),
     ]
     normalized_haystacks = [norm(item) for item in haystacks]
     for term in terms:
@@ -239,12 +421,15 @@ def _select_wac_match(matches: list[tuple[dict[str, Any], PricingSearchTerm]]) -
     return sorted(matches, key=_wac_selection_key, reverse=True)[0]
 
 
-def _wac_selection_key(match: tuple[dict[str, Any], PricingSearchTerm]) -> tuple[datetime, int, int]:
+def _wac_selection_key(match: tuple[dict[str, Any], PricingSearchTerm]) -> tuple[Any, ...]:
     row, term = match
     return (
-        _parse_date(str(row.get("WAC Effective Date") or "")),
         0 if term.is_analog else 1,
-        -(_units_per_package(str(row.get("Drug Product Description") or "")) or 999999),
+        term.relevance_score,
+        _parse_date(str(row.get("effective_date") or "")),
+        _parse_date(str(row.get("date_reported") or "")),
+        int(to_float(row.get("source_year")) or 0),
+        -(_units_per_package(str(row.get("product_description") or "")) or 999999),
     )
 
 
@@ -316,7 +501,11 @@ def _units_per_package(product_description: str) -> int | None:
     text = product_description.casefold()
     if match := re.search(r"\bx\s*(\d+)\b", text):
         return int(match.group(1))
-    if match := re.search(r"\b(\d+)\s*(?:capsules?|tablets?|tabs?|count|ct|ea|pack)\b", text):
+    if match := re.search(r"\b(\d+)\s*(?:capsules?|tablets?|tabs?|count|ct|ea|pack|pens?|syringes?|auto-?injectors?|autoinjectors?|vials?)\b", text):
+        return int(match.group(1))
+    if match := re.search(r"\b(?:capsules?|tablets?|tabs?|pens?|syringes?|auto-?injectors?|autoinjectors?|vials?)\s*(\d+)\b", text):
+        return int(match.group(1))
+    if match := re.search(r"-\s*(\d+)\s*(?:pens?|syringes?|auto-?injectors?|autoinjectors?|vials?)\b", text):
         return int(match.group(1))
     if match := re.search(r"\b(\d+)\s*day\s*bottle\b", text):
         return int(match.group(1))
@@ -361,3 +550,36 @@ def _configured_wac_path(config: dict[str, Any]) -> str | None:
         if isinstance(source, dict) and source.get("local_path"):
             return str(source["local_path"])
     return None
+
+
+def _resolve_wac_path(path: Path) -> Path:
+    if path.is_absolute() or path.exists():
+        return path
+    repo_path = REPO_ROOT / path
+    if repo_path.exists():
+        return repo_path
+    return path
+
+
+def _load_wac_rows(path: Path) -> list[dict[str, Any]]:
+    wb = load_workbook(path, data_only=True, read_only=True)
+    sheet_name = "combined_wac_increases" if "combined_wac_increases" in wb.sheetnames else wb.sheetnames[0]
+    ws = wb[sheet_name]
+    headers = [str(cell.value or "").strip() for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    normalized_headers = {_normalize_header(header): index for index, header in enumerate(headers)}
+    rows: list[dict[str, Any]] = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        normalized: dict[str, Any] = {}
+        for target, aliases in WAC_COLUMN_ALIASES.items():
+            index = next(
+                (normalized_headers[_normalize_header(alias)] for alias in aliases if _normalize_header(alias) in normalized_headers),
+                None,
+            )
+            normalized[target] = row[index] if index is not None and index < len(row) else None
+        if any(normalized.get(key) for key in ("product_description", "brand_name", "generic_name", "ndc")):
+            rows.append(normalized)
+    return rows
+
+
+def _normalize_header(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()

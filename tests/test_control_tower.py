@@ -564,7 +564,7 @@ def test_orchestrate_reuses_existing_artifact_without_rerun(monkeypatch) -> None
     assert calls == {}
 
 
-def test_goal_only_execution_intent_refreshes_existing_target_artifact(capsys, tmp_path, monkeypatch) -> None:
+def test_goal_only_mapped_capability_lets_control_tower_reuse_existing_artifact(capsys, tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "memory.sqlite"
     store = MemoryStore(db_path)
     _save_completed_run(store, "clinical_outcome_prediction", "NCT04903795", "agent3-output")
@@ -608,11 +608,11 @@ def test_goal_only_execution_intent_refreshes_existing_target_artifact(capsys, t
     stdout = capsys.readouterr().out
     assert "Orchestration completed" in stdout
     payload = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
-    assert payload["request"]["identifiers"]["execution_intent"] == "run_fresh"
-    assert payload["request"]["force_refresh"] == ["clinical_outcome_prediction"]
+    assert "execution_intent" not in payload["request"]["identifiers"]
+    assert payload["request"]["force_refresh"] == []
     assert payload["step_results"][0]["capability_name"] == "clinical_outcome_prediction"
-    assert payload["step_results"][0]["status"] == "refreshed"
-    assert calls == {"clinical_outcome_prediction": 1}
+    assert payload["step_results"][0]["status"] == "reused"
+    assert calls == {}
 
 
 def test_goal_only_explicit_reuse_intent_keeps_existing_artifact(capsys, tmp_path, monkeypatch) -> None:
@@ -659,7 +659,7 @@ def test_goal_only_explicit_reuse_intent_keeps_existing_artifact(capsys, tmp_pat
     stdout = capsys.readouterr().out
     assert "Orchestration completed" in stdout
     payload = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
-    assert payload["request"]["identifiers"]["execution_intent"] == "reuse_existing"
+    assert "execution_intent" not in payload["request"]["identifiers"]
     assert payload["request"]["force_refresh"] == []
     assert payload["step_results"][0]["status"] == "reused"
     assert payload["step_results"][0]["reused_output_id"] == "agent3-output"
@@ -697,6 +697,84 @@ def test_orchestrate_refreshes_downstream_after_upstream_change(monkeypatch) -> 
     assert [result.status for result in record.step_results] == ["refreshed", "refreshed"]
     assert calls == {"clinical_outcome_prediction": 1, "due_diligence": 1}
     assert len(record.replans) >= 1
+
+
+def test_target_only_refresh_reuses_dependency_and_supersedes_target(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output", run_id="old-agent3-run")
+    _save_completed_run(store, "due_diligence", "NCT12345678", "old-agent4", run_id="old-agent4-run")
+    calls = _install_fake_runners(monkeypatch)
+
+    record = Orchestrator(memory=store).orchestrate(
+        OrchestrationRequest(
+            objective="Remake only commercial due diligence for NCT12345678",
+            nct_id="NCT12345678",
+            identifiers={"target_capability": "due_diligence", "execution_scope": "target_only", "execution_intent": "run_fresh"},
+            force_refresh=("due_diligence",),
+        )
+    )
+
+    assert [result.capability_name for result in record.step_results] == ["clinical_outcome_prediction", "due_diligence"]
+    assert [result.status for result in record.step_results] == ["reused", "refreshed"]
+    assert calls == {"due_diligence": 1}
+    old_bundle = store.get_run_bundle("old-agent4-run")
+    new_bundle = store.get_run_bundle("due_diligence-child-1")
+    assert old_bundle.run is not None
+    assert new_bundle.run is not None
+    assert old_bundle.run.metadata["artifact_lineage_status"] == "superseded"
+    assert old_bundle.run.metadata["superseded_by_run_id"] == "due_diligence-child-1"
+    assert new_bundle.run.metadata["artifact_lineage_status"] == "current"
+    assert new_bundle.run.metadata["supersedes_run_ids"] == ["old-agent4-run"]
+    latest = store.get_latest_workflow_output(workflow_name="due_diligence", nct_id="NCT12345678")
+    assert latest is not None
+    assert latest[0].run_id == "due_diligence-child-1"
+
+
+def test_target_only_refresh_blocks_missing_dependency(monkeypatch) -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "due_diligence", "NCT12345678", "old-agent4", run_id="old-agent4-run")
+    calls = _install_fake_runners(monkeypatch)
+
+    record = Orchestrator(memory=store).orchestrate(
+        OrchestrationRequest(
+            objective="Remake only commercial due diligence for NCT12345678",
+            nct_id="NCT12345678",
+            identifiers={"target_capability": "due_diligence", "execution_scope": "target_only", "execution_intent": "run_fresh"},
+            force_refresh=("due_diligence",),
+        )
+    )
+
+    assert record.step_results[0].capability_name == "clinical_outcome_prediction"
+    assert record.step_results[0].status == "blocked"
+    assert "target-only scope" in record.step_results[0].rationale
+    assert calls == {}
+
+
+def test_plan_validator_rejects_non_target_execution_for_target_only_scope() -> None:
+    store = MemoryStore(":memory:")
+    _save_completed_run(store, "clinical_outcome_prediction", "NCT12345678", "agent3-output", run_id="old-agent3-run")
+    _save_completed_run(store, "due_diligence", "NCT12345678", "old-agent4", run_id="old-agent4-run")
+    registry = WorkflowRegistry.default()
+    request = OrchestrationRequest(
+        objective="Remake only commercial due diligence for NCT12345678",
+        nct_id="NCT12345678",
+        identifiers={"target_capability": "due_diligence", "execution_scope": "target_only"},
+        force_refresh=("due_diligence",),
+    )
+    snapshot = store.build_scientific_state_snapshot(request, registry=registry)
+    plan = build_deterministic_execution_plan(run_id="run", request=request, snapshot=snapshot, registry=registry)
+    bad_steps = (
+        plan.steps[0].model_copy(update={"action": "refresh", "executable": True, "reason": "Badly refresh dependency."}),
+        plan.steps[1],
+    )
+    bad_plan = plan.model_copy(update={"steps": bad_steps})
+
+    results = validate_execution_plan(run_id="run-validation", plan=bad_plan, snapshot=snapshot, registry=registry)
+
+    assert any(
+        result.status == "failed" and "target-only request cannot execute non-target dependency" in result.message
+        for result in results
+    )
 
 
 def test_orchestrate_supports_skip(monkeypatch) -> None:
@@ -827,9 +905,28 @@ def test_orchestrate_no_unnecessary_agent_3_4_5_reruns(monkeypatch) -> None:
     assert calls == {}
 
 
-def test_orchestrate_cli_writes_json_and_html(capsys, tmp_path) -> None:
+def test_orchestrate_cli_writes_json_and_html(capsys, tmp_path, monkeypatch) -> None:
     output_json = tmp_path / "control_tower.json"
     output_html = tmp_path / "control_tower.html"
+    monkeypatch.setattr(
+        "pharma_os.cli.understand_orchestration_goal",
+        lambda **_: RequestUnderstandingOutput(
+            normalized_objective="Skip clinical risk for this trial",
+            target_capability="clinical_outcome_prediction",
+            decision_type="clinical_risk_assessment",
+            nct_id=None,
+            asset_name=None,
+            indication=None,
+            assumptions=(),
+            force_refresh=(),
+            skip_capabilities=("clinical_outcome_prediction",),
+            requested_outputs=(),
+            missing_required_fields=(),
+            clarifying_questions=(),
+            confidence=0.92,
+            rationale_summary="The user asked to skip the clinical-risk workflow for the explicit NCT ID.",
+        ),
+    )
 
     exit_code = main(
         [
@@ -1112,6 +1209,45 @@ def test_ai_assumptions_are_limited_to_workflow_inputs() -> None:
     assert request.assumptions == {"annual_patients": 1200}
 
 
+def test_ai_scoped_rerun_maps_to_force_refresh_and_target_only_scope() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Remake only commercial due diligence for NCT07011706",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT07011706",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=("due_diligence",),
+        skip_capabilities=(),
+        requested_outputs=(),
+        execution_scope="target_only",
+        missing_required_fields=(),
+        clarifying_questions=(),
+        confidence=0.94,
+        rationale_summary="User requested a fresh due-diligence rerun scoped only to the target workflow.",
+    )
+
+    request = _request_from_understanding(
+        goal="Remake only commercial due diligence for NCT07011706",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.nct_id == "NCT07011706"
+    assert request.identifiers["target_capability"] == "due_diligence"
+    assert request.identifiers["execution_scope"] == "target_only"
+    assert request.identifiers["execution_intent"] == "run_fresh"
+    assert request.force_refresh == ("due_diligence",)
+
+
 def test_optional_commercial_assumption_gap_does_not_block_due_diligence_goal() -> None:
     from pharma_os.cli import _request_from_understanding
 
@@ -1148,8 +1284,8 @@ def test_optional_commercial_assumption_gap_does_not_block_due_diligence_goal() 
     assert request.nct_id == "NCT05966480"
     assert request.identifiers["target_capability"] == "due_diligence"
     assert request.identifiers["optional_assumption_gaps"] == "reviewed_commercial_assumptions"
-    assert request.identifiers["execution_intent"] == "run_fresh"
-    assert request.force_refresh == ("due_diligence",)
+    assert "execution_intent" not in request.identifiers
+    assert request.force_refresh == ()
 
 
 def test_optional_commercial_and_identity_question_does_not_block_when_nct_present() -> None:
@@ -1191,6 +1327,88 @@ def test_optional_commercial_and_identity_question_does_not_block_when_nct_prese
 
     assert request.nct_id == "NCT05966480"
     assert request.identifiers["optional_assumption_gaps"] == "reviewed_commercial_assumptions"
+
+
+def test_optional_default_commercial_question_without_missing_fields_does_not_block() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Do the commercial due diligence for NCT05966480",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT05966480",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=(),
+        clarifying_questions=(
+            "Do you want default commercial assumptions for the diligence "
+            "(currency, WAC, peak penetration, launch year discount rate, etc.), "
+            "or will you provide custom commercial assumptions?",
+        ),
+        confidence=0.84,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    request = _request_from_understanding(
+        goal="Do the commercial due diligence for NCT05966480",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.nct_id == "NCT05966480"
+    assert request.identifiers["target_capability"] == "due_diligence"
+    assert "execution_intent" not in request.identifiers
+
+
+def test_output_format_scope_and_reuse_question_does_not_block_mapped_due_diligence_goal() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Do the commercial due diligence for NCT05966480",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT05966480",
+        asset_name=None,
+        indication=None,
+        assumptions=(),
+        force_refresh=(),
+        skip_capabilities=(),
+        requested_outputs=(),
+        missing_required_fields=(),
+        clarifying_questions=(
+            "Do you want a full Agent-4 due diligence deliverable (asset memo, commercial model, rNPV) "
+            "or a more limited commercial-only memo? Preferred output formats? (e.g., PDF memo, Excel "
+            "commercial model, CSV, or slide deck) Should I reuse any existing Agent-3/Agent-4 artifacts "
+            "already in the system for this NCT if present, or produce fresh analyses?",
+        ),
+        confidence=0.84,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    request = _request_from_understanding(
+        goal="Do the commercial due diligence for NCT05966480",
+        parsed=parsed,
+        explicit_nct=None,
+        explicit_asset_name=None,
+        explicit_indication=None,
+        explicit_assumptions={},
+        explicit_force_refresh=(),
+        registry=WorkflowRegistry.default(),
+    )
+
+    assert request.nct_id == "NCT05966480"
+    assert request.identifiers["target_capability"] == "due_diligence"
+    assert "execution_intent" not in request.identifiers
+    assert request.force_refresh == ()
 
 
 def test_missing_nct_still_blocks_due_diligence_goal() -> None:

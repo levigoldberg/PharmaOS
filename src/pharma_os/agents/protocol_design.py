@@ -10,8 +10,10 @@ from pydantic import BaseModel
 
 from pharma_os.agent_runtime import (
     AgentRuntimeConfig,
+    AgentRuntimeError,
     StructuredAgentResult,
     agents_sdk_output_schema,
+    agent_fallbacks_disabled,
     load_agents_sdk,
     run_structured_agent,
     run_structured_llm_call,
@@ -51,6 +53,33 @@ _DIRECT_LLM_AGENT_NAMES = frozenset(
         "StatisticalSkeletonAgent",
     }
 )
+
+
+_PROTOCOL_SECTION_FIELDS = {
+    "executive_synopsis": ("Executive Synopsis", "executive-synopsis", "strategy_sections"),
+    "strategic_rationale": ("Strategic Rationale", "strategic-rationale", "strategy_sections"),
+    "analog_trial_benchmark_summary": ("Analog Trial Benchmark Summary", "analog-benchmark", "strategy_sections"),
+    "target_population": ("Target Population", "target-population", "strategy_sections"),
+    "study_design": ("Study Design", "study-design", "strategy_sections"),
+    "comparator_and_landscape_rationale": ("Comparator And Landscape Rationale", "comparator-landscape", "strategy_sections"),
+    "endpoint_strategy": ("Endpoint Strategy", "endpoint-strategy", "strategy_sections"),
+    "safety_monitoring_outline": ("Safety Monitoring Outline", "safety-monitoring", "strategy_sections"),
+    "statistical_analysis_skeleton": ("Statistical Analysis Skeleton", "stats-skeleton", "strategy_sections"),
+    "operational_feasibility_risks": ("Operational Feasibility Risks", "feasibility-risks", "strategy_sections"),
+    "regulatory_standards_considerations": ("Regulatory Standards Considerations", "regulatory-standards", "strategy_sections"),
+    "draft_eligibility_framework": ("Draft Eligibility Framework", "eligibility-framework", "eligibility_sections"),
+    "draft_schedule_of_assessments_framework": ("Draft Schedule Of Assessments Framework", "schedule-framework", "eligibility_sections"),
+}
+
+_PROTOCOL_SECTION_TITLES = {
+    norm(title): field_name
+    for field_name, (title, _, _) in _PROTOCOL_SECTION_FIELDS.items()
+}
+
+_PROTOCOL_SECTION_SUFFIXES = {
+    suffix: field_name
+    for field_name, (_, suffix, _) in _PROTOCOL_SECTION_FIELDS.items()
+}
 
 
 @dataclass(frozen=True)
@@ -423,23 +452,88 @@ def _run_section_agent(
     source_ids: tuple[str, ...],
     config: AgentRuntimeConfig | None,
 ) -> StructuredAgentResult:
-    return _run_typed_agent(
+    input_summary = f"Draft source-grounded next-study strategy sections for {target_trial.nct_id}."
+    rationale_summary = f"{agent_name} produced draft strategy sections and review questions."
+    try:
+        result = _run_typed_agent(
+            agent_name=agent_name,
+            instructions=instructions,
+            output_type=ProtocolSectionAgentOutput,
+            run_id=run_id,
+            input_summary=input_summary,
+            payload={
+                **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent),
+                "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
+                "benchmark_interpretation": benchmark_interpretation.model_dump(mode="json"),
+            },
+            fallback_output=fallback_output,
+            source_ids=fallback_output.source_ids or source_ids,
+            confidence=fallback_output.confidence,
+            config=config,
+            rationale_summary=rationale_summary,
+        )
+    except Exception as exc:
+        if agent_fallbacks_disabled():
+            if isinstance(exc, AgentRuntimeError):
+                raise
+            raise AgentRuntimeError(f"{agent_name} failed with fallbacks disabled: {exc.__class__.__name__}: {exc}") from exc
+        return _section_fallback_result(
+            agent_name=agent_name,
+            run_id=run_id,
+            input_summary=input_summary,
+            fallback_output=fallback_output,
+            source_ids=fallback_output.source_ids or source_ids,
+            confidence=fallback_output.confidence,
+            rationale_summary=rationale_summary,
+            reason="runtime_exception",
+        )
+
+    expected_fields = _section_fields(fallback_output)
+    observed_fields = _section_fields(result.output)
+    if result.output.agent_name != agent_name or not expected_fields <= observed_fields:
+        reason = f"section_or_agent_mismatch:{result.output.agent_name}:{','.join(sorted(observed_fields)) or 'no_sections'}"
+        if agent_fallbacks_disabled():
+            raise AgentRuntimeError(f"{agent_name} returned mismatched sections with fallbacks disabled: {reason}")
+        return _section_fallback_result(
+            agent_name=agent_name,
+            run_id=run_id,
+            input_summary=input_summary,
+            fallback_output=fallback_output,
+            source_ids=fallback_output.source_ids or source_ids,
+            confidence=fallback_output.confidence,
+            rationale_summary=rationale_summary,
+            reason=reason,
+        )
+    return result
+
+
+def _section_fallback_result(
+    *,
+    agent_name: str,
+    run_id: str,
+    input_summary: str,
+    fallback_output: ProtocolSectionAgentOutput,
+    source_ids: tuple[str, ...],
+    confidence: float,
+    rationale_summary: str,
+    reason: str,
+) -> StructuredAgentResult:
+    if agent_fallbacks_disabled():
+        raise AgentRuntimeError(f"{agent_name} fallback requested with fallbacks disabled: {reason}")
+    result = run_structured_llm_call(
         agent_name=agent_name,
-        instructions=instructions,
+        instructions="Validate deterministic Agent 5 section fallback output.",
+        payload={"fallback_reason": reason, "fallback_output": fallback_output.model_dump(mode="json")},
         output_type=ProtocolSectionAgentOutput,
         run_id=run_id,
-        input_summary=f"Draft source-grounded next-study strategy sections for {target_trial.nct_id}.",
-        payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent),
-            "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
-            "benchmark_interpretation": benchmark_interpretation.model_dump(mode="json"),
-        },
-        fallback_output=fallback_output,
-        source_ids=fallback_output.source_ids or source_ids,
-        confidence=fallback_output.confidence,
-        config=config,
-        rationale_summary=f"{agent_name} produced draft strategy sections and review questions.",
+        input_summary=input_summary,
+        config=AgentRuntimeConfig(disabled=True, provenance="pharma_os.agents.protocol_design.section_fallback"),
+        offline_output=fallback_output,
+        source_ids=source_ids,
+        confidence=confidence,
+        rationale_summary=rationale_summary,
     )
+    return result.model_copy(update={"trace_metadata": {**result.trace_metadata, "fallback_reason": reason}})
 
 
 def _base_payload(
@@ -770,26 +864,35 @@ def _section_agent_specs(
 
 
 def _sections_by_brief_field(outputs: tuple[ProtocolSectionAgentOutput, ...]) -> dict[str, dict[str, ProtocolSectionDraft]]:
-    by_title = {section.title: section for output in outputs for section in output.sections}
-    return {
-        "strategy_sections": {
-            "executive_synopsis": by_title["Executive Synopsis"],
-            "strategic_rationale": by_title["Strategic Rationale"],
-            "analog_trial_benchmark_summary": by_title["Analog Trial Benchmark Summary"],
-            "target_population": by_title["Target Population"],
-            "study_design": by_title["Study Design"],
-            "comparator_and_landscape_rationale": by_title["Comparator And Landscape Rationale"],
-            "endpoint_strategy": by_title["Endpoint Strategy"],
-            "safety_monitoring_outline": by_title["Safety Monitoring Outline"],
-            "statistical_analysis_skeleton": by_title["Statistical Analysis Skeleton"],
-            "operational_feasibility_risks": by_title["Operational Feasibility Risks"],
-            "regulatory_standards_considerations": by_title["Regulatory Standards Considerations"],
-        },
-        "eligibility_sections": {
-            "draft_eligibility_framework": by_title["Draft Eligibility Framework"],
-            "draft_schedule_of_assessments_framework": by_title["Draft Schedule Of Assessments Framework"],
-        },
-    }
+    by_field: dict[str, ProtocolSectionDraft] = {}
+    for output in outputs:
+        for section in output.sections:
+            field_name = _section_field(section)
+            if field_name and field_name not in by_field:
+                by_field[field_name] = section
+    missing = [field_name for field_name in _PROTOCOL_SECTION_FIELDS if field_name not in by_field]
+    if missing:
+        available = sorted(section.title for output in outputs for section in output.sections)
+        raise AgentRuntimeError(
+            "Protocol section assembly missing required fields after section-agent validation: "
+            f"{', '.join(missing)}. Available section titles: {', '.join(available) or 'none'}."
+        )
+    grouped = {"strategy_sections": {}, "eligibility_sections": {}}
+    for field_name, (_, _, group_name) in _PROTOCOL_SECTION_FIELDS.items():
+        grouped[group_name][field_name] = by_field[field_name]
+    return grouped
+
+
+def _section_fields(output: ProtocolSectionAgentOutput) -> set[str]:
+    return {field_name for section in output.sections if (field_name := _section_field(section))}
+
+
+def _section_field(section: ProtocolSectionDraft) -> str | None:
+    section_id = norm(section.section_id)
+    for suffix, field_name in _PROTOCOL_SECTION_SUFFIXES.items():
+        if section_id.endswith(norm(suffix)):
+            return field_name
+    return _PROTOCOL_SECTION_TITLES.get(norm(section.title))
 
 
 def _shared_guardrails() -> str:

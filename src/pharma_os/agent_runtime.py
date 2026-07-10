@@ -11,6 +11,7 @@ import json
 import os
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -43,6 +44,14 @@ class StructuredAgentResult(StrictSchema):
     output: BaseModel
     trace: AgentRunTrace
     trace_metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PayloadCompactionResult:
+    """Model-facing payload after deterministic context compaction."""
+
+    payload: Any
+    metadata: dict[str, str | int | float | bool | None]
 
 
 MODEL_TIER_DEFAULTS = {
@@ -221,10 +230,11 @@ def run_structured_agent(
             },
         )
 
+    compacted_payload = _compact_payload_for_model(payload)
     _, _, Runner, _ = load_agents_sdk()
     try:
         response, retry_metadata = _execute_with_retries(
-            lambda: _run_agent_once(Runner, agent, payload, effective_max_turns),
+            lambda: _run_agent_once(Runner, agent, compacted_payload.payload, effective_max_turns),
             operation="Agents SDK run",
         )
     except Exception as exc:
@@ -251,7 +261,10 @@ def run_structured_agent(
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.openai_agents_sdk_fallback",
                 execution_mode="deterministic_fallback",
-                runtime_metadata=_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
+                runtime_metadata={
+                    **_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
+                    **compacted_payload.metadata,
+                },
             ),
             trace_metadata={
                 "agent_name": agent_name,
@@ -265,6 +278,7 @@ def run_structured_agent(
                 "error": str(exc)[:500],
                 "fallback_cause": _fallback_cause(exc),
                 **retry_metadata,
+                **compacted_payload.metadata,
             },
         )
 
@@ -293,7 +307,7 @@ def run_structured_agent(
             tool_calls=tool_calls,
             provenance="pharma_os.agent_runtime.openai_agents_sdk",
             execution_mode="live_agent",
-            runtime_metadata=_trace_runtime_metadata(settings, retry_metadata),
+            runtime_metadata={**_trace_runtime_metadata(settings, retry_metadata), **compacted_payload.metadata},
         ),
         trace_metadata={
             **_response_metadata(response),
@@ -304,6 +318,7 @@ def run_structured_agent(
             "disabled": False,
             "execution_mode": "live_agent",
             **retry_metadata,
+            **compacted_payload.metadata,
         },
     )
 
@@ -341,12 +356,13 @@ def run_structured_llm_call(
             trace_metadata={"direct_api": True},
         )
 
+    compacted_payload = _compact_payload_for_model(payload)
     try:
         (parsed, response_metadata), retry_metadata = _execute_with_retries(
             lambda: _call_openai_structured_output(
                 model=settings.model,
                 instructions=instructions,
-                payload=payload,
+                payload=compacted_payload.payload,
                 output_type=output_type,
             ),
             operation="Direct OpenAI structured output call",
@@ -379,7 +395,10 @@ def run_structured_llm_call(
                 tool_calls=(),
                 provenance="pharma_os.agent_runtime.direct_openai_api_fallback",
                 execution_mode="deterministic_fallback",
-                runtime_metadata=_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
+                runtime_metadata={
+                    **_trace_runtime_metadata(settings, retry_metadata, fallback_cause=_fallback_cause(exc)),
+                    **compacted_payload.metadata,
+                },
             ),
             trace_metadata={
                 "agent_name": agent_name,
@@ -393,6 +412,7 @@ def run_structured_llm_call(
                 "error": str(exc)[:500],
                 "fallback_cause": _fallback_cause(exc),
                 **retry_metadata,
+                **compacted_payload.metadata,
             },
         )
 
@@ -413,7 +433,7 @@ def run_structured_llm_call(
             tool_calls=(),
             provenance="pharma_os.agent_runtime.openai_api_structured_output",
             execution_mode="direct_llm",
-            runtime_metadata=_trace_runtime_metadata(settings, retry_metadata),
+            runtime_metadata={**_trace_runtime_metadata(settings, retry_metadata), **compacted_payload.metadata},
         ),
         trace_metadata={
             **response_metadata,
@@ -424,6 +444,7 @@ def run_structured_llm_call(
             "direct_api": True,
             "execution_mode": "direct_llm",
             **retry_metadata,
+            **compacted_payload.metadata,
         },
     )
 
@@ -530,7 +551,241 @@ def _offline_structured_result(
     )
 
 
-def _run_agent_once(Runner: Any, agent: Any, payload: BaseModel | dict[str, Any], max_turns: int) -> Any:
+def _compact_payload_for_model(payload: Any) -> PayloadCompactionResult:
+    """Return a bounded JSON payload for model calls while preserving full local state elsewhere.
+
+    PharmaOS keeps the authoritative evidence and outputs in typed objects and
+    Scientific Memory. This function only limits the prompt payload sent to a
+    model, following OpenAI's context-management guidance for long, tool-heavy
+    agent runs.
+    """
+
+    jsonable = _jsonable_payload(payload)
+    original_text = _json_dumps(jsonable)
+    original_chars = len(original_text)
+    if not _context_compaction_enabled():
+        return PayloadCompactionResult(
+            payload=jsonable,
+            metadata={
+                "context_compaction_applied": False,
+                "context_original_chars": original_chars,
+                "context_compacted_chars": original_chars,
+                "context_truncated_strings": 0,
+                "context_truncated_arrays": 0,
+            },
+        )
+
+    max_input_chars = _env_int("PHARMA_OS_LLM_MAX_INPUT_CHARS", 60_000, minimum=5_000, maximum=1_000_000)
+    max_string_chars = _env_int("PHARMA_OS_LLM_MAX_STRING_CHARS", 2_500, minimum=300, maximum=30_000)
+    max_array_items = _env_int("PHARMA_OS_LLM_MAX_ARRAY_ITEMS", 30, minimum=3, maximum=1_000)
+    max_depth = _env_int("PHARMA_OS_LLM_MAX_JSON_DEPTH", 10, minimum=3, maximum=50)
+
+    compacted, stats = _compact_value(
+        jsonable,
+        path="$",
+        max_string_chars=max_string_chars,
+        max_array_items=max_array_items,
+        max_depth=max_depth,
+        depth=0,
+    )
+    compacted_text = _json_dumps(compacted)
+
+    if len(compacted_text) > max_input_chars:
+        for divisor in (2, 4, 8):
+            compacted, stats = _compact_value(
+                jsonable,
+                path="$",
+                max_string_chars=max(300, max_string_chars // divisor),
+                max_array_items=max(3, max_array_items // divisor),
+                max_depth=max(3, max_depth - divisor),
+                depth=0,
+            )
+            compacted_text = _json_dumps(compacted)
+            if len(compacted_text) <= max_input_chars:
+                break
+
+    if len(compacted_text) > max_input_chars:
+        compacted, compacted_text, stats = _force_context_limit(compacted, compacted_text, stats, max_input_chars)
+
+    compacted_chars = len(compacted_text)
+    applied = (
+        compacted_chars < original_chars
+        or stats["truncated_strings"] > 0
+        or stats["truncated_arrays"] > 0
+        or stats["max_depth_hits"] > 0
+    )
+    metadata: dict[str, str | int | float | bool | None] = {
+        "context_compaction_applied": applied,
+        "context_original_chars": original_chars,
+        "context_compacted_chars": compacted_chars,
+        "context_truncated_strings": stats["truncated_strings"],
+        "context_truncated_arrays": stats["truncated_arrays"],
+    }
+    if stats["paths"]:
+        metadata["context_truncated_paths"] = ",".join(stats["paths"][:12])[:1000]
+    return PayloadCompactionResult(payload=compacted, metadata=metadata)
+
+
+def _jsonable_payload(payload: Any) -> Any:
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(mode="json")
+    if isinstance(payload, dict):
+        return {str(key): _jsonable_payload(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return [_jsonable_payload(value) for value in payload]
+    return payload
+
+
+def _compact_value(
+    value: Any,
+    *,
+    path: str,
+    max_string_chars: int,
+    max_array_items: int,
+    max_depth: int,
+    depth: int,
+) -> tuple[Any, dict[str, Any]]:
+    stats = {"truncated_strings": 0, "truncated_arrays": 0, "max_depth_hits": 0, "paths": []}
+    if depth > max_depth:
+        stats["max_depth_hits"] = 1
+        stats["paths"].append(path)
+        return _safe_summary(value) or "[context omitted: max depth exceeded]", stats
+
+    if isinstance(value, str):
+        compacted = _compact_text(value, max_string_chars)
+        if compacted != value:
+            stats["truncated_strings"] = 1
+            stats["paths"].append(path)
+        return compacted, stats
+
+    if isinstance(value, list):
+        limit = max_array_items
+        items = value
+        omitted = 0
+        if len(value) > limit:
+            items = value[:limit]
+            omitted = len(value) - limit
+            stats["truncated_arrays"] = 1
+            stats["paths"].append(path)
+        compacted_items = []
+        for index, item in enumerate(items):
+            compacted_item, child_stats = _compact_value(
+                item,
+                path=f"{path}[{index}]",
+                max_string_chars=max_string_chars,
+                max_array_items=max_array_items,
+                max_depth=max_depth,
+                depth=depth + 1,
+            )
+            compacted_items.append(compacted_item)
+            _merge_compaction_stats(stats, child_stats)
+        if omitted:
+            compacted_items.append({"_context_compaction": f"{omitted} list items omitted", "original_item_count": len(value)})
+        return compacted_items, stats
+
+    if isinstance(value, dict):
+        compacted_dict: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            key_string_chars = _string_limit_for_key(key, max_string_chars)
+            key_array_items = _array_limit_for_key(key, max_array_items)
+            compacted_item, child_stats = _compact_value(
+                item,
+                path=f"{path}.{key}",
+                max_string_chars=key_string_chars,
+                max_array_items=key_array_items,
+                max_depth=max_depth,
+                depth=depth + 1,
+            )
+            compacted_dict[key] = compacted_item
+            _merge_compaction_stats(stats, child_stats)
+        return compacted_dict, stats
+
+    return value, stats
+
+
+def _merge_compaction_stats(target: dict[str, Any], source: dict[str, Any]) -> None:
+    target["truncated_strings"] += int(source.get("truncated_strings") or 0)
+    target["truncated_arrays"] += int(source.get("truncated_arrays") or 0)
+    target["max_depth_hits"] += int(source.get("max_depth_hits") or 0)
+    for path in source.get("paths") or ():
+        if path not in target["paths"] and len(target["paths"]) < 50:
+            target["paths"].append(path)
+
+
+def _string_limit_for_key(key: str, default: int) -> int:
+    key_lower = key.casefold()
+    bulky_text_keys = {
+        "eligibility_criteria",
+        "brief_summary",
+        "detailed_description",
+        "ctgov_summary",
+        "benchmark_summary",
+        "abstract",
+        "abstract_text",
+        "description",
+        "criteria",
+        "rationale",
+        "summary",
+    }
+    if key_lower in bulky_text_keys or key_lower.endswith("_summary") or key_lower.endswith("_description"):
+        return min(default, 1_500)
+    return default
+
+
+def _array_limit_for_key(key: str, default: int) -> int:
+    key_lower = key.casefold()
+    bulky_array_keys = {
+        "source_ids",
+        "claims",
+        "pubmed_titles",
+        "analog_candidates",
+        "comparator_trials",
+        "validation_results",
+        "agent_outputs",
+        "agent_traces",
+    }
+    if key_lower in bulky_array_keys:
+        return min(default, 20)
+    return default
+
+
+def _compact_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    if max_chars < 120:
+        return value[:max_chars]
+    head_chars = max(80, int(max_chars * 0.7))
+    tail_chars = max(40, max_chars - head_chars - 80)
+    omitted = len(value) - head_chars - tail_chars
+    return f"{value[:head_chars]}\n[... {omitted} chars omitted by PharmaOS context compaction ...]\n{value[-tail_chars:]}"
+
+
+def _force_context_limit(
+    value: Any,
+    value_text: str,
+    stats: dict[str, Any],
+    max_input_chars: int,
+) -> tuple[Any, str, dict[str, Any]]:
+    hard_limit = max(1_000, max_input_chars - 500)
+    compacted = {
+        "_context_compaction": (
+            "Original JSON payload exceeded the configured model input budget after recursive trimming. "
+            "Full typed state remains in PharmaOS memory/output artifacts."
+        ),
+        "compacted_json_excerpt": _compact_text(value_text, hard_limit),
+    }
+    stats["truncated_strings"] += 1
+    if "$" not in stats["paths"]:
+        stats["paths"].append("$")
+    return compacted, _json_dumps(compacted), stats
+
+
+def _context_compaction_enabled() -> bool:
+    return not _truthy(os.getenv("PHARMA_OS_LLM_CONTEXT_COMPACTION_DISABLED"))
+
+
+def _run_agent_once(Runner: Any, agent: Any, payload: Any, max_turns: int) -> Any:
     try:
         return Runner.run_sync(
             agent,
@@ -818,10 +1073,12 @@ def _validate_output(value: T | dict[str, Any] | Any, output_type: type[T]) -> T
     return output_type.model_validate(value)
 
 
-def _payload_json(payload: BaseModel | dict[str, Any]) -> str:
-    if isinstance(payload, BaseModel):
-        return payload.model_dump_json()
-    return json.dumps(payload, ensure_ascii=False)
+def _payload_json(payload: Any) -> str:
+    return _json_dumps(_jsonable_payload(payload))
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
 def _summarize_model(model: BaseModel) -> str:

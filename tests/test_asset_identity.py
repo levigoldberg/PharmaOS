@@ -35,3 +35,26 @@ def test_asset_identity_extracts_development_code_alias_from_title() -> None:
 
     assert output.asset_name == "Envudeucitinib"
     assert "ESK-001" in output.aliases
+
+
+def test_asset_identity_normalizes_multi_term_atopic_dermatitis_conditions() -> None:
+    trial = ClinicalTrialRecord(
+        nct_id="NCT07011706",
+        brief_title="A Study of ATI-045 in Atopic Dermatitis",
+        official_title="A Study of ATI-045 in Adult Participants With AD",
+        phases=("PHASE2",),
+        conditions=("Atopic Dermatitis", "Atopic", "Dermatitis", "AD", "Eczema"),
+        interventions=(
+            TrialIntervention(name="ATI-045", type="DRUG"),
+            TrialIntervention(name="Placebo", type="DRUG"),
+        ),
+        lead_sponsor=TrialSponsor(name="Aclaris Therapeutics, Inc."),
+        source_id="ctgov:NCT07011706",
+    )
+
+    output, _ = resolve_asset_identity(trial, rxnorm_client=NoMatchRxNormClient())
+
+    assert output.normalized_indication == "atopic dermatitis"
+    assert output.therapeutic_area == "immunology/dermatology"
+    assert "indication_atopic_dermatitis" in output.rule_ids
+    assert not any(flag.flag_id == "asset-missing-indication" for flag in output.missing_data_flags)

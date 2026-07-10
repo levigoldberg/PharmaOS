@@ -20,6 +20,8 @@ Planning is decision-aware rather than keyword-only. For example, a Phase II -> 
 
 AI execution mode is explicit in workflow outputs, agent traces, agent-output envelopes, Control Tower records, and reports. The supported modes are `live_agent`, `direct_llm`, `deterministic_fallback`, and `reused_artifact`; reports summarize counts such as live AI calls completed and deterministic fallbacks used.
 
+Live model calls use shared context compaction before sending payloads to the Responses API or Agents SDK. Full typed state remains in Scientific Memory and output artifacts; only the model-facing JSON is bounded. Agent traces record whether compaction was applied and how much context was trimmed.
+
 Implemented executable workflows:
 
 - Agent 3 `clinical_outcome_prediction`: clinical outcome/risk context for one NCT ID, with deterministic trial identity, design, PoS, safety, and trial-landscape components plus SDK-backed bounded reasoning when live agents are enabled.
@@ -69,6 +71,11 @@ Required for live agent runs:
 - `PHARMA_OS_LLM_MAX_RETRIES`, defaults to `4`; transient rate limits, timeouts, and server errors retry before deterministic fallback.
 - `PHARMA_OS_LLM_RETRY_INITIAL_DELAY_SECONDS`, defaults to `1.0`
 - `PHARMA_OS_LLM_RETRY_MAX_DELAY_SECONDS`, defaults to `30.0`
+- `PHARMA_OS_LLM_MAX_INPUT_CHARS`, defaults to `60000`; maximum model-facing JSON payload size before hard compaction.
+- `PHARMA_OS_LLM_MAX_STRING_CHARS`, defaults to `2500`; maximum per-string length before recursive trimming.
+- `PHARMA_OS_LLM_MAX_ARRAY_ITEMS`, defaults to `30`; maximum per-array item count before recursive trimming.
+- `PHARMA_OS_LLM_MAX_JSON_DEPTH`, defaults to `10`; maximum nested JSON depth before summarization.
+- `PHARMA_OS_LLM_CONTEXT_COMPACTION_DISABLED=true` disables model-facing compaction for debugging only.
 
 Optional for due diligence:
 
@@ -100,7 +107,7 @@ python -m pharma_os orchestrate \
   --db-path .pharma_os/scientific_memory.sqlite
 ```
 
-Goal-only orchestration uses the AI request-understanding step to extract identifiers such as NCT IDs from `--goal`. If `--output-json` and `--output-html` are omitted, JSON and HTML reports are written under `outputs/`.
+Natural-language orchestration uses the AI request-understanding step for workflow selection and identifier extraction from `--goal`; deterministic code only validates the AI parse and protects execution. Explicit fields such as `--nct-id` override or validate the AI-extracted fields, but they do not skip AI request understanding. Use `--input-json` with a complete `OrchestrationRequest` when you intentionally want a fully structured non-AI request. If `--output-json` and `--output-html` are omitted, JSON and HTML reports are written under `outputs/`.
 
 Clinical outcome prediction:
 
