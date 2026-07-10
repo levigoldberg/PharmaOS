@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -8,10 +9,11 @@ import pharma_os.control_tower as control_tower_module
 from pharma_os.cli import main
 from pharma_os.agent_runtime import AgentRuntimeConfig
 from pharma_os.control_tower import build_deterministic_execution_plan, run_control_tower_agent, validate_execution_plan
+from pharma_os.request_understanding import RequestUnderstandingError
 from pharma_os.memory import MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.registry import WorkflowRegistry
-from pharma_os.schemas import HumanGate, OrchestrationRequest, SourceMetadata, WorkflowRun
+from pharma_os.schemas import HumanGate, OrchestrationRequest, RequestUnderstandingOutput, SourceMetadata, WorkflowRun
 
 
 def test_control_tower_plans_minimum_clinical_risk_path() -> None:
@@ -554,6 +556,129 @@ def test_orchestrate_cli_writes_json_and_html(capsys, tmp_path) -> None:
     assert "Control Tower Orchestration" in output_html.read_text(encoding="utf-8")
     assert "step_results" in output_json.read_text(encoding="utf-8")
     assert "step_results" in capsys.readouterr().out
+
+
+def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys, tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    calls = _install_fake_runners(monkeypatch)
+
+    def fake_understand(**kwargs):
+        assert kwargs["goal"] == "Draft the next-study protocol design for NCT04903795"
+        return RequestUnderstandingOutput(
+            normalized_objective="Draft the next-study protocol design for NCT04903795",
+            target_capability="protocol_design",
+            decision_type="protocol_design",
+            nct_id="NCT04903795",
+            requested_outputs=("json", "html"),
+            confidence=0.86,
+            rationale_summary="Protocol design request anchored to an NCT ID.",
+        )
+
+    monkeypatch.setattr("pharma_os.cli.understand_orchestration_goal", fake_understand)
+
+    exit_code = main(
+        [
+            "orchestrate",
+            "--goal",
+            "Draft the next-study protocol design for NCT04903795",
+            "--db-path",
+            str(tmp_path / "memory.sqlite"),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["request"]["nct_id"] == "NCT04903795"
+    assert [result["capability_name"] for result in payload["step_results"]] == [
+        "clinical_outcome_prediction",
+        "due_diligence",
+        "protocol_design",
+    ]
+    assert calls == {
+        "clinical_outcome_prediction": 1,
+        "due_diligence": 1,
+        "protocol_design": 1,
+    }
+    assert list((tmp_path / "outputs").glob("control_tower_orchestration_*.json"))
+    assert list((tmp_path / "outputs").glob("control_tower_orchestration_*.html"))
+
+
+def test_orchestrate_goal_only_ai_unavailable_returns_clear_error(capsys, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "pharma_os.cli.understand_orchestration_goal",
+        lambda **_: (_ for _ in ()).throw(RequestUnderstandingError("Natural-language goal parsing requires live AI.")),
+    )
+
+    exit_code = main(
+        [
+            "orchestrate",
+            "--goal",
+            "Draft the next-study protocol design for NCT04903795",
+            "--db-path",
+            str(tmp_path / "memory.sqlite"),
+        ]
+    )
+
+    assert exit_code == 2
+    assert "Natural-language goal parsing requires live AI" in capsys.readouterr().out
+
+
+def test_orchestrate_goal_only_blocks_registered_unimplemented_capability(capsys, tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "pharma_os.cli.understand_orchestration_goal",
+        lambda **_: RequestUnderstandingOutput(
+            normalized_objective="Create a manufacturing CMC control plan for this asset",
+            target_capability="manufacturing_biofactory",
+            decision_type="manufacturing_control",
+            confidence=0.82,
+            rationale_summary="Manufacturing request maps to a registered skeleton capability.",
+        ),
+    )
+
+    exit_code = main(
+        [
+            "orchestrate",
+            "--goal",
+            "Create a manufacturing CMC control plan for this asset",
+            "--db-path",
+            str(tmp_path / "memory.sqlite"),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["step_results"][0]["capability_name"] == "manufacturing_biofactory"
+    assert payload["step_results"][0]["status"] == "blocked"
+
+
+def test_ai_extracted_nct_conflict_is_rejected() -> None:
+    from pharma_os.cli import _request_from_understanding
+
+    parsed = RequestUnderstandingOutput(
+        normalized_objective="Build diligence for NCT11111111",
+        target_capability="due_diligence",
+        decision_type="clinical_stage_due_diligence",
+        nct_id="NCT11111111",
+        confidence=0.9,
+        rationale_summary="Diligence request anchored to an NCT ID.",
+    )
+
+    try:
+        _request_from_understanding(
+            goal="Build diligence for NCT11111111",
+            parsed=parsed,
+            explicit_nct="NCT22222222",
+            explicit_asset_name=None,
+            explicit_indication=None,
+            explicit_assumptions={},
+            explicit_force_refresh=(),
+            registry=WorkflowRegistry.default(),
+        )
+    except ValueError as exc:
+        assert "conflicts with AI-extracted NCT ID" in str(exc)
+    else:
+        raise AssertionError("expected conflicting NCT IDs to fail")
 
 
 def _save_completed_run(

@@ -458,7 +458,7 @@ def _reuse_satisfies_addressed_requirements(step: PlannedStep, snapshot: Scienti
     satisfaction = {result.requirement_id: result for result in snapshot.requirement_satisfaction}
     for requirement_id in step.requirements_addressed:
         result = satisfaction.get(requirement_id)
-        if result is None or result.status != "satisfied":
+        if result is None or result.status not in {"satisfied", "partially_satisfied"}:
             return False
         if step.reuse_output_id and step.reuse_output_id not in result.satisfying_artifact_output_ids:
             return False
@@ -475,6 +475,13 @@ def _force_refreshes(capability: ModuleCapability, request: OrchestrationRequest
 def _skip_requested(capability: ModuleCapability, request: OrchestrationRequest) -> bool:
     text = request.objective.casefold()
     name = capability.name.casefold()
+    parsed_skips = {
+        item.strip().casefold()
+        for item in request.identifiers.get("skip_capabilities", "").split(",")
+        if item.strip()
+    }
+    if name in parsed_skips:
+        return True
     aliases = {
         "clinical_outcome_prediction": ("clinical risk", "agent 3", "clinical outcome prediction"),
         "due_diligence": ("diligence", "agent 4"),

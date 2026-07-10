@@ -401,6 +401,25 @@ class OrchestrationRequest(StrictSchema):
     decision_type: DecisionType | None = None
 
 
+class RequestUnderstandingOutput(StrictSchema):
+    """Structured parse of a natural-language orchestration goal."""
+
+    normalized_objective: str = Field(..., min_length=1)
+    target_capability: str | None = None
+    decision_type: DecisionType = "unknown"
+    nct_id: str | None = None
+    asset_name: str | None = None
+    indication: str | None = None
+    assumptions: dict[str, MetadataValue] = Field(default_factory=dict)
+    force_refresh: tuple[str, ...] = Field(default_factory=tuple)
+    skip_capabilities: tuple[str, ...] = Field(default_factory=tuple)
+    requested_outputs: tuple[str, ...] = Field(default_factory=tuple)
+    missing_required_fields: tuple[str, ...] = Field(default_factory=tuple)
+    clarifying_questions: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    rationale_summary: str = Field(..., min_length=1)
+
+
 class ModuleCapability(StrictSchema):
     """Registry metadata describing a Control Tower capability."""
 

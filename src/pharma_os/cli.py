@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -12,8 +13,13 @@ from dotenv import load_dotenv
 from pharma_os.html_report import write_run_html
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
+from pharma_os.registry import WorkflowRegistry
 from pharma_os.report import build_report
+from pharma_os.request_understanding import RequestUnderstandingError, understand_orchestration_goal
 from pharma_os.schemas import ClinicalOutcomePredictionInput, ClinicalTrialIntelligenceInput, DueDiligenceInput, OrchestrationRequest, ProtocolDesignInput
+
+
+NCT_RE = re.compile(r"^NCT\d{8}$", re.IGNORECASE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,9 +114,9 @@ def main(argv: list[str] | None = None) -> int:
             request = _orchestration_request(args)
             result = Orchestrator(memory=store).orchestrate(request)
             payload = result.model_dump_json()
-            _write_output(args.output_json, payload)
-            if args.output_html:
-                write_run_html(result.run_id, args.output_html, memory=store)
+            output_json, output_html = _orchestration_output_paths(args, result.run_id)
+            _write_output(output_json, payload)
+            write_run_html(result.run_id, output_html, memory=store)
             print(payload)
             return 0
 
@@ -128,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path = write_run_html(args.run_id, args.output_html, memory=store)
             print(json.dumps({"run_id": args.run_id, "output_html": str(output_path)}))
             return 0
-    except (OSError, RuntimeError, ValueError, ValidationError) as exc:
+    except (OSError, RuntimeError, ValueError, ValidationError, RequestUnderstandingError) as exc:
         print(f"error: {exc}")
         return 2
     return 1
@@ -218,7 +224,7 @@ def _orchestration_request(args: argparse.Namespace) -> OrchestrationRequest:
         )
     if not args.goal:
         raise ValueError("orchestrate requires --goal unless --input-json is supplied")
-    assumptions = {
+    explicit_assumptions = {
         key: value
         for key, value in {
             "pos_workbook_path": args.pos_workbook_path,
@@ -234,14 +240,122 @@ def _orchestration_request(args: argparse.Namespace) -> OrchestrationRequest:
         }.items()
         if value is not None
     }
+    explicit_nct = _normalize_nct(args.nct_id, field_name="--nct-id") if args.nct_id else None
+    if _requires_ai_request_understanding(args):
+        registry = WorkflowRegistry.default()
+        parsed = understand_orchestration_goal(
+            goal=args.goal,
+            explicit_fields={
+                "nct_id": explicit_nct,
+                "asset_name": args.asset_name,
+                "indication": args.indication,
+                "assumptions": explicit_assumptions,
+                "force_refresh": tuple(args.force_refresh or ()),
+            },
+            registry=registry,
+        )
+        return _request_from_understanding(
+            goal=args.goal,
+            parsed=parsed,
+            explicit_nct=explicit_nct,
+            explicit_asset_name=args.asset_name,
+            explicit_indication=args.indication,
+            explicit_assumptions=explicit_assumptions,
+            explicit_force_refresh=tuple(args.force_refresh or ()),
+            registry=registry,
+        )
     return OrchestrationRequest(
         objective=args.goal,
-        nct_id=args.nct_id,
+        nct_id=explicit_nct,
         asset_name=args.asset_name,
         indication=args.indication,
-        assumptions=assumptions,
+        assumptions=explicit_assumptions,
         force_refresh=tuple(args.force_refresh or ()),
     )
+
+
+def _requires_ai_request_understanding(args: argparse.Namespace) -> bool:
+    return not any((args.nct_id, args.asset_name, args.indication))
+
+
+def _request_from_understanding(
+    *,
+    goal: str,
+    parsed: object,
+    explicit_nct: str | None,
+    explicit_asset_name: str | None,
+    explicit_indication: str | None,
+    explicit_assumptions: dict[str, object],
+    explicit_force_refresh: tuple[str, ...],
+    registry: WorkflowRegistry,
+) -> OrchestrationRequest:
+    nct_id = _normalize_nct(getattr(parsed, "nct_id", None), field_name="AI-extracted nct_id") if getattr(parsed, "nct_id", None) else None
+    if explicit_nct and nct_id and explicit_nct != nct_id:
+        raise ValueError(f"--nct-id {explicit_nct} conflicts with AI-extracted NCT ID {nct_id}.")
+    resolved_nct = explicit_nct or nct_id
+    target_capability = getattr(parsed, "target_capability", None)
+    decision_type = getattr(parsed, "decision_type", None)
+    capability = registry.get(target_capability) if target_capability else None
+    missing = tuple(getattr(parsed, "missing_required_fields", ()) or ())
+    questions = tuple(getattr(parsed, "clarifying_questions", ()) or ())
+    confidence = float(getattr(parsed, "confidence", 0.0) or 0.0)
+    executable_target = capability is not None and capability.executable and capability.implementation_status == "implemented"
+    if executable_target and not resolved_nct:
+        missing = tuple(dict.fromkeys((*missing, "nct_id")))
+        questions = tuple(dict.fromkeys((*questions, "Which ClinicalTrials.gov NCT ID should PharmaOS use?")))
+    if (confidence < 0.6 or missing or questions) and (capability is None or executable_target):
+        details = []
+        if confidence < 0.6:
+            details.append(f"AI request understanding confidence is {confidence:.2f}.")
+        if missing:
+            details.append(f"Missing required fields: {', '.join(missing)}.")
+        if questions:
+            details.append("Clarifying questions: " + " ".join(questions))
+        raise ValueError("Cannot safely orchestrate from the goal. " + " ".join(details))
+
+    assumptions = {
+        **(getattr(parsed, "assumptions", {}) or {}),
+        **explicit_assumptions,
+    }
+    identifiers = {
+        "request_understanding": "ai",
+    }
+    if target_capability:
+        identifiers["target_capability"] = str(target_capability)
+    skip_capabilities = tuple(getattr(parsed, "skip_capabilities", ()) or ())
+    if skip_capabilities:
+        identifiers["skip_capabilities"] = ",".join(str(item) for item in skip_capabilities)
+    requested_outputs = tuple(getattr(parsed, "requested_outputs", ()) or ())
+    if requested_outputs:
+        identifiers["requested_outputs"] = ",".join(str(item) for item in requested_outputs)
+
+    parsed_force_refresh = tuple(str(item) for item in (getattr(parsed, "force_refresh", ()) or ()))
+    normalized_objective = str(getattr(parsed, "normalized_objective", None) or goal)
+    return OrchestrationRequest(
+        objective=normalized_objective,
+        nct_id=resolved_nct,
+        asset_name=explicit_asset_name or getattr(parsed, "asset_name", None),
+        indication=explicit_indication or getattr(parsed, "indication", None),
+        identifiers=identifiers,
+        assumptions=assumptions,
+        force_refresh=tuple(dict.fromkeys((*explicit_force_refresh, *parsed_force_refresh))),
+        decision_type=decision_type if decision_type != "unknown" else None,
+    )
+
+
+def _normalize_nct(value: str | None, *, field_name: str) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().upper()
+    if not NCT_RE.match(normalized):
+        raise ValueError(f"{field_name} must be a valid ClinicalTrials.gov identifier like NCT12345678.")
+    return normalized
+
+
+def _orchestration_output_paths(args: argparse.Namespace, run_id: str) -> tuple[str, str]:
+    output_json = args.output_json or str(Path("outputs") / f"control_tower_orchestration_{run_id}.json")
+    output_html = args.output_html or str(Path("outputs") / f"control_tower_orchestration_{run_id}.html")
+    return output_json, output_html
 
 
 def _write_output(path: str | None, payload: str) -> None:
