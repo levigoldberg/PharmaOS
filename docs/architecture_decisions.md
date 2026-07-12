@@ -1,5 +1,7 @@
 # Architecture Decisions
 
+For a full current system map, see `docs/system_architecture_detailed.md`. For a short implementation-style architecture description, see `docs/system_architecture_concise.md`.
+
 ## Orchestration
 
 Use OpenAI Agents SDK for agent orchestration.

@@ -2,6 +2,8 @@
 
 Build an AI-native pharma operating system prototype.
 
+Current implementation status: PharmaOS now has an executable clinical-development slice with Agent 3 `clinical_outcome_prediction`, Agent 4 `due_diligence`, and Agent 5 `protocol_design`. Discovery, tox/PK-PD, enrollment feasibility, trial execution, manufacturing, launch/PV, and regulatory/quality/audit remain registered non-executable skeletons until real data sources or system connectors exist. For the current architecture, see `docs/system_architecture_detailed.md` and `docs/system_architecture_concise.md`.
+
 The project should demonstrate how a vertically integrated AI-native pharma company could coordinate specialized agents across the drug-development lifecycle with as much automation as safely possible.
 
 The system should include these layers:

@@ -78,7 +78,7 @@ Whenever a change affects architecture, workflows, capabilities, runtime behavio
 
 ## Repo Layout
 
-- `docs/`: project brief, architecture decisions, and historical lean build plan.
+- `docs/`: detailed and concise system architecture guides, project brief, architecture decisions, and historical lean build plan.
 - `src/pharma_os/cli.py`: command-line entry point.
 - `src/pharma_os/orchestrator.py`: direct workflow runs plus Control Tower orchestration.
 - `src/pharma_os/control_tower.py`: Control Tower planning primitives and plan validation.
@@ -206,4 +206,5 @@ python -m pytest
 python -m pharma_os run <workflow> [args]
 python -m pharma_os orchestrate --goal "<objective>" [args]
 python -m pharma_os report --run-id <RUN_ID>
+python -m pharma_os view --run-id <RUN_ID>
 ```

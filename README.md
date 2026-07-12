@@ -4,6 +4,8 @@ AI-native pharma operating system prototype with a memory-aware Control Tower an
 
 Start with:
 
+- [Detailed system architecture guide](docs/system_architecture_detailed.md)
+- [Concise system architecture description](docs/system_architecture_concise.md)
 - [Project brief](docs/project_brief.md)
 - [Architecture decisions](docs/architecture_decisions.md)
 - [Lean implementation plan](docs/build_plan.md)
@@ -166,6 +168,15 @@ python -m pharma_os report \
   --run-id RUN_ID \
   --db-path .pharma_os/scientific_memory.sqlite \
   --output-json outputs/report.json
+```
+
+HTML run viewer:
+
+```bash
+python -m pharma_os view \
+  --run-id RUN_ID \
+  --db-path .pharma_os/scientific_memory.sqlite \
+  --output-html outputs/run_view.html
 ```
 
 Notes:
