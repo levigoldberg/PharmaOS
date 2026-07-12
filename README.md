@@ -102,16 +102,7 @@ Control Tower orchestration:
 
 ```bash
 python -m pharma_os orchestrate \
-  --goal "Build a clinical diligence and next-study protocol brief for NCT04903795" \
-  --annual-patients 1000 \
-  --peak-penetration 0.2 \
-  --gross-to-net 0.15 \
-  --operating-margin 0.35 \
-  --discount-rate 0.1 \
-  --development-cost 50000000 \
-  --launch-year 2029 \
-  --loe-year 2040 \
-  --db-path .pharma_os/scientific_memory.sqlite
+--goal "Force refresh the whole suite of agents: trial prediction, commercial due diligence, and protocol design for NCT05966480"
 ```
 
 Natural-language orchestration uses the AI request-understanding step for workflow selection and identifier extraction from `--goal`; deterministic code only validates the AI parse and protects execution. Explicit fields such as `--nct-id` override or validate the AI-extracted fields, but they do not skip AI request understanding. Use `--input-json` with a complete `OrchestrationRequest` when you intentionally want a fully structured non-AI request. If `--output-json` and `--output-html` are omitted, JSON and HTML reports are written under `outputs/`.
