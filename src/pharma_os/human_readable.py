@@ -7,7 +7,8 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 from pharma_os.agent_runtime import AgentRuntimeConfig, StructuredAgentResult, run_structured_llm_call, runtime_config_for_live_agents
-from pharma_os.schemas import HumanReadableFinding, HumanReadableModuleOutput
+from pharma_os.review_flags import top_review_flags_from_payload
+from pharma_os.schemas import ConfidenceFlag, HumanReadableFinding, HumanReadableModuleOutput
 
 
 ModuleName = Literal["clinical_outcome_prediction", "due_diligence", "protocol_design", "trial_intelligence"]
@@ -65,6 +66,7 @@ def build_human_readable_module_output(
                 "preserve_source_ids": True,
                 "avoid_hidden_reasoning": True,
                 "avoid_final_decisions": True,
+                "review_flags": "Surface only the supplied canonical review_flags. Each visible flag needs a severity rating and reason.",
             },
         },
         output_type=HumanReadableModuleOutput,
@@ -105,6 +107,7 @@ def _fallback_summary(
     validation_status = str(values.get("validation_status") or "not_run")
     limitations = _limitations(values)
     review_questions = _review_questions(values)
+    review_flags = tuple(_confidence_flag_from_payload(flag) for flag in top_review_flags_from_payload(values))
     findings = _findings(module_name, values, source_ids, confidence)
     takeaways = tuple(finding.title for finding in findings[:5]) or (f"{module_display_name} typed output is available for review.",)
     return HumanReadableModuleOutput(
@@ -119,6 +122,7 @@ def _fallback_summary(
         key_findings=tuple(findings),
         handoff_summary=_handoff_summary(module_name, values),
         limitations=limitations,
+        review_flags=review_flags,
         human_review_questions=review_questions,
         source_ids=source_ids,
         confidence=max(0.0, min(1.0, confidence)),
@@ -130,6 +134,18 @@ def _source_ids(output: BaseModel) -> tuple[str, ...]:
     explicit = tuple(str(source_id) for source_id in getattr(output, "source_ids", ()) if source_id)
     sources = tuple(str(getattr(source, "source_id", "")) for source in getattr(output, "sources", ()) if getattr(source, "source_id", ""))
     return tuple(dict.fromkeys((*explicit, *sources)))
+
+
+def _confidence_flag_from_payload(flag: dict[str, Any]) -> ConfidenceFlag:
+    return ConfidenceFlag(
+        flag_id=str(flag.get("flag_id") or flag.get("target_id") or "review-flag"),
+        target_id=str(flag.get("target_id") or flag.get("flag_id") or "workflow-output"),
+        reason=str(flag.get("reason") or "Human review is required."),
+        severity=str(flag.get("severity") or "medium"),  # type: ignore[arg-type]
+        confidence=float(flag.get("confidence") or 0.8),
+        source_ids=tuple(str(source_id) for source_id in (flag.get("source_ids") or ())),
+        provenance=str(flag.get("provenance") or "pharma_os.human_readable.review_flags"),
+    )
 
 
 def _headline(module_name: ModuleName, values: dict[str, Any], validation_status: str) -> str:

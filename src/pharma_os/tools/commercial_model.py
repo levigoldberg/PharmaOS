@@ -37,6 +37,7 @@ from pharma_os.tools._due_diligence_common import (
     to_float,
     triplet_base,
 )
+from pharma_os.tools.census import CensusPopulationClient, CensusPopulationError
 from pharma_os.tools.pubmed import PubMedArticle, PubMedClient, PubMedError
 from pharma_os.tools.rules import config_provenance, config_source_id, load_config
 
@@ -92,7 +93,7 @@ EPIDEMIOLOGY_EXTRACTION_INSTRUCTIONS = """You are an epidemiology evidence extra
 Use only the supplied PubMed titles and abstract snippets. Do not use outside knowledge.
 Extract only explicit numeric epidemiology estimates relevant to the target indication and geography.
 Prefer United States-specific patient-count estimates for the same disease or indicated severity segment.
-If a source gives only a prevalence percentage, do not convert it unless the input payload provides a source-backed population denominator and the formula is stated in your rationale.
+If a source gives a prevalence percentage/rate, you may convert it to a patient-count denominator only when the input payload provides a US population denominator. Choose total, adult, or pediatric denominator to match the article population when possible, state the formula in your rationale, cite both the PubMed source and the population source, and mark human_review_required true.
 Do not use clinical trial enrollment counts as market denominators.
 Return a selected_population_measure only when a usable patient-count denominator or source-backed converted denominator exists.
 Every selected or candidate value must include the PMID/source_id and a short rationale tied to the evidence."""
@@ -146,6 +147,7 @@ def build_commercial_model_with_trace(
             trial=trial,
             asset=asset,
             clinical_evidence=clinical_evidence,
+            default_config=default_config,
             run_id=run_id,
             config=config,
         )
@@ -298,6 +300,7 @@ def assemble_commercial_input_bundle(
             "status": trial.overall_status if trial else None,
             "modality": asset.modality if asset else None,
         },
+        us_population_denominator=dict(market_evidence.get("us_population_denominator") or {}),
         disease_population_evidence=tuple(population_evidence),
         prevalence_evidence=tuple(item for item in population_evidence if "preval" in str(item.get("measure_type", "")).casefold() or item.get("measure_type") == "reviewed_annual_eligible_patients"),
         incidence_evidence=tuple(item for item in population_evidence if "incidence" in str(item.get("measure_type", "")).casefold()),
@@ -308,6 +311,7 @@ def assemble_commercial_input_bundle(
             "primary_endpoints": list(trial.primary_endpoints) if trial else [],
         },
         pricing_benchmark=_pricing_benchmark(pricing, default_archetypes),
+        market_query_diagnostics=tuple(item for item in market_evidence.get("query_diagnostics") or () if isinstance(item, dict)),
         missing_inputs=missing_labels,
         user_overrides={**user_overrides, **_market_user_overrides(market_evidence)},
         predefined_archetype_assumptions=default_archetypes,
@@ -319,34 +323,51 @@ def _collect_market_population_evidence(
     trial: ClinicalTrialRecord | None,
     asset: AssetIdentityOutput | None,
     clinical_evidence: ClinicalEvidenceSummary | None,
+    default_config: dict[str, Any],
     run_id: str | None,
     config: AgentRuntimeConfig | None,
 ) -> dict[str, Any]:
+    us_population, population_source, population_flags, population_questions = _us_population_denominator(default_config)
     if trial is None:
-        return _empty_market_evidence(confidence_flags=("market_trial_missing",))
+        return _empty_market_evidence(
+            sources=(population_source,) if population_source else (),
+            confidence_flags=tuple((*population_flags, "market_trial_missing")),
+            human_review_questions=population_questions,
+            us_population_denominator=us_population,
+        )
     query_config = load_config("market_query_templates.yaml", section="due_diligence")
     queries = _generate_market_queries(trial=trial, asset=asset, query_config=query_config)
     if not queries:
-        return _empty_market_evidence(confidence_flags=("market_queries_missing",))
+        return _empty_market_evidence(
+            sources=(population_source,) if population_source else (),
+            confidence_flags=tuple((*population_flags, "market_queries_missing")),
+            human_review_questions=population_questions,
+            us_population_denominator=us_population,
+        )
     articles: list[PubMedArticle] = []
     flags: list[str] = []
+    query_diagnostics: list[dict[str, Any]] = []
     client = PubMedClient()
     for query in queries[: _env_int("PHARMA_OS_MARKET_MAX_QUERIES", 8, minimum=1, maximum=40)]:
         try:
-            articles.extend(
-                client.search(
-                    query,
-                    max_results=_env_int("PHARMA_OS_MARKET_PUBMED_RESULTS_PER_QUERY", 5, minimum=1, maximum=25),
-                )
+            results = client.search(
+                query,
+                max_results=_env_int("PHARMA_OS_MARKET_PUBMED_RESULTS_PER_QUERY", 5, minimum=1, maximum=25),
             )
+            query_diagnostics.append({"query": query, "status": "ok", "article_count": len(results)})
+            articles.extend(results)
         except PubMedError as exc:
             flags.append(f"pubmed_market_query_failed:{_slug(query)}:{exc.__class__.__name__}")
+            query_diagnostics.append({"query": query, "status": "failed", "error_type": exc.__class__.__name__, "error": str(exc)})
     articles = _dedupe_articles(articles)
-    sources = tuple(article.source() for article in articles)
+    sources = _dedupe_sources((*((population_source,) if population_source else ()), *(article.source() for article in articles)))
     if not articles:
         return _empty_market_evidence(
             sources=sources,
-            confidence_flags=tuple((*flags, "market_pubmed_no_articles")),
+            confidence_flags=tuple((*population_flags, *flags, "market_pubmed_no_articles")),
+            human_review_questions=population_questions,
+            us_population_denominator=us_population,
+            query_diagnostics=tuple(query_diagnostics),
         )
     selected = _select_epi_articles(trial=trial, asset=asset, articles=articles)
     payload = {
@@ -355,6 +376,7 @@ def _collect_market_population_evidence(
         "geography": "United States",
         "nct_id": trial.nct_id,
         "clinical_evidence_query": clinical_evidence.pubmed_query if clinical_evidence else None,
+        "us_population_denominator": us_population,
         "articles": [
             {
                 "pmid": article.pmid,
@@ -400,6 +422,7 @@ def _collect_market_population_evidence(
     confidence_flags = tuple(
         dict.fromkeys(
             (
+                *population_flags,
                 *flags,
                 *result.output.assumption_flags,
                 *("literature_population_measure_missing" for _ in [1] if not population_evidence),
@@ -412,7 +435,9 @@ def _collect_market_population_evidence(
         "sources": sources,
         "source_ids": tuple(source.source_id for source in sources),
         "confidence_flags": confidence_flags,
-        "human_review_questions": result.output.human_review_questions,
+        "human_review_questions": tuple(dict.fromkeys((*population_questions, *result.output.human_review_questions))),
+        "us_population_denominator": us_population,
+        "query_diagnostics": tuple(query_diagnostics),
         "trace": result.trace,
         "trace_metadata": result.trace_metadata,
     }
@@ -422,6 +447,9 @@ def _empty_market_evidence(
     *,
     sources: tuple[SourceMetadata, ...] = (),
     confidence_flags: tuple[str, ...] = (),
+    human_review_questions: tuple[str, ...] = (),
+    us_population_denominator: dict[str, Any] | None = None,
+    query_diagnostics: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     return {
         "population_evidence": (),
@@ -429,7 +457,9 @@ def _empty_market_evidence(
         "sources": sources,
         "source_ids": tuple(source.source_id for source in sources),
         "confidence_flags": confidence_flags,
-        "human_review_questions": (),
+        "human_review_questions": human_review_questions,
+        "us_population_denominator": us_population_denominator or {},
+        "query_diagnostics": query_diagnostics,
         "trace": None,
         "trace_metadata": {},
     }
@@ -526,7 +556,7 @@ def _select_epi_articles(*, trial: ClinicalTrialRecord, asset: AssetIdentityOutp
 def _population_evidence_from_extraction(extraction: EpidemiologyEvidenceExtraction) -> tuple[dict[str, Any], ...]:
     items: list[dict[str, Any]] = []
     selected = extraction.selected_population_measure
-    if selected and selected.value is not None:
+    if selected and selected.value is not None and _is_patient_count_population(selected.model_dump(mode="json")):
         payload = selected.model_dump(mode="json")
         if extraction.selected_source_id:
             payload["source_id"] = extraction.selected_source_id
@@ -535,9 +565,21 @@ def _population_evidence_from_extraction(extraction: EpidemiologyEvidenceExtract
         if candidate.value is None:
             continue
         payload = candidate.model_dump(mode="json")
+        if not _is_patient_count_population(payload):
+            continue
         if not any(item.get("value") == payload.get("value") and item.get("source_id") == payload.get("source_id") for item in items):
             items.append(payload)
     return tuple(items)
+
+
+def _is_patient_count_population(payload: dict[str, Any]) -> bool:
+    measure_type = str(payload.get("measure_type") or "").casefold()
+    unit = str(payload.get("unit") or "").casefold()
+    if any(token in measure_type for token in ("percent", "rate", "fraction")):
+        return False
+    if any(token in unit for token in ("%", "percent", "per ", "rate", "fraction")):
+        return False
+    return "patient" in measure_type or "population" in measure_type or "patient" in unit or unit in {"people", "persons"}
 
 
 def _market_source_ids(market_evidence: dict[str, Any]) -> tuple[str, ...]:
@@ -547,6 +589,57 @@ def _market_source_ids(market_evidence: dict[str, Any]) -> tuple[str, ...]:
 def _market_user_overrides(market_evidence: dict[str, Any]) -> dict[str, Any]:
     del market_evidence
     return {}
+
+
+def _source_ids_from_reference(reference: str | None) -> tuple[str, ...]:
+    if not reference:
+        return ()
+    return tuple(
+        dict.fromkeys(
+            match.group(0).rstrip(".,;)")
+            for match in re.finditer(r"\b(?:pubmed|ctgov|census|config|wac|openfda_label):[A-Za-z0-9_.:/-]+", reference)
+        )
+    )
+
+
+def _us_population_denominator(default_config: dict[str, Any]) -> tuple[dict[str, Any], SourceMetadata | None, tuple[str, ...], tuple[str, ...]]:
+    try:
+        denominator = CensusPopulationClient().get_latest_us_population()
+        return denominator.model_payload(), denominator.source(), (), ()
+    except CensusPopulationError as exc:
+        fallback = default_config.get("us_population_denominator") or {}
+        if not isinstance(fallback, dict) or to_float(fallback.get("total_us_population")) is None:
+            return (
+                {},
+                None,
+                ("us_population_denominator_unavailable",),
+                (f"Provide a reviewed US population denominator; live Census lookup failed: {exc}",),
+            )
+        payload = dict(fallback)
+        payload["lookup_error"] = str(exc)
+        payload["source_type"] = payload.get("source_type") or "config_fallback"
+        payload["human_review_required"] = True
+        source = SourceMetadata(
+            source_id=str(payload.get("source_id") or "config:due_diligence:us_population_denominator"),
+            title=f"US population denominator fallback ({payload.get('source_year') or 'unknown year'})",
+            url=payload.get("source_url"),
+            provenance="due_diligence/default_archetypes.yaml:us_population_denominator",
+            source_type=str(payload.get("source_type") or "config_fallback"),
+            version=str(payload.get("source_year")) if payload.get("source_year") is not None else None,
+        )
+        return (
+            payload,
+            source,
+            ("us_population_denominator_config_fallback",),
+            ("Confirm the US population denominator used for prevalence-to-patient conversion.",),
+        )
+
+
+def _dedupe_sources(sources: tuple[SourceMetadata, ...]) -> tuple[SourceMetadata, ...]:
+    deduped: dict[str, SourceMetadata] = {}
+    for source in sources:
+        deduped[source.source_id] = source
+    return tuple(deduped.values())
 
 
 def _combined_trace_metadata(items: dict[str, Any]) -> dict[str, str | int | float | bool | None]:
@@ -925,12 +1018,8 @@ def _legacy_assumptions(
 ) -> list[Any]:
     selected_annual_patients = interpretation.selected_population_measure.value
     population_reference = interpretation.selected_population_measure.evidence_reference
-    population_source_ids = (
-        (population_reference,)
-        if isinstance(population_reference, str)
-        and (population_reference.startswith("pubmed:") or population_reference.startswith("ctgov:"))
-        else (config_id,) if selected_annual_patients is not None else ()
-    )
+    parsed_population_source_ids = _source_ids_from_reference(population_reference)
+    population_source_ids = parsed_population_source_ids or ((config_id,) if selected_annual_patients is not None else ())
     assumptions = [
         assumption(
             "commercial-annual-patients",
@@ -1029,12 +1118,14 @@ def _fraction_record(name: str, value: CommercialAssumptionTriplet) -> Commercia
 
 def _bundle_summary(bundle: CommercialInputBundle) -> dict[str, Any]:
     return {
+        "us_population_denominator": bundle.us_population_denominator,
         "disease_population_evidence_count": len(bundle.disease_population_evidence),
         "prevalence_evidence_count": len(bundle.prevalence_evidence),
         "incidence_evidence_count": len(bundle.incidence_evidence),
         "segmentation_evidence_count": len(bundle.segmentation_evidence),
         "has_trial_eligibility": bool(bundle.trial_eligibility_criteria),
         "pricing_source": bundle.pricing_benchmark.get("source"),
+        "market_query_diagnostics": list(bundle.market_query_diagnostics),
         "missing_inputs": list(bundle.missing_inputs),
     }
 

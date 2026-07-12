@@ -6,6 +6,7 @@ from pharma_os.schemas import (
     AssetIdentityOutput,
     ClinicalTrialRecord,
     CommercialAssumptionTriplet,
+    CommercialInputBundle,
     MarketSizingInterpretation,
     PatentExclusivityOutput,
     PoSOutput,
@@ -183,6 +184,137 @@ def test_commercial_model_uses_ai_extracted_market_population(monkeypatch) -> No
     assert output.output.revenue_forecast
     assert "pubmed:123" in output.output.source_ids
     assert len(output.agent_traces) == 2
+
+
+def test_commercial_model_passes_us_population_denominator_for_prevalence_conversion(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePubMedClient:
+        def search(self, query, *, max_results=5):
+            return (
+                commercial_model_module.PubMedArticle(
+                    pmid="321",
+                    title="United States atopic dermatitis prevalence",
+                    abstract_snippet="Prevalence of atopic dermatitis was 7.3% among adults in the United States.",
+                ),
+            )
+
+    def fake_census(self):
+        raise commercial_model_module.CensusPopulationError("no key")
+
+    def fake_llm_call(**kwargs):
+        if kwargs["output_type"].__name__ == "EpidemiologyEvidenceExtraction":
+            payload = kwargs["payload"]
+            captured["us_population_denominator"] = payload["us_population_denominator"]
+            output = commercial_model_module.EpidemiologyEvidenceExtraction(
+                evidence_status="converted_prevalence_measure_selected",
+                selected_population_measure=SelectedPopulationMeasure(
+                    value=19_504_262.0,
+                    unit="patients",
+                    measure_type="converted_prevalent_patients",
+                    condition="atopic dermatitis",
+                    geography="United States",
+                    source_type="source_derived",
+                    rationale="Converted 7.3% adult prevalence using adult denominator 267181678.",
+                    evidence_reference="pubmed:321; census:acs1_subject:2024:us_population_config_fallback",
+                    confidence_score=7,
+                    human_review_required=True,
+                ),
+                selected_source_id="pubmed:321",
+                candidate_population_measures=(
+                    commercial_model_module.EpidemiologyPopulationCandidate(
+                        value=7.3,
+                        unit="percent",
+                        measure_type="prevalence_percent",
+                        condition="atopic dermatitis",
+                        geography="United States",
+                        source_type="source_derived",
+                        evidence_reference="pubmed:321",
+                        rationale="Raw prevalence percent should stay segmentation evidence, not patient-count evidence.",
+                        confidence_score=7,
+                        human_review_required=True,
+                    ),
+                ),
+                confidence_score=7,
+            )
+        else:
+            assert isinstance(kwargs["payload"], CommercialInputBundle)
+            assert kwargs["payload"].us_population_denominator["total_us_population"] == 340110990
+            assert kwargs["payload"].disease_population_evidence[0]["value"] == 19_504_262.0
+            assert all(item.get("unit") != "percent" for item in kwargs["payload"].disease_population_evidence)
+            triplet = CommercialAssumptionTriplet(
+                low=1.0,
+                base=1.0,
+                high=1.0,
+                source_type="source_derived",
+                rationale="Use converted denominator directly.",
+                evidence_reference="pubmed:321",
+                confidence_score=7,
+                human_review_required=True,
+            )
+            output = MarketSizingInterpretation(
+                calculable=True,
+                selected_market_archetype="chronic_specialty_prevalence",
+                market_basis="prevalence_stock",
+                selected_population_measure=SelectedPopulationMeasure(
+                    value=19_504_262.0,
+                    unit="patients",
+                    measure_type="converted_prevalent_patients",
+                    condition="atopic dermatitis",
+                    geography="United States",
+                    source_type="source_derived",
+                    rationale="Selected converted prevalence denominator.",
+                    evidence_reference="pubmed:321; census:acs1_subject:2024:us_population_config_fallback",
+                    confidence_score=7,
+                    human_review_required=True,
+                ),
+                yearly_eligible_patient_logic="Use converted disease-population denominator directly.",
+                diagnosed_fraction=triplet,
+                treated_fraction=triplet,
+                eligibility_fraction=triplet,
+                commercially_addressable_fraction=triplet,
+                rationale="Source-backed prevalence conversion was available.",
+                confidence_score=7,
+                key_evidence_used=("pubmed:321", "census:acs1_subject:2024:us_population_config_fallback"),
+            )
+        return SimpleNamespace(output=output, trace=SimpleNamespace(agent_name=kwargs["agent_name"]), trace_metadata={"agent_name": kwargs["agent_name"]})
+
+    monkeypatch.setattr(commercial_model_module, "PubMedClient", FakePubMedClient)
+    monkeypatch.setattr(commercial_model_module.CensusPopulationClient, "get_latest_us_population", fake_census)
+    monkeypatch.setattr(commercial_model_module, "run_structured_llm_call", fake_llm_call)
+
+    output = build_commercial_model_with_trace(
+        annual_patients=None,
+        peak_penetration=None,
+        gross_to_net=None,
+        pricing=PricingOutput(
+            annual_wac=1000.0,
+            wac_value=1000.0,
+            dosing_summary="source-backed dosing",
+            source_ids=("wac:fixture",),
+            confidence=0.8,
+        ),
+        trial=ClinicalTrialRecord(
+            nct_id="NCT12345678",
+            brief_title="Trial in patients with atopic dermatitis",
+            conditions=("Atopic Dermatitis",),
+            source_id="ctgov:NCT12345678",
+        ),
+        asset=AssetIdentityOutput(
+            nct_id="NCT12345678",
+            asset_name="Example",
+            normalized_indication="atopic dermatitis",
+            source_ids=("ctgov:NCT12345678",),
+            confidence=0.8,
+        ),
+        run_id="commercial-market-prevalence-fixture",
+    )
+
+    assert output.output.calculable
+    assert output.output.annual_patients == 19_504_262.0
+    assert "census:acs1_subject:2024:us_population_config_fallback" in output.output.source_ids
+    assert output.output.commercial_input_bundle_summary["us_population_denominator"]["human_review_required"] is True
+    assert captured["us_population_denominator"]["adult_population"] == 267181678
 
 
 def test_rnpv_uses_config_fallbacks_with_provenance() -> None:

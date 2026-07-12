@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pharma_os.execution_modes import reused_artifacts_from_output, summarize_execution_modes
 from pharma_os.memory import MemoryStore
+from pharma_os.review_flags import canonical_review_flags, review_flag_summary
 from pharma_os.schemas import FinalReport
 from pharma_os.validators import aggregate_validation_status
 
@@ -38,8 +39,14 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
             from pharma_os.schemas import ExecutionModeSummary
 
             execution_mode_summary = ExecutionModeSummary.model_validate(output_summary)
-    summary = _summary(bundle, execution_mode_summary.summary)
-    confidence = _confidence(validation_status, bool(latest_gate), len(bundle.confidence_flags))
+    review_flags = canonical_review_flags(
+        run_id=run_id,
+        validation_results=bundle.validation_results,
+        human_gate=latest_gate,
+        confidence_flags=bundle.confidence_flags,
+    )
+    summary = _summary(bundle, execution_mode_summary.summary, review_flag_summary(review_flags))
+    confidence = _confidence(validation_status, bool(latest_gate), review_flags)
     report = FinalReport(
         report_id=f"report-{run_id}",
         run_id=run_id,
@@ -48,7 +55,7 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
         claims=bundle.claims,
         sources=bundle.sources,
         validation_results=bundle.validation_results,
-        confidence_flags=bundle.confidence_flags,
+        confidence_flags=review_flags,
         human_gate=latest_gate,
         confidence=confidence,
         validation_status=validation_status,
@@ -58,7 +65,7 @@ def build_report(run_id: str, memory: MemoryStore | None = None) -> FinalReport:
     return store.save_report(report)
 
 
-def _summary(bundle: object, execution_mode_summary: str) -> str:
+def _summary(bundle: object, execution_mode_summary: str, review_summary: str) -> str:
     run = bundle.run
     if run is None:
         return "No persisted workflow details are available yet."
@@ -71,18 +78,20 @@ def _summary(bundle: object, execution_mode_summary: str) -> str:
         parts.append(
             f"{len(bundle.validation_results)} validation results were recorded."
         )
-    if bundle.confidence_flags:
-        parts.append(f"{len(bundle.confidence_flags)} confidence flags require review.")
-    if bundle.human_gates:
-        parts.append("A human review gate is open.")
+    parts.append(review_summary)
     return " ".join(parts)
 
 
-def _confidence(validation_status: str, has_gate: bool, flag_count: int) -> float:
+def _confidence(validation_status: str, has_gate: bool, review_flags: tuple[object, ...]) -> float:
     if validation_status == "failed":
         return 0.25
+    severities = [getattr(flag, "severity", "") for flag in review_flags]
+    if "critical" in severities:
+        return 0.3
+    if "high" in severities:
+        return 0.45
     if has_gate:
-        return 0.4
+        return 0.55
     if validation_status == "warning":
         return 0.65
-    return max(0.5, 0.9 - min(flag_count, 5) * 0.05)
+    return max(0.5, 0.9 - min(len(review_flags), 5) * 0.05)

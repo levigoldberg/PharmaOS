@@ -7,6 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from pharma_os.review_flags import canonical_review_flags
 from pharma_os.schemas import (
     ClinicalOutcomePredictionOutput,
     ConfidenceFlag,
@@ -579,42 +580,16 @@ def generate_confidence_flags(
     run_id: str,
     validation_results: tuple[ValidationResult, ...],
     risk_flags: tuple[Any, ...] = (),
+    human_gate: HumanGate | None = None,
 ) -> tuple[ConfidenceFlag, ...]:
-    """Generate confidence flags from validation and workflow risk flags."""
+    """Generate canonical human-review flags from validation, risk, and gate signals."""
 
-    flags: list[ConfidenceFlag] = []
-    for result in validation_results:
-        if result.status not in {"failed", "warning", "needs_human_review"}:
-            continue
-        severity = "high" if result.status == "failed" else "medium"
-        flags.append(
-            ConfidenceFlag(
-                flag_id=f"flag-{run_id}-{_slug(result.validation_id)}",
-                target_id=result.target_id,
-                reason=result.message,
-                severity=severity,
-                confidence=max(0.0, min(result.confidence, 1.0)),
-                source_ids=result.source_ids,
-                provenance="pharma_os.validators.generate_confidence_flags.validation",
-            )
-        )
-    for index, risk in enumerate(risk_flags, start=1):
-        severity = getattr(risk, "severity", "medium")
-        description = getattr(risk, "description", None) or getattr(risk, "reason", str(risk))
-        source_ids = tuple(getattr(risk, "source_ids", ()))
-        flag_severity = "critical" if severity == "critical" else "high" if severity == "high" else "medium"
-        flags.append(
-            ConfidenceFlag(
-                flag_id=f"flag-{run_id}-risk-{index}",
-                target_id=getattr(risk, "risk_id", None) or getattr(risk, "flag_id", f"risk-{index}"),
-                reason=description,
-                severity=flag_severity,
-                confidence=0.4 if severity == "critical" else 0.65 if severity == "high" else 0.8,
-                source_ids=source_ids,
-                provenance="pharma_os.validators.generate_confidence_flags.risk",
-            )
-        )
-    return tuple(flags)
+    return canonical_review_flags(
+        run_id=run_id,
+        validation_results=validation_results,
+        risk_flags=risk_flags,
+        human_gate=human_gate,
+    )
 
 
 def aggregate_validation_status(results: tuple[ValidationResult, ...]) -> str:

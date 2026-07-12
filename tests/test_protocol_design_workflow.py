@@ -12,6 +12,7 @@ from pharma_os.schemas import (
     Agent3HandoffReference,
     Agent4HandoffReference,
     AgentOutput,
+    AgentRunTrace,
     AnalogCandidateRecord,
     AnalogSearchPlanOutput,
     AnalogTrialSelectionOutput,
@@ -33,6 +34,9 @@ from pharma_os.schemas import (
     EndpointRiskAssessment,
     EnrollmentDurationRisk,
     FailureModeClassification,
+    FollowOnCandidateRecord,
+    FollowOnTrialAdjudication,
+    FollowOnTrialAdjudicationOutput,
     HistoricalPoSEstimate,
     LabelExpansionClinicalRationale,
     PatentExclusivityOutput,
@@ -40,6 +44,7 @@ from pharma_os.schemas import (
     PoSOutput,
     PricingOutput,
     ProtocolDesignInput,
+    QualitativeProtocolSynthesis,
     RNPVOutput,
     SafetyContext,
     SafetyLabelSummary,
@@ -55,7 +60,14 @@ from pharma_os.schemas import (
     TrialSponsor,
     WorkflowRun,
 )
-from pharma_os.tools.protocol_design import calculate_analog_benchmark, execute_ctgov_search_plan
+from pharma_os.tools.protocol_design import (
+    adjudicate_follow_on_trials_deterministically,
+    calculate_analog_benchmark,
+    execute_ctgov_search_plan,
+    hydrate_selected_analog_candidates,
+    retrieve_follow_on_candidates,
+)
+from pharma_os.tools.clinicaltrials import ClinicalTrialsGovError
 from pharma_os.validators import validate_protocol_design_constraints
 from pharma_os.workflows import protocol_design
 from pharma_os.workflows.protocol_design import run_protocol_design_workflow
@@ -110,6 +122,75 @@ def _analog(nct_id: str, *, enrollment: int | None = 100, status: str = "COMPLET
         locations=(),
         source_id=f"ctgov:{nct_id}",
     )
+
+
+def _follow_on(nct_id: str, *, enrollment: int | None = 150, phase: tuple[str, ...] = ("PHASE3",), start_date: str = "2023-01", sponsor: str = "Analog Bio", study_type: str = "INTERVENTIONAL") -> ClinicalTrialRecord:
+    return ClinicalTrialRecord(
+        nct_id=nct_id,
+        brief_title=f"Follow-on Analogmab {nct_id}",
+        overall_status="RECRUITING",
+        phases=phase,
+        study_type=study_type,
+        allocation="RANDOMIZED",
+        intervention_model="PARALLEL",
+        masking="DOUBLE",
+        number_of_arms=2,
+        conditions=("Glioblastoma",),
+        interventions=(TrialIntervention(name="Analogmab", type="DRUG", arm_group_labels=("Experimental",)), TrialIntervention(name="Placebo", type="DRUG", arm_group_labels=("Control",))),
+        arm_groups=(TrialArmGroup(label="Experimental", type="EXPERIMENTAL", intervention_names=("Analogmab",)), TrialArmGroup(label="Control", type="PLACEBO_COMPARATOR", intervention_names=("Placebo",))),
+        lead_sponsor=TrialSponsor(name=sponsor, sponsor_class="INDUSTRY"),
+        enrollment_count=enrollment,
+        start_date=start_date,
+        primary_completion_date="2026-01",
+        results_available=False,
+        primary_endpoints=(TrialEndpoint(measure="Overall survival", endpoint_type="primary"),),
+        secondary_endpoints=(TrialEndpoint(measure="Progression-free survival", endpoint_type="secondary"),),
+        eligibility_criteria="Inclusion Criteria: diagnosis; measurable disease; biomarker testing. Exclusion Criteria: infection; cardiac disease; prior therapy.",
+        minimum_age="18 Years",
+        sex="ALL",
+        locations=(TrialLocation(facility="Site 1", country="United States"), TrialLocation(facility="Site 2", country="Canada")),
+        source_id=f"ctgov:{nct_id}",
+    )
+
+
+def _follow_on_candidate(anchor_nct_id: str, trial: ClinicalTrialRecord, *, exclusion_reason: str | None = None) -> FollowOnCandidateRecord:
+    return FollowOnCandidateRecord(
+        candidate_id=f"follow-on-candidate-{anchor_nct_id}-{trial.nct_id}",
+        anchor_analog_nct_id=anchor_nct_id,
+        trial=trial,
+        lineage_features={
+            "anchor_nct_id": anchor_nct_id,
+            "candidate_nct_id": trial.nct_id,
+            "same_normalized_asset": True,
+            "same_indication": True,
+            "same_sponsor": True,
+            "chronology": "later_start",
+        },
+        exclusion_reason=exclusion_reason,
+        source_ids=(trial.source_id,),
+        provenance="test.follow_on",
+    )
+
+
+def _patch_follow_on_flow(monkeypatch, follow_on_trials: tuple[ClinicalTrialRecord, ...]) -> None:
+    def fake_retrieve(selected_analogs):
+        candidates = tuple(
+            _follow_on_candidate(selected_analogs[0].trial.nct_id, trial)
+            for trial in follow_on_trials
+        ) if selected_analogs else ()
+        return candidates, tuple(_source(trial.source_id, "clinical_trial_registry") for trial in follow_on_trials), ()
+
+    def fake_fetch(adjudication, follow_on_candidates):
+        selected = {
+            nct_id
+            for item in adjudication.adjudications
+            for nct_id in item.selected_follow_on_nct_ids
+        }
+        records = tuple(trial for trial in follow_on_trials if trial.nct_id in selected)
+        return records, tuple(_source(trial.source_id, "clinical_trial_registry") for trial in records), ()
+
+    monkeypatch.setattr(protocol_design_agents, "retrieve_follow_on_candidates", fake_retrieve)
+    monkeypatch.setattr(protocol_design_agents, "fetch_selected_follow_on_trials", fake_fetch)
 
 
 def _benchmark_for_trials(trials: tuple[ClinicalTrialRecord, ...]):
@@ -246,6 +327,173 @@ def test_execute_ctgov_search_plan_dedupes_and_preserves_provenance() -> None:
     assert any(source.source_id.startswith("ctgov_search:protocol_design:") for source in sources)
 
 
+def test_execute_ctgov_search_plan_retries_ai_specific_query_with_api_safe_variants() -> None:
+    plan = AnalogSearchPlanOutput(
+        output_id="search-plan",
+        target_nct_id="NCT12345678",
+        queries=(
+            CTGovSearchQuery(
+                query_id="q1",
+                condition="Glioblastoma",
+                intervention="placebo",
+                phase="PHASE2",
+                endpoint_family="progression-free survival",
+                comparator="placebo-controlled",
+                term="glioblastoma phase 2 placebo progression-free survival",
+                expected_analog_dimension="same indication, phase, comparator, and endpoint family",
+                rationale="AI chose a specific comparator/endpoints search.",
+            ),
+        ),
+        rationale="AI-specific plan.",
+    )
+    calls = []
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            calls.append(input_data)
+            assert input_data.drug is None
+            if input_data.target:
+                raise ClinicalTrialsGovError("ClinicalTrials.gov returned HTTP 400")
+            analog = _analog("NCT00000001")
+            return ClinicalTrialsSearchResult(
+                query=input_data,
+                trials=(analog,),
+                sources=(_source(analog.source_id, "clinical_trial_registry"),),
+                api_url="https://clinicaltrials.gov/api/v2/studies",
+            )
+
+    candidates, sources, flags = execute_ctgov_search_plan(search_plan=plan, target_nct_id="NCT12345678", client=FakeClient())
+
+    assert [candidate.trial.nct_id for candidate in candidates] == ["NCT00000001"]
+    assert not flags
+    assert any(call.target and "placebo" in call.target for call in calls)
+    assert any(call.target is None and call.phase == "PHASE2" for call in calls)
+    assert any("executed attempt=condition_phase" in source.provenance for source in sources)
+
+
+def test_hydrate_selected_analog_candidates_fetches_agent_selected_ncts() -> None:
+    selection = AnalogTrialSelectionOutput(
+        output_id="analog-selection-run",
+        target_nct_id="NCT12345678",
+        selected_analogs=(
+            SelectedAnalogTrial(
+                nct_id="NCT00000009",
+                match_score=0.91,
+                match_confidence="high",
+                matched_dimensions=("indication", "endpoint_family"),
+                reasoning="Live agent selected a source-backed analog.",
+                source_ids=("NCT00000009",),
+            ),
+        ),
+        confidence=0.9,
+    )
+
+    class FakeClient:
+        def fetch_trial(self, nct_id):
+            assert nct_id == "NCT00000009"
+            return _analog("NCT00000009")
+
+    candidates, sources, flags = hydrate_selected_analog_candidates(
+        target_trial=_target_trial(),
+        selection=selection,
+        candidates=(),
+        client=FakeClient(),
+    )
+
+    assert not flags
+    assert [candidate.trial.nct_id for candidate in candidates] == ["NCT00000009"]
+    assert candidates[0].provenance == "protocol_design.selected_analog_hydration"
+    assert candidates[0].similarity_features["recovered_from_selection"] is True
+    assert [source.source_id for source in sources] == ["ctgov:NCT00000009"]
+
+
+def test_manager_carries_hydrated_live_selected_analogs_into_follow_on_search(monkeypatch) -> None:
+    agent3, _, agent4, _ = _handoffs()
+    hydrated = AnalogCandidateRecord(
+        candidate_id="analog-candidate-NCT00000009",
+        trial=_analog("NCT00000009"),
+        query_ids=("selected_analog_hydration",),
+        similarity_features={"recovered_from_selection": True},
+        source_ids=("ctgov:NCT00000009",),
+        provenance="protocol_design.selected_analog_hydration",
+    )
+    selection = AnalogTrialSelectionOutput(
+        output_id="analog-selection-manager",
+        target_nct_id="NCT12345678",
+        selected_analogs=(
+            SelectedAnalogTrial(
+                nct_id="NCT00000009",
+                match_score=0.91,
+                match_confidence="high",
+                matched_dimensions=("indication", "endpoint_family"),
+                reasoning="Live agent selected this analog from dependency context.",
+                source_ids=("NCT00000009",),
+            ),
+        ),
+        confidence=0.91,
+    )
+    original_run_typed_agent = protocol_design_agents._run_typed_agent
+
+    def fake_run_typed_agent(**kwargs):
+        if kwargs["agent_name"] == "AnalogSelectionAgent":
+            return SimpleNamespace(
+                output=selection,
+                trace=AgentRunTrace(
+                    trace_id="trace-analog-selection-manager",
+                    run_id=kwargs["run_id"],
+                    agent_name="AnalogSelectionAgent",
+                    input_summary=kwargs.get("input_summary"),
+                    output_id=selection.output_id,
+                    output_type="AnalogTrialSelectionOutput",
+                    source_ids=selection.source_ids,
+                    confidence=selection.confidence,
+                    rationale_summary="Fixture live selection.",
+                    provenance="test",
+                    execution_mode="live_agent",
+                ),
+            )
+        return original_run_typed_agent(**kwargs)
+
+    captured = {}
+    monkeypatch.setattr(protocol_design_agents, "_run_typed_agent", fake_run_typed_agent)
+    monkeypatch.setattr(
+        protocol_design_agents,
+        "hydrate_selected_analog_candidates",
+        lambda **_: ((hydrated,), (_source("ctgov:NCT00000009", "clinical_trial_registry"),), ()),
+    )
+
+    def fake_retrieve_follow_on_candidates(*, selected_analogs):
+        captured["selected_analogs"] = selected_analogs
+        return (), (), ()
+
+    monkeypatch.setattr(protocol_design_agents, "retrieve_follow_on_candidates", fake_retrieve_follow_on_candidates)
+
+    result = run_protocol_design_manager_agent(
+        run_id="manager-hydration",
+        target_trial=_target_trial(),
+        agent3_output=agent3,
+        agent4_output=agent4,
+        source_ids=("ctgov:NCT12345678",),
+        assumptions=(),
+        missing_data_flags=(),
+        claims=(),
+        top_k=5,
+        execute_search_plan=lambda search_plan, target_nct_id: ((), (), ()),
+        calculate_benchmark=lambda trial, candidates, selection_output, search_plan: calculate_analog_benchmark(
+            run_id="manager-hydration",
+            target_trial=trial,
+            candidates=candidates,
+            selection=selection_output,
+            search_plan=search_plan,
+        ),
+        config=AgentRuntimeConfig(disabled=True),
+    )
+
+    assert [candidate.trial.nct_id for candidate in captured["selected_analogs"]] == ["NCT00000009"]
+    assert result.direct_analog_benchmark_bundle.selected_analog_ids == ("NCT00000009",)
+    assert result.benchmark_bundle.selected_analog_ids == ("NCT00000009",)
+
+
 def test_calculate_analog_benchmark_handles_missing_values() -> None:
     agent3, _, agent4, _ = _handoffs()
     plan = protocol_design.build_search_strategy(run_id="run", target_trial=_target_trial(), agent3_output=agent3, agent4_output=agent4)
@@ -309,6 +557,113 @@ def test_analog_benchmark_uses_heuristics_when_structured_fields_missing() -> No
     assert bundle.comparator_categories[0].label == "placebo_control"
 
 
+def test_follow_on_search_requires_same_asset_indication_and_sponsor_and_excludes_earlier() -> None:
+    analog = AnalogCandidateRecord(
+        candidate_id="analog",
+        trial=_analog("NCT00000001", enrollment=120),
+        query_ids=("q1",),
+        source_ids=("ctgov:NCT00000001",),
+        provenance="test",
+    )
+    valid = _follow_on("NCT10000001", enrollment=180, start_date="2023-01")
+    earlier = _follow_on("NCT10000002", enrollment=180, start_date="2019-01")
+    sponsor_mismatch = _follow_on("NCT10000003", enrollment=180, sponsor="Other Bio")
+    observational = _follow_on("NCT10000004", enrollment=180, study_type="OBSERVATIONAL")
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            trials = (analog.trial, valid, earlier, sponsor_mismatch, observational)
+            return ClinicalTrialsSearchResult(
+                query=input_data,
+                trials=trials,
+                sources=tuple(_source(trial.source_id, "clinical_trial_registry") for trial in trials),
+                api_url="https://clinicaltrials.gov/api/v2/studies",
+            )
+
+    candidates, _, flags = retrieve_follow_on_candidates(selected_analogs=(analog,), client=FakeClient())
+
+    viable = [candidate.trial.nct_id for candidate in candidates if candidate.exclusion_reason is None]
+    excluded = {candidate.trial.nct_id: candidate.exclusion_reason for candidate in candidates if candidate.exclusion_reason}
+    assert viable == ["NCT10000001"]
+    assert excluded["NCT00000001"] == "analog_itself"
+    assert excluded["NCT10000002"] == "clearly_earlier_trial"
+    assert excluded["NCT10000003"] == "sponsor_mismatch"
+    assert excluded["NCT10000004"] == "observational_candidate_for_interventional_program"
+    assert not flags
+
+
+def test_follow_on_search_expands_development_code_aliases_and_retries_broader_queries() -> None:
+    anchor = ClinicalTrialRecord(
+        nct_id="NCT00678210",
+        brief_title="Effectiveness and Safety of CP-690,550 in Subjects With Moderate to Severe Chronic Plaque Psoriasis",
+        overall_status="COMPLETED",
+        phases=("PHASE2",),
+        study_type="INTERVENTIONAL",
+        conditions=("Psoriasis",),
+        interventions=(TrialIntervention(name="CP-690,550", type="DRUG"), TrialIntervention(name="Placebo", type="DRUG")),
+        lead_sponsor=TrialSponsor(name="Pfizer", sponsor_class="INDUSTRY"),
+        start_date="2008-07",
+        source_id="ctgov:NCT00678210",
+    )
+    follow_on = ClinicalTrialRecord(
+        nct_id="NCT01815424",
+        brief_title="A Study Evaluating The Efficacy And Safety Of CP-690,550 In Subjects With Moderate To Severe Plaque Psoriasis",
+        overall_status="COMPLETED",
+        phases=("PHASE3",),
+        study_type="INTERVENTIONAL",
+        conditions=("Plaque Psoriasis",),
+        interventions=(TrialIntervention(name="Tofacitinib", type="DRUG"), TrialIntervention(name="Placebo", type="DRUG")),
+        lead_sponsor=TrialSponsor(name="Pfizer", sponsor_class="INDUSTRY"),
+        start_date="2013-12",
+        source_id="ctgov:NCT01815424",
+    )
+    analog = AnalogCandidateRecord(candidate_id="analog", trial=anchor, source_ids=(anchor.source_id,), provenance="test")
+    seen: list[tuple[str | None, str | None, str]] = []
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            seen.append((input_data.drug, input_data.target, input_data.disease))
+            if input_data.drug == "CP-690,550":
+                raise ClinicalTrialsGovError("transient fixture")
+            if input_data.drug == "tofacitinib" or input_data.target == "tofacitinib":
+                return ClinicalTrialsSearchResult(
+                    query=input_data,
+                    trials=(anchor, follow_on),
+                    sources=(_source(anchor.source_id, "clinical_trial_registry"), _source(follow_on.source_id, "clinical_trial_registry")),
+                    api_url="https://clinicaltrials.gov/api/v2/studies",
+                )
+            return ClinicalTrialsSearchResult(query=input_data, trials=(), sources=(), api_url="https://clinicaltrials.gov/api/v2/studies")
+
+    candidates, _, flags = retrieve_follow_on_candidates(selected_analogs=(analog,), client=FakeClient())
+
+    viable = [candidate.trial.nct_id for candidate in candidates if candidate.exclusion_reason is None]
+    assert "NCT01815424" in viable
+    assert any(drug == "tofacitinib" or target == "tofacitinib" for drug, target, _ in seen)
+    assert not any(flag.flag_id.startswith("protocol-design-follow-on-search-nct00678210") for flag in flags)
+
+
+def test_follow_on_adjudication_supports_multiple_and_no_plausible_branches() -> None:
+    analog_with_branches = AnalogCandidateRecord(candidate_id="a1", trial=_analog("NCT00000001"), source_ids=("ctgov:NCT00000001",), provenance="test")
+    analog_without_branch = AnalogCandidateRecord(candidate_id="a2", trial=_analog("NCT00000002"), source_ids=("ctgov:NCT00000002",), provenance="test")
+    candidates = (
+        _follow_on_candidate("NCT00000001", _follow_on("NCT10000001", enrollment=180)),
+        _follow_on_candidate("NCT00000001", _follow_on("NCT10000002", enrollment=220)),
+        _follow_on_candidate("NCT00000002", _follow_on("NCT10000003", enrollment=200), exclusion_reason="asset_mismatch"),
+    )
+
+    output = adjudicate_follow_on_trials_deterministically(
+        run_id="run",
+        target_trial=_target_trial(),
+        selected_analogs=(analog_with_branches, analog_without_branch),
+        follow_on_candidates=candidates,
+    )
+
+    by_anchor = {item.anchor_analog_nct_id: item for item in output.adjudications}
+    assert by_anchor["NCT00000001"].status == "multiple_plausible_branches"
+    assert set(by_anchor["NCT00000001"].selected_follow_on_nct_ids) == {"NCT10000001", "NCT10000002"}
+    assert by_anchor["NCT00000002"].status == "no_plausible_follow_on"
+
+
 def test_next_study_intent_does_not_blindly_increment_phase() -> None:
     agent3, _, agent4, _ = _handoffs()
     target = _target_trial()
@@ -329,7 +684,7 @@ def test_next_study_intent_does_not_blindly_increment_phase() -> None:
     assert intent.requires_human_review is True
 
 
-def test_analog_search_and_selection_follow_next_study_intent_phase() -> None:
+def test_analog_search_and_selection_use_current_trial_not_next_study_intent() -> None:
     agent3, _, agent4, _ = _handoffs()
     target = _target_trial()
     intent = protocol_design_agents.build_next_study_intent(
@@ -354,9 +709,10 @@ def test_analog_search_and_selection_follow_next_study_intent_phase() -> None:
         agent4_output=agent4,
         next_study_intent=intent,
     )
-    assert plan.queries[0].phase == "PHASE3"
-    assert "proposed_next_stage" in plan.expected_dimensions
-    assert "current target trial phase" in plan.rationale
+    assert plan.queries[0].phase == "PHASE2"
+    assert "proposed_next_stage" not in plan.expected_dimensions
+    assert "same_or_comparable_current_phase" in plan.expected_dimensions
+    assert "current trial" in plan.rationale
 
     phase3_candidate = AnalogCandidateRecord(
         candidate_id="c1",
@@ -376,7 +732,8 @@ def test_analog_search_and_selection_follow_next_study_intent_phase() -> None:
     )
 
     assert selection.selected_analogs
-    assert "proposed_next_stage" in selection.selected_analogs[0].matched_dimensions
+    assert "same_indication" in selection.selected_analogs[0].matched_dimensions
+    assert "proposed_next_stage" not in selection.selected_analogs[0].matched_dimensions
 
 
 def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch) -> None:
@@ -395,22 +752,27 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
             )
 
     monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=180), _follow_on("NCT10000002", enrollment=220)))
     store = MemoryStore(":memory:")
 
     output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=store)
 
     assert output.protocol_design_brief.artifact_type == "draft_protocol_design_brief"
     assert output.protocol_design_brief.requires_human_review is True
-    assert output.next_study_intent.proposed_next_stage == "Phase IIb optimization study"
+    assert output.next_study_intent.proposed_next_stage.startswith("analog-follow-on-derived")
     assert output.protocol_design_brief.next_study_intent == output.next_study_intent
-    assert "Phase IIb optimization study" in output.protocol_design_brief.title
     assert output.analog_benchmark_bundle.selected_analog_ids
+    assert output.follow_on_trials
+    assert output.follow_on_adjudications
+    assert output.follow_on_benchmark_bundle is not None
+    assert output.analog_derived_design_decisions
+    assert output.protocol_design_brief.follow_on_trial_ids == tuple(trial.nct_id for trial in output.follow_on_trials)
+    assert output.protocol_design_brief.design_decisions == output.analog_derived_design_decisions
     assert output.human_gate is not None
     assert output.human_gate.decision == "needs_human_review"
     assert output.validation_status == "needs_human_review"
     assert output.human_readable_summary is not None
     assert output.human_readable_summary.module_name == "protocol_design"
-    assert "Phase IIb optimization study" in output.human_readable_summary.plain_language_summary
     assert any(finding.title == "Next study intent" for finding in output.human_readable_summary.key_findings)
     assert "Agent 3 run" in output.human_readable_summary.handoff_summary
     assert "Agent 4 run" in output.human_readable_summary.handoff_summary
@@ -420,16 +782,17 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert bundle.agent_traces
     assert {trace.agent_name for trace in bundle.agent_traces} >= {
         "ProtocolDesignManagerAgent",
-        "DevelopmentStrategyAgent",
         "AnalogSearchPlannerAgent",
         "AnalogSelectionAgent",
+        "FollowOnTrialAdjudicatorAgent",
         "AnalogBenchmarkInterpreterAgent",
+        "QualitativeProtocolSynthesisAgent",
         "EndpointStrategyAgent",
         "PopulationEligibilityAgent",
         "ComparatorDesignAgent",
         "SafetyMonitoringAgent",
         "StatisticalSkeletonAgent",
-        "RegulatoryCriticAgent",
+        "ProtocolCriticAgent",
         "ProtocolBriefWriterAgent",
         "Agent5HumanReadableSummaryAgent",
     }
@@ -438,13 +801,15 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert bundle.input_json is not None
     assert bundle.input_json["cli_input"]["nct_id"] == "NCT12345678"
     assert bundle.input_json["expanded_pipeline_input"]["target_trial"]["nct_id"] == "NCT12345678"
-    assert bundle.input_json["expanded_pipeline_input"]["next_study_intent"]["proposed_next_stage"] == "Phase IIb optimization study"
+    assert bundle.input_json["expanded_pipeline_input"]["next_study_intent"]["proposed_next_stage"].startswith("analog-follow-on-derived")
     assert bundle.input_json["expanded_pipeline_input"]["agent3_output"]["output_id"] == agent3.output_id
     assert bundle.input_json["expanded_pipeline_input"]["agent4_output"]["output_id"] == agent4.output_id
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
-    assert payload["next_study_intent"]["proposed_next_stage"] == "Phase IIb optimization study"
+    assert payload["next_study_intent"]["proposed_next_stage"].startswith("analog-follow-on-derived")
     assert payload["protocol_design_brief"]["next_study_intent"]["study_role"]
     assert payload["analog_benchmark_bundle"]["selected_analog_ids"]
+    assert payload["follow_on_trials"]
+    assert payload["analog_derived_design_decisions"]
     assert payload["human_readable_summary"]["module_name"] == "protocol_design"
 
     html_path = write_run_html(output.run_id, "/tmp/protocol-design-agent5-test.html", memory=store)
@@ -452,7 +817,7 @@ def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch)
     assert "Agent Traces" in html
     assert "ProtocolBriefWriterAgent" in html
     assert "Next Study Intent" in html
-    assert "Phase IIb optimization study" in html
+    assert "analog-follow-on-derived" in html
     assert "Human-Readable Module Summary" in html
 
 
@@ -472,6 +837,7 @@ def test_protocol_design_cli_command(monkeypatch, tmp_path) -> None:
             )
 
     monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=180),))
     output_path = tmp_path / "protocol_design.json"
 
     html_path = tmp_path / "protocol_design.html"
@@ -493,11 +859,13 @@ def test_protocol_design_cli_command(monkeypatch, tmp_path) -> None:
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["input"]["nct_id"] == "NCT12345678"
     assert payload["protocol_design_brief"]["requires_human_review"] is True
+    assert payload["follow_on_trials"]
+    assert payload["analog_derived_design_decisions"]
     assert payload["human_gate"]["decision"] == "needs_human_review"
     assert "Agent Traces" in html_path.read_text(encoding="utf-8")
 
 
-def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> None:
+def test_protocol_design_manager_offline_fallback_and_section_source_ids(monkeypatch) -> None:
     agent3, _, agent4, _ = _handoffs()
     target = _target_trial()
 
@@ -510,6 +878,8 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> No
 
     def fake_calculate(trial, candidates, selection, search_plan):
         return calculate_analog_benchmark(run_id="manager-run", target_trial=trial, candidates=candidates, selection=selection, search_plan=search_plan)
+
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=180), _follow_on("NCT10000002", enrollment=220)))
 
     result = run_protocol_design_manager_agent(
         run_id="manager-run",
@@ -531,10 +901,43 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids() -> No
     assert result.selection.selected_analogs
     assert result.selection.excluded_candidates
     assert all(item.reason for item in result.selection.excluded_candidates)
-    assert result.benchmark_bundle.enrollment.median == 100.0
+    assert result.follow_on_trials
+    assert result.follow_on_adjudication.adjudications[0].status == "multiple_plausible_branches"
+    assert result.benchmark_bundle.enrollment.median == 200.0
+    assert result.design_decisions
     assert result.section_outputs
     assert all(output.source_ids for output in result.section_outputs)
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in result.traces)
+
+
+def test_protocol_design_manager_agent_exposes_specialists_as_tools(monkeypatch) -> None:
+    created = []
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(self)
+
+        def as_tool(self, *, tool_name, tool_description):
+            return {"tool_name": tool_name, "tool_description": tool_description}
+
+    monkeypatch.setattr(protocol_design_agents, "load_agents_sdk", lambda: (FakeAgent, object, object, object))
+    monkeypatch.setattr(protocol_design_agents, "agents_sdk_output_schema", lambda schema: schema)
+
+    manager = protocol_design_agents.build_protocol_design_manager_agent_with_tools(
+        instructions="manager",
+        model="gpt-test",
+        output_type=protocol_design_agents.ProtocolDesignManagerPlan,
+    )
+
+    tool_names = {tool["tool_name"] for tool in manager.kwargs["tools"]}
+    assert tool_names == {
+        "AnalogSelectionAgent",
+        "FollowOnTrialAdjudicatorAgent",
+        "QualitativeProtocolSynthesisAgent",
+        "ProtocolCriticAgent",
+    }
+    assert {agent.kwargs["name"] for agent in created} >= tool_names | {"ProtocolDesignManagerAgent"}
 
 
 def test_protocol_section_assembly_uses_stable_ids_when_live_titles_change() -> None:
@@ -695,6 +1098,7 @@ def test_protocol_design_workflow_dedupes_unhashable_missing_flags(monkeypatch) 
             client=FakeClient(),
         ),
     )
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=None),))
 
     output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=MemoryStore(":memory:"))
 
@@ -720,6 +1124,7 @@ def test_protocol_design_validator_blocks_over_final_language(monkeypatch) -> No
             )
 
     monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=180),))
     output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=MemoryStore(":memory:"))
     bad_study_design = output.protocol_design_brief.study_design.model_copy(
         update={"body": "This is the final design and the protocol approved path."}
@@ -752,6 +1157,7 @@ def test_protocol_design_reuses_agent3_and_agent4_handoffs(monkeypatch) -> None:
             )
 
     monkeypatch.setattr(protocol_design, "execute_ctgov_search_plan", lambda search_plan, target_nct_id: execute_ctgov_search_plan(search_plan=search_plan, target_nct_id=target_nct_id, client=FakeClient()))
+    _patch_follow_on_flow(monkeypatch, (_follow_on("NCT10000001", enrollment=180),))
 
     output = run_protocol_design_workflow(ProtocolDesignInput(nct_id="NCT12345678"), memory=store)
 

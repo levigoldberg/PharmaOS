@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from pharma_os.review_flags import top_review_flags_from_payload
+
 
 NOT_AVAILABLE = "Not available"
 
@@ -73,7 +75,6 @@ def _pricing_source_logic(pricing: dict[str, Any], commercial: dict[str, Any]) -
         "annualization_formula": _available(details.get("formula")),
         "gross_to_net": _available(commercial.get("gross_to_net")),
         "annual_net_price": _available(commercial.get("net_price")),
-        "human_review_required": True,
     }
 
 
@@ -93,7 +94,6 @@ def _market_conversion_assumptions(commercial: dict[str, Any]) -> list[dict[str,
             "base_fraction": _available(_round(fraction)),
             "resulting_patients": _available(_round(patients)),
             "source": "commercial_model.patient_funnel",
-            "human_review_required": True,
         }
         for label, step, fraction, patients in rows
         if fraction not in (None, NOT_AVAILABLE) or patients not in (None, NOT_AVAILABLE)
@@ -303,23 +303,15 @@ def _calculate_rnpv(forecast_rows: list[Any], rnpv: dict[str, Any]) -> float | N
 
 
 def _top_confidence_flags(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    flags = []
-    for flag in _list(raw.get("red_flags")):
-        if isinstance(flag, dict):
-            flags.append({"module": flag.get("category"), "severity": flag.get("severity"), "message": flag.get("reason"), "requires_human_review": True})
-    for flag in _list(raw.get("missing_data_flags")):
-        if isinstance(flag, dict):
-            flags.append({"module": flag.get("section"), "severity": flag.get("severity"), "message": flag.get("reason"), "requires_human_review": True})
-    rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-    deduped = []
-    seen = set()
-    for flag in sorted(flags, key=lambda item: (rank.get(str(item.get("severity")), 5), str(item.get("message")))):
-        key = str(flag.get("message"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(flag)
-    return deduped[:5]
+    return [
+        {
+            "module": flag.get("category") or flag.get("target_id"),
+            "rating": flag.get("severity"),
+            "reason": flag.get("reason"),
+            "source_ids": flag.get("source_ids") or (),
+        }
+        for flag in top_review_flags_from_payload(raw)
+    ]
 
 
 def _rnpv_interpretation(rnpv: dict[str, Any]) -> str | None:

@@ -79,6 +79,11 @@ Required for live agent runs:
 
 Optional for due diligence:
 
+- `NCBI_API_KEY` and `NCBI_EMAIL` for more reliable PubMed market-evidence retrieval
+- `CENSUS_API_KEY` for live US Census ACS population denominators used in prevalence-to-patient conversion; without it, Agent 4 uses the reviewed 2024 ACS config fallback and flags human review
+- `PHARMA_OS_CENSUS_YEAR` to pin the Census ACS year instead of auto-discovery
+- `PHARMA_OS_PUBMED_MAX_RETRIES`, `PHARMA_OS_PUBMED_RETRY_INITIAL_DELAY_SECONDS`, and `PHARMA_OS_PUBMED_RETRY_MAX_DELAY_SECONDS` for PubMed transient retry behavior
+- `PHARMA_OS_MARKET_MAX_QUERIES` and `PHARMA_OS_MARKET_PUBMED_RESULTS_PER_QUERY` to tune Agent 4 market-evidence breadth
 - `LENS_API_TOKEN` for Lens patent retrieval
 - `PHARMA_OS_POS_WORKBOOK_PATH`, defaults to `data/Source_Based_PoS_Workbook.xlsx`
 - `PHARMA_OS_WAC_DATA_PATH`, defaults to `data/california_wac_data.xlsx`

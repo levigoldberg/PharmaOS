@@ -20,6 +20,7 @@ from pharma_os.agent_runtime import (
     runtime_config_for_route,
 )
 from pharma_os.schemas import (
+    AnalogDerivedDesignDecision,
     AnalogCandidateRecord,
     AnalogBenchmarkBundle,
     AnalogSearchPlanOutput,
@@ -31,17 +32,31 @@ from pharma_os.schemas import (
     ClinicalTrialRecord,
     DueDiligenceOutput,
     ExcludedAnalogTrial,
+    FollowOnCandidateRecord,
+    FollowOnTrialAdjudicationOutput,
     MissingDataFlag,
     NextStudyIntent,
     ProtocolDesignBrief,
     ProtocolDesignManagerPlan,
+    QualitativeProtocolSynthesis,
     ProtocolReviewerCritique,
     ProtocolSectionAgentOutput,
     ProtocolSectionDraft,
     SelectedAnalogTrial,
 )
 from pharma_os.tools._due_diligence_common import norm
-from pharma_os.tools.protocol_design import build_benchmark_summary, build_protocol_design_brief
+from pharma_os.tools.protocol_design import (
+    adjudicate_follow_on_trials_deterministically,
+    annotate_analog_similarity_features,
+    build_analog_derived_design_decisions,
+    build_benchmark_summary,
+    build_protocol_design_brief,
+    build_qualitative_protocol_synthesis,
+    calculate_follow_on_benchmark,
+    fetch_selected_follow_on_trials,
+    hydrate_selected_analog_candidates,
+    retrieve_follow_on_candidates,
+)
 
 
 _DIRECT_LLM_AGENT_NAMES = frozenset(
@@ -93,8 +108,15 @@ class ProtocolDesignManagerResult:
     analog_sources: tuple[object, ...]
     retrieval_flags: tuple[MissingDataFlag, ...]
     selection: AnalogTrialSelectionOutput
+    analog_follow_on_candidates: tuple[FollowOnCandidateRecord, ...]
+    follow_on_adjudication: FollowOnTrialAdjudicationOutput
+    follow_on_trials: tuple[ClinicalTrialRecord, ...]
+    direct_analog_benchmark_bundle: AnalogBenchmarkBundle
+    follow_on_benchmark_bundle: AnalogBenchmarkBundle
     benchmark_bundle: AnalogBenchmarkBundle
     benchmark_interpretation: BenchmarkInterpretation
+    qualitative_synthesis: QualitativeProtocolSynthesis
+    design_decisions: tuple[AnalogDerivedDesignDecision, ...]
     section_outputs: tuple[ProtocolSectionAgentOutput, ...]
     reviewer_critique: ProtocolReviewerCritique
     protocol_design_brief: ProtocolDesignBrief
@@ -150,52 +172,30 @@ def run_protocol_design_manager_agent(
     traces.append(manager_plan.trace)
     payloads.append(manager_plan.output)
 
-    next_study_intent = _run_typed_agent(
-        agent_name="DevelopmentStrategyAgent",
-        instructions=_development_strategy_instructions(),
-        output_type=NextStudyIntent,
-        run_id=run_id,
-        input_summary=f"Define logical next study intent for {target_trial.nct_id}.",
-        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids),
-        fallback_output=build_next_study_intent(
-            run_id=run_id,
-            target_trial=target_trial,
-            agent3_output=agent3_output,
-            agent4_output=agent4_output,
-            source_ids=source_ids,
-            missing_data_flags=missing_data_flags,
-        ),
-        source_ids=source_ids,
-        confidence=0.7,
-        config=runtime_config,
-        rationale_summary="Determine the logical next clinical study before analog search or protocol drafting.",
-    )
-    traces.append(next_study_intent.trace)
-    payloads.append(next_study_intent.output)
-
     search_plan = _run_typed_agent(
         agent_name="AnalogSearchPlannerAgent",
         instructions=_search_planner_instructions(),
         output_type=AnalogSearchPlanOutput,
         run_id=run_id,
-        input_summary=f"Plan CT.gov analog searches for {target_trial.nct_id}.",
-        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
+        input_summary=f"Plan current-trial CT.gov analog searches for {target_trial.nct_id}.",
+        payload=_base_payload(target_trial, agent3_output, agent4_output, source_ids),
         fallback_output=build_search_strategy(
             run_id=run_id,
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
-            next_study_intent=next_study_intent.output,
+            next_study_intent=None,
         ),
         source_ids=source_ids,
         confidence=0.7,
         config=runtime_config,
-        rationale_summary="Plan bounded CT.gov searches only; deterministic code executes them.",
+        rationale_summary="Plan bounded CT.gov analog searches from the current trial only; deterministic code executes them.",
     )
     traces.append(search_plan.trace)
     payloads.append(search_plan.output)
 
     analog_candidates, analog_sources, retrieval_flags = execute_search_plan(search_plan.output, target_trial.nct_id)
+    analog_candidates = annotate_analog_similarity_features(target_trial=target_trial, candidates=analog_candidates)
     selection = _run_typed_agent(
         agent_name="AnalogSelectionAgent",
         instructions=_analog_selection_instructions(),
@@ -203,7 +203,7 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Select relevant analogs for {target_trial.nct_id} from {len(analog_candidates)} candidates.",
         payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
             "search_plan": search_plan.output.model_dump(mode="json"),
             "analog_candidates": [_compact_analog_candidate(candidate) for candidate in analog_candidates],
             "top_k": top_k,
@@ -214,7 +214,7 @@ def run_protocol_design_manager_agent(
             candidates=analog_candidates,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
-            next_study_intent=next_study_intent.output,
+            next_study_intent=None,
             search_plan=search_plan.output,
             top_k=top_k,
         ),
@@ -226,26 +226,154 @@ def run_protocol_design_manager_agent(
     traces.append(selection.trace)
     payloads.append(selection.output)
 
-    benchmark_bundle = calculate_benchmark(target_trial, analog_candidates, selection.output, search_plan.output)
+    analog_candidates, hydrated_sources, hydration_flags = hydrate_selected_analog_candidates(
+        target_trial=target_trial,
+        selection=selection.output,
+        candidates=analog_candidates,
+    )
+    if hydrated_sources or hydration_flags:
+        analog_candidates = annotate_analog_similarity_features(target_trial=target_trial, candidates=analog_candidates)
+        analog_sources = tuple((*analog_sources, *hydrated_sources))
+        retrieval_flags = tuple((*retrieval_flags, *hydration_flags))
+
+    direct_analog_benchmark_bundle = calculate_benchmark(target_trial, analog_candidates, selection.output, search_plan.output)
+    selected_candidate_by_nct = {candidate.trial.nct_id: candidate for candidate in analog_candidates}
+    selected_analog_candidates = tuple(
+        selected_candidate_by_nct[item.nct_id]
+        for item in selection.output.selected_analogs
+        if item.nct_id in selected_candidate_by_nct
+    )
+    follow_on_candidates, follow_on_sources, follow_on_flags = retrieve_follow_on_candidates(selected_analogs=selected_analog_candidates)
+    retrieval_flags = tuple((*retrieval_flags, *follow_on_flags))
+    analog_sources = tuple((*analog_sources, *follow_on_sources))
+    follow_on_fallback = adjudicate_follow_on_trials_deterministically(
+        run_id=run_id,
+        target_trial=target_trial,
+        selected_analogs=selected_analog_candidates,
+        follow_on_candidates=follow_on_candidates,
+    )
+    follow_on_adjudication_config = (
+        runtime_config
+        if follow_on_candidates
+        else (runtime_config or AgentRuntimeConfig()).model_copy(update={"disabled": True})
+    )
+    follow_on_adjudication = _run_typed_agent(
+        agent_name="FollowOnTrialAdjudicatorAgent",
+        instructions=_follow_on_adjudicator_instructions(),
+        output_type=FollowOnTrialAdjudicationOutput,
+        run_id=run_id,
+        input_summary=f"Adjudicate follow-on lineages for {len(selected_analog_candidates)} selected analogs.",
+        payload={
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+            "selected_analogs": [_compact_analog_candidate(candidate) for candidate in selected_analog_candidates],
+            "follow_on_candidates": [_compact_follow_on_candidate(candidate) for candidate in follow_on_candidates],
+        },
+        fallback_output=follow_on_fallback,
+        source_ids=tuple(dict.fromkeys(source_id for candidate in follow_on_candidates for source_id in candidate.source_ids)),
+        confidence=0.65 if follow_on_candidates else 0.25,
+        config=follow_on_adjudication_config,
+        rationale_summary=(
+            "Adjudicate same-program follow-on candidates without forcing a successor."
+            if follow_on_candidates
+            else "No follow-on candidates were retrieved; deterministic no-follow-on adjudication was used."
+        ),
+    )
+    traces.append(follow_on_adjudication.trace)
+    payloads.append(follow_on_adjudication.output)
+
+    follow_on_trials, full_follow_on_sources, full_follow_on_flags = fetch_selected_follow_on_trials(
+        adjudication=follow_on_adjudication.output,
+        follow_on_candidates=follow_on_candidates,
+    )
+    retrieval_flags = tuple((*retrieval_flags, *full_follow_on_flags))
+    analog_sources = tuple((*analog_sources, *full_follow_on_sources))
+
+    follow_on_benchmark_bundle = calculate_follow_on_benchmark(
+        run_id=run_id,
+        target_trial=target_trial,
+        search_plan=search_plan.output,
+        follow_on_trials=follow_on_trials,
+        adjudication=follow_on_adjudication.output,
+    )
+    if not follow_on_trials and direct_analog_benchmark_bundle.selected_analog_ids:
+        benchmark_bundle = direct_analog_benchmark_bundle.model_copy(
+            update={
+                "limitations": tuple(
+                    dict.fromkeys(
+                        (
+                            "No lineage-confirmed follow-on trials were found; direct selected analog benchmark is shown as weaker evidence.",
+                            *direct_analog_benchmark_bundle.limitations,
+                        )
+                    )
+                )
+            }
+        )
+    else:
+        benchmark_bundle = follow_on_benchmark_bundle
     source_ids = tuple(dict.fromkeys((*source_ids, *benchmark_bundle.source_ids)))
     benchmark_interpretation = _run_typed_agent(
         agent_name="AnalogBenchmarkInterpreterAgent",
         instructions=_benchmark_interpreter_instructions(),
         output_type=BenchmarkInterpretation,
         run_id=run_id,
-        input_summary=f"Interpret deterministic benchmark bundle {benchmark_bundle.bundle_id}.",
+        input_summary=f"Interpret follow-on benchmark bundle {benchmark_bundle.bundle_id}.",
         payload={
-            **_base_payload(target_trial, agent3_output, agent4_output, source_ids, next_study_intent.output),
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
             "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
+            "follow_on_adjudication": follow_on_adjudication.output.model_dump(mode="json"),
         },
-        fallback_output=_fallback_benchmark_interpretation(run_id, target_trial, next_study_intent.output, benchmark_bundle),
+        fallback_output=_fallback_benchmark_interpretation(run_id, target_trial, None, benchmark_bundle),
         source_ids=benchmark_bundle.source_ids,
         confidence=benchmark_bundle.confidence,
         config=runtime_config,
-        rationale_summary="Interpret benchmark patterns without inventing new numbers.",
+        rationale_summary="Interpret follow-on benchmark patterns without inventing new numbers.",
     )
     traces.append(benchmark_interpretation.trace)
     payloads.append(benchmark_interpretation.output)
+
+    qualitative_synthesis = _run_typed_agent(
+        agent_name="QualitativeProtocolSynthesisAgent",
+        instructions=_qualitative_synthesis_instructions(),
+        output_type=QualitativeProtocolSynthesis,
+        run_id=run_id,
+        input_summary=f"Synthesize recurring protocol patterns from {len(follow_on_trials)} selected follow-on trials.",
+        payload={
+            **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
+            "follow_on_trials": [_compact_trial_record(trial, eligibility_chars=1200, endpoint_chars=500) for trial in follow_on_trials],
+            "benchmark_bundle": _compact_benchmark_bundle(benchmark_bundle),
+        },
+        fallback_output=build_qualitative_protocol_synthesis(
+            run_id=run_id,
+            target_trial=target_trial,
+            follow_on_trials=follow_on_trials,
+            benchmark_bundle=benchmark_bundle,
+        ),
+        source_ids=benchmark_bundle.source_ids,
+        confidence=benchmark_bundle.confidence,
+        config=runtime_config,
+        rationale_summary="Synthesize recurring patterns across actual follow-on trials.",
+    )
+    traces.append(qualitative_synthesis.trace)
+    payloads.append(qualitative_synthesis.output)
+
+    design_decisions = build_analog_derived_design_decisions(
+        run_id=run_id,
+        follow_on_trials=follow_on_trials,
+        benchmark_bundle=benchmark_bundle,
+        qualitative_synthesis=qualitative_synthesis.output,
+    )
+    payloads.extend(design_decisions)
+    next_study_intent = build_next_study_intent_from_follow_on_precedent(
+        run_id=run_id,
+        target_trial=target_trial,
+        agent3_output=agent3_output,
+        agent4_output=agent4_output,
+        source_ids=source_ids,
+        missing_data_flags=missing_data_flags,
+        benchmark_bundle=benchmark_bundle,
+        qualitative_synthesis=qualitative_synthesis.output,
+    )
+    payloads.append(next_study_intent)
 
     section_outputs = tuple(
         _run_section_agent(
@@ -256,7 +384,7 @@ def run_protocol_design_manager_agent(
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
-            next_study_intent=next_study_intent.output,
+            next_study_intent=next_study_intent,
             benchmark_bundle=benchmark_bundle,
             benchmark_interpretation=benchmark_interpretation.output,
             source_ids=source_ids,
@@ -267,7 +395,7 @@ def run_protocol_design_manager_agent(
             target_trial=target_trial,
             agent3_output=agent3_output,
             agent4_output=agent4_output,
-            next_study_intent=next_study_intent.output,
+            next_study_intent=next_study_intent,
             benchmark_bundle=benchmark_bundle,
             benchmark_interpretation=benchmark_interpretation.output,
             source_ids=source_ids,
@@ -279,48 +407,68 @@ def run_protocol_design_manager_agent(
     section_payloads = tuple(result.output for result in section_outputs)
 
     draft_sections = _sections_by_brief_field(section_payloads)
-    reviewer_critique = _run_typed_agent(
-        agent_name="RegulatoryCriticAgent",
-        instructions=_regulatory_critic_instructions(),
-        output_type=ProtocolReviewerCritique,
+    reviewer_critique_output = review_protocol_design(
         run_id=run_id,
-        input_summary=f"Red-team Agent 5 draft sections for {target_trial.nct_id}.",
-        payload={
-            "next_study_intent": next_study_intent.output.model_dump(mode="json"),
-            "sections": [section.model_dump(mode="json") for output in section_payloads for section in output.sections],
-            "benchmark_interpretation": benchmark_interpretation.output.model_dump(mode="json"),
-            "agent3_risks": agent3_output.failure_mode_classification.model_dump(mode="json"),
-            "agent4_red_flags": [flag.model_dump(mode="json") for flag in agent4_output.red_flags],
-            "missing_data_flags": [flag.model_dump(mode="json") for flag in missing_data_flags],
-        },
-        fallback_output=review_protocol_design(
-            run_id=run_id,
-            source_ids=source_ids,
-            analog_limitations=benchmark_bundle.limitations,
-            agent3_output=agent3_output,
-            agent4_output=agent4_output,
-            next_study_intent=next_study_intent.output,
-        ),
         source_ids=source_ids,
-        confidence=0.6,
-        config=runtime_config,
-        rationale_summary="Critique only; do not approve or invent facts.",
+        analog_limitations=benchmark_bundle.limitations,
+        agent3_output=agent3_output,
+        agent4_output=agent4_output,
+        next_study_intent=next_study_intent,
     )
-    traces.append(reviewer_critique.trace)
-    payloads.append(reviewer_critique.output)
+    if _should_run_protocol_critic(
+        follow_on_trials=follow_on_trials,
+        follow_on_adjudication=follow_on_adjudication.output,
+        qualitative_synthesis=qualitative_synthesis.output,
+        design_decisions=design_decisions,
+        benchmark_bundle=benchmark_bundle,
+    ):
+        reviewer_critique = _run_typed_agent(
+            agent_name="ProtocolCriticAgent",
+            instructions=_regulatory_critic_instructions(),
+            output_type=ProtocolReviewerCritique,
+            run_id=run_id,
+            input_summary=f"Red-team Agent 5 draft sections for {target_trial.nct_id}.",
+            payload={
+                "next_study_intent": next_study_intent.model_dump(mode="json"),
+                "sections": [section.model_dump(mode="json") for output in section_payloads for section in output.sections],
+                "benchmark_interpretation": benchmark_interpretation.output.model_dump(mode="json"),
+                "follow_on_adjudication": follow_on_adjudication.output.model_dump(mode="json"),
+                "qualitative_synthesis": qualitative_synthesis.output.model_dump(mode="json"),
+                "design_decisions": [decision.model_dump(mode="json") for decision in design_decisions],
+                "agent3_risks": agent3_output.failure_mode_classification.model_dump(mode="json"),
+                "agent4_red_flags": [flag.model_dump(mode="json") for flag in agent4_output.red_flags],
+                "missing_data_flags": [flag.model_dump(mode="json") for flag in missing_data_flags],
+            },
+            fallback_output=reviewer_critique_output,
+            source_ids=source_ids,
+            confidence=0.6,
+            config=runtime_config,
+            rationale_summary="Critique only; do not approve or invent facts.",
+        )
+        traces.append(reviewer_critique.trace)
+        reviewer_critique_output = reviewer_critique.output
+    payloads.append(reviewer_critique_output)
 
     fallback_brief = build_protocol_design_brief(
         run_id=run_id,
         target_trial=target_trial,
-        next_study_intent=next_study_intent.output,
+        next_study_intent=next_study_intent,
         strategy_sections=draft_sections["strategy_sections"],
         eligibility_sections=draft_sections["eligibility_sections"],
-        reviewer_critique=reviewer_critique.output,
+        reviewer_critique=reviewer_critique_output,
         benchmark_bundle=benchmark_bundle,
         claims=claims,  # type: ignore[arg-type]
         assumptions=assumptions,  # type: ignore[arg-type]
         missing_data_flags=missing_data_flags,
         source_ids=source_ids,
+    )
+    fallback_brief = fallback_brief.model_copy(
+        update={
+            "follow_on_trial_ids": tuple(trial.nct_id for trial in follow_on_trials),
+            "analog_lineage_mappings": follow_on_adjudication.output.adjudications,
+            "qualitative_synthesis": qualitative_synthesis.output,
+            "design_decisions": design_decisions,
+        }
     )
     brief = _run_typed_agent(
         agent_name="ProtocolBriefWriterAgent",
@@ -329,10 +477,13 @@ def run_protocol_design_manager_agent(
         run_id=run_id,
         input_summary=f"Assemble draft ProtocolDesignBrief for {target_trial.nct_id}.",
         payload={
-            "next_study_intent": next_study_intent.output.model_dump(mode="json"),
+            "next_study_intent": next_study_intent.model_dump(mode="json"),
             "sections": [section.model_dump(mode="json") for output in section_payloads for section in output.sections],
-            "reviewer_critique": reviewer_critique.output.model_dump(mode="json"),
+            "reviewer_critique": reviewer_critique_output.model_dump(mode="json"),
             "benchmark_interpretation": benchmark_interpretation.output.model_dump(mode="json"),
+            "follow_on_adjudication": follow_on_adjudication.output.model_dump(mode="json"),
+            "qualitative_synthesis": qualitative_synthesis.output.model_dump(mode="json"),
+            "design_decisions": [decision.model_dump(mode="json") for decision in design_decisions],
             "claims": [getattr(claim, "model_dump", lambda **_: claim)(mode="json") if hasattr(claim, "model_dump") else str(claim) for claim in claims],
             "missing_data_flags": [flag.model_dump(mode="json") for flag in missing_data_flags],
         },
@@ -343,21 +494,36 @@ def run_protocol_design_manager_agent(
         rationale_summary="Assemble the draft strategy brief with human-review framing.",
     )
     traces.append(brief.trace)
-    payloads.append(brief.output)
+    brief_output = brief.output.model_copy(
+        update={
+            "follow_on_trial_ids": tuple(trial.nct_id for trial in follow_on_trials),
+            "analog_lineage_mappings": follow_on_adjudication.output.adjudications,
+            "qualitative_synthesis": qualitative_synthesis.output,
+            "design_decisions": design_decisions,
+        }
+    )
+    payloads.append(brief_output)
 
     return ProtocolDesignManagerResult(
         manager_plan=manager_plan.output,
-        next_study_intent=next_study_intent.output,
+        next_study_intent=next_study_intent,
         search_plan=search_plan.output,
         analog_candidates=analog_candidates,
         analog_sources=analog_sources,
         retrieval_flags=retrieval_flags,
         selection=selection.output,
+        analog_follow_on_candidates=follow_on_candidates,
+        follow_on_adjudication=follow_on_adjudication.output,
+        follow_on_trials=follow_on_trials,
+        direct_analog_benchmark_bundle=direct_analog_benchmark_bundle,
+        follow_on_benchmark_bundle=follow_on_benchmark_bundle,
         benchmark_bundle=benchmark_bundle,
         benchmark_interpretation=benchmark_interpretation.output,
+        qualitative_synthesis=qualitative_synthesis.output,
+        design_decisions=design_decisions,
         section_outputs=section_payloads,
-        reviewer_critique=reviewer_critique.output,
-        protocol_design_brief=brief.output,
+        reviewer_critique=reviewer_critique_output,
+        protocol_design_brief=brief_output,
         traces=tuple(traces),
         subagent_payloads=tuple(payloads),
     )
@@ -409,13 +575,20 @@ def _run_typed_agent(
 
     agent = object()
     if not call_config.disabled:
-        Agent, _, _, _ = load_agents_sdk()
-        agent = Agent(
-            name=agent_name,
-            instructions=instructions,
-            model=call_config.model,
-            output_type=agents_sdk_output_schema(output_type),
-        )
+        if agent_name == "ProtocolDesignManagerAgent":
+            agent = build_protocol_design_manager_agent_with_tools(
+                instructions=instructions,
+                model=call_config.model,
+                output_type=output_type,
+            )
+        else:
+            Agent, _, _, _ = load_agents_sdk()
+            agent = Agent(
+                name=agent_name,
+                instructions=instructions,
+                model=call_config.model,
+                output_type=agents_sdk_output_schema(output_type),
+            )
     return run_structured_agent(
         agent=agent,
         payload=payload,
@@ -431,10 +604,59 @@ def _run_typed_agent(
     )
 
 
+def build_protocol_design_manager_agent_with_tools(*, instructions: str, model: str, output_type: type[Any]) -> Any:
+    """Construct the live manager with bounded specialist agents exposed as tools."""
+
+    Agent, _, _, _ = load_agents_sdk()
+    tool_specs = (
+        ("AnalogSelectionAgent", _analog_selection_instructions(), AnalogTrialSelectionOutput, "Select clinically meaningful analog trials and exclude weak candidates."),
+        ("FollowOnTrialAdjudicatorAgent", _follow_on_adjudicator_instructions(), FollowOnTrialAdjudicationOutput, "Adjudicate same-program follow-on candidates without forcing a successor."),
+        ("QualitativeProtocolSynthesisAgent", _qualitative_synthesis_instructions(), QualitativeProtocolSynthesis, "Synthesize recurring protocol patterns across selected follow-on trials."),
+        ("ProtocolCriticAgent", _regulatory_critic_instructions(), ProtocolReviewerCritique, "Critique sparse, ambiguous, conflicting, or weakly sourced protocol precedent."),
+    )
+    tools = []
+    for name, tool_instructions, schema, description in tool_specs:
+        specialist = Agent(
+            name=name,
+            instructions=tool_instructions,
+            model=model,
+            output_type=agents_sdk_output_schema(schema),
+        )
+        tools.append(specialist.as_tool(tool_name=name, tool_description=description))
+    return Agent(
+        name="ProtocolDesignManagerAgent",
+        instructions=instructions,
+        model=model,
+        tools=tools,
+        output_type=agents_sdk_output_schema(output_type),
+    )
+
+
 def _agent5_route(agent_name: str) -> str:
     if agent_name in {"ProtocolDesignManagerAgent", "DevelopmentStrategyAgent", "ProtocolBriefWriterAgent"}:
         return "agent5_manager"
     return "agent5_subagent"
+
+
+def _should_run_protocol_critic(
+    *,
+    follow_on_trials: tuple[ClinicalTrialRecord, ...],
+    follow_on_adjudication: FollowOnTrialAdjudicationOutput,
+    qualitative_synthesis: QualitativeProtocolSynthesis,
+    design_decisions: tuple[AnalogDerivedDesignDecision, ...],
+    benchmark_bundle: AnalogBenchmarkBundle,
+) -> bool:
+    if len(follow_on_trials) < 3:
+        return True
+    if any(item.status != "clear_follow_on" for item in follow_on_adjudication.adjudications):
+        return True
+    if qualitative_synthesis.conflicting_precedent or qualitative_synthesis.insufficient_evidence:
+        return True
+    if benchmark_bundle.confidence < 0.55:
+        return True
+    if len(design_decisions) < 4:
+        return True
+    return False
 
 
 def _run_section_agent(
@@ -594,19 +816,23 @@ def _fallback_manager_plan(
         output_id=f"protocol-design-manager-plan-{run_id}",
         target_nct_id=target_trial.nct_id,
         ordered_steps=(
-            "plan_ctgov_analog_search",
+            "plan_current_trial_ctgov_analog_search",
             "execute_ctgov_search_deterministically",
             "select_analogs",
-            "calculate_benchmark_deterministically",
-            "interpret_benchmark",
+            "retrieve_same_program_follow_on_candidates",
+            "adjudicate_follow_on_lineages",
+            "fetch_full_follow_on_records",
+            "calculate_follow_on_benchmark_deterministically",
+            "synthesize_follow_on_protocol_patterns",
+            "derive_protocol_design_decisions",
             "draft_strategy_sections",
-            "red_team_sections",
+            "critique_when_useful",
             "assemble_draft_brief",
         ),
         source_ids=source_ids,
         missing_data_flags=missing_data_flags,
         guardrail_summary="Agent 5 produces a draft strategy brief only and escalates missing or ambiguous evidence to flags and human-review questions.",
-        rationale_summary="Coordinate ambiguous protocol reasoning through scoped subagents while preserving deterministic retrieval, math, validation, persistence, and gates.",
+        rationale_summary="Coordinate current-trial analog selection and observed follow-on lineage synthesis while preserving deterministic retrieval, math, validation, persistence, and gates.",
         confidence=0.7 if not missing_data_flags else 0.55,
     )
 
@@ -660,6 +886,19 @@ def _compact_analog_candidate(candidate: AnalogCandidateRecord) -> dict[str, Any
         "candidate_id": candidate.candidate_id,
         "trial": _compact_trial_record(candidate.trial, eligibility_chars=900, endpoint_chars=350),
         "query_ids": candidate.query_ids,
+        "similarity_features": candidate.similarity_features,
+        "source_ids": candidate.source_ids,
+        "provenance": candidate.provenance,
+    }
+
+
+def _compact_follow_on_candidate(candidate: FollowOnCandidateRecord) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "anchor_analog_nct_id": candidate.anchor_analog_nct_id,
+        "trial": _compact_trial_record(candidate.trial, eligibility_chars=900, endpoint_chars=350),
+        "lineage_features": candidate.lineage_features,
+        "exclusion_reason": candidate.exclusion_reason,
         "source_ids": candidate.source_ids,
         "provenance": candidate.provenance,
     }
@@ -716,7 +955,7 @@ def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
 def _fallback_benchmark_interpretation(
     run_id: str,
     target_trial: ClinicalTrialRecord,
-    next_study_intent: NextStudyIntent,
+    next_study_intent: NextStudyIntent | None,
     benchmark_bundle: AnalogBenchmarkBundle,
 ) -> BenchmarkInterpretation:
     common_patterns = []
@@ -731,12 +970,20 @@ def _fallback_benchmark_interpretation(
         output_id=f"benchmark-interpretation-{run_id}",
         target_nct_id=target_trial.nct_id,
         common_design_patterns=tuple(common_patterns) or ("No dominant analog design pattern was confidently identified.",),
-        target_alignment=(f"Analog alignment should be reviewed against the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}, not only the anchor trial phase.",),
+        target_alignment=(
+            f"Analog alignment should be reviewed against the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}, not only the anchor trial phase."
+            if next_study_intent
+            else "Follow-on benchmark alignment is derived from observed successor trials, not a preselected future-study hypothesis.",
+        ),
         target_misalignment=("No source-backed next-study misalignment should be treated as final without human review.",),
-        strategy_implications=(f"Use benchmark patterns as review inputs for the proposed next study objective: {next_study_intent.development_objective}.",),
+        strategy_implications=(
+            f"Use benchmark patterns as review inputs for the proposed next study objective: {next_study_intent.development_objective}."
+            if next_study_intent
+            else "Use follow-on benchmark patterns as review inputs for analog-derived protocol choices.",
+        ),
         weak_or_incomplete_findings=weak,
         human_review_questions=(
-            f"Do selected analogs fit the proposed next study role: {next_study_intent.study_role}?",
+            f"Do selected analogs fit the proposed next study role: {next_study_intent.study_role}?" if next_study_intent else "Do selected follow-on trials provide enough precedent for protocol drafting?",
             "Which benchmark patterns are strong enough to influence protocol strategy?",
             "Which analog limitations should reduce confidence in protocol design choices?",
         ),
@@ -909,7 +1156,9 @@ def _shared_guardrails() -> str:
 def _manager_instructions() -> str:
     return _shared_guardrails() + (
         " Coordinate the Agent 5 workflow after Agent 3 and Agent 4 handoffs. "
-        "List ordered steps, guardrails, missing context, and a short rationale for the typed subagent sequence."
+        "Use current-trial analog retrieval, analog selection, same-program follow-on lineage adjudication, follow-on benchmark synthesis, "
+        "qualitative protocol synthesis, optional critique, and final analog-derived draft assembly. "
+        "Do not infer a future phase before observed follow-on precedent is available."
     )
 
 
@@ -926,8 +1175,8 @@ def _development_strategy_instructions() -> str:
 def _search_planner_instructions() -> str:
     return _shared_guardrails() + (
         " Create bounded ClinicalTrials.gov analog search queries only. Do not execute searches or select analogs. "
-        "Use NextStudyIntent as the primary design target. Cover proposed stage, study role, indication, population, regimen, "
-        "modality or target/MOA when known, endpoint family, comparator/control, biomarker-defined population, and line/prior-treatment setting when detectable. "
+        "Use the current trial as the search anchor, not a hypothesized future study. Prioritize same indication and same or comparable current phase. "
+        "Expose current-trial population, regimen, modality or target/MOA when known, endpoint family, comparator/control, biomarker-defined population, and line/prior-treatment setting when detectable. "
         "If a dimension is unknown, expose it as unknown rather than guessing."
     )
 
@@ -940,10 +1189,27 @@ def _analog_selection_instructions() -> str:
     )
 
 
+def _follow_on_adjudicator_instructions() -> str:
+    return _shared_guardrails() + (
+        " For each selected analog, adjudicate deterministic same-asset, same-indication, same-sponsor follow-on candidates. "
+        "Reason over chronology, phase progression, study role, population continuity, line of therapy, regimen and dose continuity, endpoint continuity, comparator changes, "
+        "and whether candidates represent expansion, optimization, pivotal progression, confirmatory development, label expansion, or parallel branches. "
+        "Return clear_follow_on, multiple_plausible_branches, or no_plausible_follow_on. Do not force a selection."
+    )
+
+
 def _benchmark_interpreter_instructions() -> str:
     return _shared_guardrails() + (
-        " Interpret deterministic benchmark metrics. Do not invent new benchmark numbers. Explain common design patterns, "
+        " Interpret deterministic benchmark metrics from selected follow-on trials. Do not invent new benchmark numbers. Explain common design patterns, "
         "target alignment/misalignment, findings that matter for strategy, weak/incomplete findings, and human-review questions."
+    )
+
+
+def _qualitative_synthesis_instructions() -> str:
+    return _shared_guardrails() + (
+        " Synthesize recurring protocol patterns across full selected follow-on CT.gov records and deterministic benchmark metrics. "
+        "Identify dominant recurring patterns, minority patterns, conflicting precedent, and insufficient evidence for study role, population, study design, comparator/control, endpoints, "
+        "eligibility, biomarkers, prior treatment, safety monitoring, assessment schedule, treatment duration, and follow-up. Do not invent unsupported protocol details."
     )
 
 
@@ -1094,6 +1360,64 @@ def build_next_study_intent(
     )
 
 
+def build_next_study_intent_from_follow_on_precedent(
+    *,
+    run_id: str,
+    target_trial: ClinicalTrialRecord,
+    agent3_output: ClinicalOutcomePredictionOutput,
+    agent4_output: DueDiligenceOutput,
+    source_ids: tuple[str, ...],
+    missing_data_flags: tuple[MissingDataFlag, ...],
+    benchmark_bundle: AnalogBenchmarkBundle,
+    qualitative_synthesis: QualitativeProtocolSynthesis,
+) -> NextStudyIntent:
+    """Build legacy intent summary after observed follow-on precedent is known."""
+
+    base = build_next_study_intent(
+        run_id=run_id,
+        target_trial=target_trial,
+        agent3_output=agent3_output,
+        agent4_output=agent4_output,
+        source_ids=source_ids,
+        missing_data_flags=missing_data_flags,
+    )
+    phase_pattern = (qualitative_synthesis.study_role_patterns[0] if qualitative_synthesis.study_role_patterns else None)
+    role_pattern = (qualitative_synthesis.dominant_patterns[0] if qualitative_synthesis.dominant_patterns else None)
+    objective = (
+        "derive a human-reviewed future-trial protocol from observed follow-on trials of relevant analog development programs"
+    )
+    if phase_pattern and "No phase" not in phase_pattern:
+        proposed_stage = f"analog-follow-on-derived study ({phase_pattern})"
+    else:
+        proposed_stage = "analog-follow-on-derived future study"
+    study_role = role_pattern or "follow-on precedent-derived study"
+    return base.model_copy(
+        update={
+            "proposed_next_stage": proposed_stage,
+            "study_role": study_role,
+            "development_objective": objective,
+            "key_clinical_question": (
+                "Which protocol elements are supported by observed same-program follow-on precedent, and which require human review because evidence is sparse or conflicting?"
+            ),
+            "rationale": (
+                "This compatibility intent was created after analog selection, same-program follow-on search, follow-on adjudication, and follow-on benchmark synthesis. "
+                "It did not drive analog retrieval or future-stage selection."
+            ),
+            "alternatives_considered": tuple(
+                dict.fromkeys(
+                    (
+                        "use only clear_follow_on lineages when human reviewers reject ambiguous branches",
+                        "block protocol drafting if follow-on evidence is too sparse",
+                        *base.alternatives_considered,
+                    )
+                )
+            ),
+            "source_ids": tuple(dict.fromkeys((*source_ids, *benchmark_bundle.source_ids, *qualitative_synthesis.source_ids))),
+            "confidence": min(base.confidence, qualitative_synthesis.confidence, benchmark_bundle.confidence),
+        }
+    )
+
+
 
 def build_search_strategy(
     *,
@@ -1105,16 +1429,8 @@ def build_search_strategy(
 ) -> AnalogSearchPlanOutput:
     """Build a structured CT.gov search plan without calling the API."""
 
-    if next_study_intent is None:
-        next_study_intent = build_next_study_intent(
-            run_id=run_id,
-            target_trial=target_trial,
-            agent3_output=agent3_output,
-            agent4_output=agent4_output,
-            source_ids=tuple(dict.fromkeys((target_trial.source_id, *agent3_output.trial_identity.source_ids, *agent4_output.asset_identity.source_ids))),
-            missing_data_flags=tuple(agent3_output.missing_data_flags) + tuple(agent4_output.missing_data_flags),
-        )
-    indication = next_study_intent.indication or (
+    del next_study_intent
+    indication = (
         agent4_output.asset_identity.normalized_indication
         or agent3_output.asset_identity.normalized_indication
         or (target_trial.conditions[0] if target_trial.conditions else None)
@@ -1122,14 +1438,13 @@ def build_search_strategy(
     if not indication:
         indication = "unknown condition"
     phase = (
-        _phase_query_from_stage(next_study_intent.proposed_next_stage)
-        or (target_trial.phases[0] if target_trial.phases else agent3_output.historical_pos_estimate.current_phase)
+        target_trial.phases[0] if target_trial.phases else agent3_output.historical_pos_estimate.current_phase
     )
     asset = agent4_output.asset_identity.asset_name or agent3_output.asset_identity.asset_name
     modality = agent4_output.asset_identity.modality or agent3_output.asset_identity.modality
     endpoint_family = _endpoint_family(target_trial)
     comparator = _comparator_hint(target_trial)
-    biomarker_or_line = _biomarker_or_line(target_trial) or _intent_biomarker_or_line(next_study_intent)
+    biomarker_or_line = _biomarker_or_line(target_trial)
     query_limit = _env_int("PHARMA_OS_CTGV_MAX_RESULTS", 25, minimum=1, maximum=100)
 
     queries = [
@@ -1140,10 +1455,10 @@ def build_search_strategy(
             endpoint_family=endpoint_family,
             comparator=comparator,
             biomarker_or_line=biomarker_or_line,
-            term=next_study_intent.study_role,
+            term="current trial analog",
             limit=query_limit,
-            expected_analog_dimension="same indication and proposed next-study stage",
-            rationale="Primary analog search anchored to NextStudyIntent indication, proposed stage, and study role.",
+            expected_analog_dimension="same indication and same or comparable current phase",
+            rationale="Primary analog search anchored to the current trial indication, phase, endpoint family, comparator, and population context.",
         )
     ]
     if modality and modality != "unknown":
@@ -1154,10 +1469,10 @@ def build_search_strategy(
                 phase=phase,
                 target_or_moa=modality,
                 endpoint_family=endpoint_family,
-                term=next_study_intent.development_objective,
+                term="current trial modality analog",
                 limit=query_limit,
-                expected_analog_dimension="same indication, proposed stage, and modality or MOA",
-                rationale="Secondary analog search adds modality/MOA to the NextStudyIntent target.",
+                expected_analog_dimension="same indication, current phase, and modality or MOA",
+                rationale="Secondary analog search adds modality/MOA to the current-trial analog context.",
             )
         )
     if asset:
@@ -1168,7 +1483,7 @@ def build_search_strategy(
                 intervention=asset,
                 phase=phase,
                 endpoint_family=endpoint_family,
-                term=next_study_intent.regimen_context,
+                term="current trial asset analog",
                 limit=query_limit,
                 expected_analog_dimension="same asset or close asset-family context",
                 rationale="Asset-name search captures same-product or regimen-context studies when public registry records exist.",
@@ -1178,15 +1493,14 @@ def build_search_strategy(
         output_id=f"analog-search-plan-{run_id}",
         target_nct_id=target_trial.nct_id,
         queries=tuple(queries),
-        rationale="Search plan is bounded to CT.gov and prioritizes the proposed next study intent rather than the current target trial phase alone.",
+        rationale="Search plan is bounded to CT.gov and is anchored to the current trial; future stage or NextStudyIntent is not used to drive analog retrieval.",
         expected_dimensions=tuple(
             item
             for item in (
                 "indication",
-                "proposed_next_stage",
-                "study_role",
+                "same_or_comparable_current_phase",
                 "population_context",
-                "regimen_context",
+                "current_regimen_context",
                 "modality" if modality else None,
                 "endpoint_family" if endpoint_family else None,
                 "comparator" if comparator else None,
@@ -1201,7 +1515,6 @@ def build_search_strategy(
                     *agent3_output.trial_identity.source_ids,
                     *agent3_output.asset_identity.source_ids,
                     *agent4_output.asset_identity.source_ids,
-                    *next_study_intent.source_ids,
                 )
             )
         ),
@@ -1222,19 +1535,15 @@ def select_analog_trials(
 ) -> AnalogTrialSelectionOutput:
     """Select analogs from normalized candidates without API calls."""
 
-    if next_study_intent is None:
-        next_study_intent = build_next_study_intent(
-            run_id=run_id,
-            target_trial=target_trial,
-            agent3_output=agent3_output,
-            agent4_output=agent4_output,
-            source_ids=search_plan.source_ids,
-            missing_data_flags=tuple(agent3_output.missing_data_flags) + tuple(agent4_output.missing_data_flags),
-        )
-    del agent3_output, agent4_output, search_plan
-    scored = [_score_candidate(target_trial, next_study_intent, candidate) for candidate in candidates if candidate.trial.nct_id != target_trial.nct_id]
+    del agent3_output, agent4_output, search_plan, next_study_intent
+    candidates = annotate_analog_similarity_features(target_trial=target_trial, candidates=candidates)
+    scored = [
+        _score_current_trial_candidate(target_trial, candidate)
+        for candidate in candidates
+        if candidate.trial.nct_id != target_trial.nct_id
+    ]
     scored.sort(key=lambda item: (-item[0].match_score, item[0].nct_id))
-    selected = tuple(item[0] for item in scored[:top_k])
+    selected = tuple(item[0] for item in scored[:top_k] if item[0].match_score >= 0.35)
     selected_ids = {item.nct_id for item in selected}
     excluded = [
         ExcludedAnalogTrial(
@@ -1243,11 +1552,13 @@ def select_analog_trials(
             source_ids=(target_trial.source_id,),
         )
     ]
-    for selection, candidate in scored[top_k:]:
+    for selection, candidate in scored:
+        if selection.nct_id in selected_ids:
+            continue
         excluded.append(
             ExcludedAnalogTrial(
                 nct_id=selection.nct_id,
-                reason="Candidate ranked below selected analog cutoff.",
+                reason="Candidate was weakly matched or ranked below selected analog cutoff.",
                 source_ids=candidate.source_ids,
             )
         )
@@ -1307,7 +1618,7 @@ def build_protocol_strategy_sections(
             title="Strategic Rationale",
             body=(
                 f"Next-study rationale: {next_study_intent.rationale} Agent 3 clinical-risk context, Agent 4 diligence findings, "
-                f"and public analog trial benchmarks inform the draft. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags. "
+                f"and observed follow-on trial benchmarks from selected analog programs inform the draft. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags. "
                 f"Alternatives considered: {'; '.join(next_study_intent.alternatives_considered) or 'none recorded'}."
             ),
             source_ids=source_ids,
@@ -1335,7 +1646,7 @@ def build_protocol_strategy_sections(
             title="Study Design",
             body=(
                 f"Draft design should be benchmarked for the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}. "
-                "Selected analogs should inform randomization, blinding, arm count, duration, and enrollment burden; no final protocol design decision is made by Agent 5."
+                "Selected follow-on trials should inform randomization, blinding, arm count, duration, and enrollment burden; no final protocol design decision is made by Agent 5."
             ),
             source_ids=source_ids,
             confidence=0.6,
@@ -1343,7 +1654,7 @@ def build_protocol_strategy_sections(
         "comparator_and_landscape_rationale": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-comparator-landscape",
             title="Comparator And Landscape Rationale",
-            body="Comparator rationale is based on named comparators and control categories detected in selected CT.gov analog trials plus Agent 4 competitive-landscape context.",
+            body="Comparator rationale is based on named comparators and control categories detected in selected follow-on CT.gov trials plus Agent 4 competitive-landscape context.",
             source_ids=source_ids,
             confidence=0.6,
         ),
@@ -1507,6 +1818,48 @@ def _score_candidate(target: ClinicalTrialRecord, next_study_intent: NextStudyIn
             mismatched_dimensions=tuple(mismatched),
             unknown_dimensions=tuple(unknown),
             reasoning=f"Matched {len(matched)} dimensions; mismatched {len(mismatched)}; unknown {len(unknown)}.",
+            source_ids=candidate.source_ids,
+        ),
+        candidate,
+    )
+
+
+def _score_current_trial_candidate(target: ClinicalTrialRecord, candidate: AnalogCandidateRecord) -> tuple[SelectedAnalogTrial, AnalogCandidateRecord]:
+    trial = candidate.trial
+    features = candidate.similarity_features or {}
+    matched: list[str] = []
+    mismatched: list[str] = []
+    unknown: list[str] = []
+    weights = {
+        "same_indication": 0.3,
+        "same_or_comparable_phase": 0.2,
+        "same_endpoint_family": 0.15,
+        "same_comparator_structure": 0.1,
+        "same_modality": 0.1,
+        "similar_population": 0.075,
+        "similar_biomarker_or_line": 0.05,
+        "target_or_moa_overlap": 0.025,
+    }
+    score = 0.0
+    for key, weight in weights.items():
+        value = features.get(key)
+        if value is True:
+            matched.append(key)
+            score += weight
+        elif value is False:
+            mismatched.append(key)
+        else:
+            unknown.append(key)
+    confidence = "high" if score >= 0.7 else "medium" if score >= 0.45 else "low"
+    return (
+        SelectedAnalogTrial(
+            nct_id=trial.nct_id,
+            match_score=round(score, 3),
+            match_confidence=confidence,
+            matched_dimensions=tuple(matched),
+            mismatched_dimensions=tuple(mismatched),
+            unknown_dimensions=tuple(unknown),
+            reasoning="Selected against current-trial similarity features; no future-study hypothesis was used.",
             source_ids=candidate.source_ids,
         ),
         candidate,

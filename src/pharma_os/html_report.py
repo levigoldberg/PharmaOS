@@ -10,7 +10,8 @@ from typing import Any
 from pydantic import BaseModel
 
 from pharma_os.due_diligence_report import build_due_diligence_report_payload
-from pharma_os.memory import MemoryStore
+from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
+from pharma_os.review_flags import top_review_flags_from_payload
 
 
 def build_run_html(run_id: str, *, memory: MemoryStore | None = None) -> str:
@@ -79,6 +80,789 @@ def write_run_html(run_id: str, output_html: str | Path, *, memory: MemoryStore 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(build_run_html(run_id, memory=memory), encoding="utf-8")
     return output_path
+
+
+def build_nct_report_html(nct_id: str, *, memory: MemoryStore | None = None) -> str:
+    """Build a curated cumulative report for one NCT ID from Scientific Memory."""
+
+    store = memory or MemoryStore()
+    normalized_nct = nct_id.strip().upper()
+    workflow_outputs = _latest_nct_workflow_outputs(normalized_nct, store)
+    identity = _nct_report_identity(workflow_outputs, normalized_nct)
+    title = f"{identity.get('asset_name') or normalized_nct} Development Brief"
+    parts = [
+        "<!doctype html>",
+        "<html><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        f"<title>{escape(title)}</title>",
+        f"<style>{_CSS}{_CUMULATIVE_CSS}</style></head><body>",
+        "<main class='cumulative-report'>",
+        _nct_report_hero(identity, workflow_outputs),
+    ]
+    if not workflow_outputs:
+        parts.append(_section("No Persisted Workflow Outputs", _paragraphs([f"No completed Agent 3, Agent 4, or Agent 5 outputs were found for {normalized_nct}."])))
+        parts.append("</main></body></html>")
+        return "\n".join(parts)
+
+    parts.extend(
+        [
+            _section("Executive Readout", _nct_executive_readout(workflow_outputs)),
+            _section("Decision Metrics", _nct_kpis(workflow_outputs)),
+            _section("Lifecycle Summary", _lifecycle_summary_table(workflow_outputs)),
+        ]
+    )
+    for workflow_name in ("clinical_outcome_prediction", "due_diligence", "protocol_design"):
+        item = workflow_outputs.get(workflow_name)
+        if item is None:
+            continue
+        _, output = item
+        if workflow_name == "clinical_outcome_prediction":
+            parts.append(_cumulative_agent3_section(output))
+        elif workflow_name == "due_diligence":
+            parts.append(_cumulative_agent4_section(output))
+        elif workflow_name == "protocol_design":
+            parts.append(_cumulative_agent5_section(output))
+    parts.append(_section("Source And Confidence Context", _source_confidence_context(workflow_outputs)))
+    parts.append("</main></body></html>")
+    return "\n".join(parts)
+
+
+def write_nct_report(
+    nct_id: str,
+    output_html: str | Path | None = None,
+    *,
+    memory: MemoryStore | None = None,
+) -> Path:
+    """Write the cumulative NCT report and return its path."""
+
+    store = memory or MemoryStore()
+    output_path = Path(output_html) if output_html is not None else _default_nct_report_path(nct_id, store)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(build_nct_report_html(nct_id, memory=store), encoding="utf-8")
+    return output_path
+
+
+def write_nct_report_if_persistent(nct_id: str | None, *, memory: MemoryStore) -> Path | None:
+    """Write the cumulative report for file-backed Scientific Memory stores."""
+
+    if not nct_id or str(getattr(memory, "db_path", "")) == ":memory:":
+        return None
+    return write_nct_report(nct_id, memory=memory)
+
+
+def _latest_nct_workflow_outputs(nct_id: str, store: MemoryStore) -> dict[str, tuple[Any, dict[str, Any]]]:
+    outputs: dict[str, tuple[Any, dict[str, Any]]] = {}
+    for workflow_name in ("clinical_outcome_prediction", "due_diligence", "protocol_design"):
+        latest = store.get_latest_workflow_output(workflow_name=workflow_name, nct_id=nct_id)
+        if latest is None:
+            continue
+        run, payload = latest
+        if isinstance(payload, dict):
+            outputs[workflow_name] = (run, payload)
+    return outputs
+
+
+def _default_nct_report_path(nct_id: str, store: MemoryStore) -> Path:
+    filename = f"{_safe_filename(nct_id.strip().upper())}.html"
+    db_path = getattr(store, "db_path", Path(DEFAULT_DB_PATH))
+    db_path = Path(db_path)
+    if str(db_path) != ":memory:" and db_path.parent.name == ".pharma_os":
+        return db_path.parent.parent / "reports" / filename
+    return Path("reports") / filename
+
+
+def _safe_filename(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+    return safe or "report"
+
+
+def _nct_report_identity(outputs: dict[str, tuple[Any, dict[str, Any]]], nct_id: str) -> dict[str, Any]:
+    identity: dict[str, Any] = {"nct_id": nct_id}
+    for _, output in outputs.values():
+        trial = _dict(output.get("target_trial") or output.get("trial") or output.get("trial_identity"))
+        asset = _dict(output.get("asset_identity"))
+        if trial:
+            identity.setdefault("title", trial.get("brief_title") or trial.get("official_title"))
+            identity.setdefault("status", _pretty_status(trial.get("overall_status")))
+            identity.setdefault("phase", _pretty_phase_list(_list(trial.get("phases"))))
+            identity.setdefault("conditions", ", ".join(_list(trial.get("conditions"))))
+            identity.setdefault("sponsor", trial.get("sponsor") or _nested(trial, "lead_sponsor", "name"))
+            identity.setdefault("enrollment", trial.get("enrollment_count"))
+        if asset:
+            identity.setdefault("asset_name", asset.get("asset_name"))
+            identity.setdefault("indication", asset.get("normalized_indication"))
+            identity.setdefault("modality", asset.get("modality"))
+            identity.setdefault("sponsor", asset.get("sponsor"))
+    identity.setdefault("indication", identity.get("conditions"))
+    return identity
+
+
+def _nct_report_hero(identity: dict[str, Any], outputs: dict[str, tuple[Any, dict[str, Any]]]) -> str:
+    latest_completed = [
+        getattr(run, "completed_at", None)
+        for run, _ in outputs.values()
+        if getattr(run, "completed_at", None) is not None
+    ]
+    subtitle = identity.get("title") or "Cumulative PharmaOS scientific development brief."
+    return _hero(
+        "PharmaOS Cumulative Report",
+        identity.get("asset_name") or identity.get("nct_id"),
+        subtitle,
+        [
+            ("NCT", identity.get("nct_id")),
+            ("Indication", identity.get("indication")),
+            ("Phase", identity.get("phase")),
+            ("Status", identity.get("status")),
+            ("Sponsor", identity.get("sponsor")),
+            ("Updated", max(latest_completed).date().isoformat() if latest_completed else None),
+        ],
+    )
+
+
+def _nct_executive_readout(outputs: dict[str, tuple[Any, dict[str, Any]]]) -> str:
+    takeaways: list[str] = []
+    agent3 = _output(outputs, "clinical_outcome_prediction")
+    agent4 = _output(outputs, "due_diligence")
+    agent5 = _output(outputs, "protocol_design")
+    if agent3:
+        endpoint = _dict(agent3.get("endpoint_risk_assessment"))
+        enrollment = _dict(agent3.get("enrollment_duration_risk"))
+        pos = _dict(agent3.get("historical_pos_estimate"))
+        takeaways.append(
+            _join_sentence_parts(
+                [
+                    f"Clinical risk is framed as endpoint risk {_display(endpoint.get('risk_level')).lower()}" if endpoint.get("risk_level") else None,
+                    f"enrollment risk {_display(enrollment.get('risk_level')).lower()}" if enrollment.get("risk_level") else None,
+                    f"historical PoS {_percent(pos.get('probability_of_success'))}" if pos.get("probability_of_success") is not None else None,
+                ]
+            )
+        )
+    if agent4:
+        memo = _dict(agent4.get("asset_memo"))
+        commercial = _dict(agent4.get("commercial_model"))
+        rnpv = _dict(agent4.get("rnpv"))
+        memo_summary = _first_sentences(memo.get("summary"), 2)
+        takeaways.append(memo_summary)
+        if (
+            commercial.get("calculable") is False
+            or rnpv.get("calculable") is False
+        ) and "non-calculable" not in memo_summary.casefold():
+            takeaways.append("Commercial sizing or rNPV remains non-calculable under the persisted evidence and assumptions.")
+    if agent5:
+        brief = _dict(agent5.get("protocol_design_brief"))
+        synopsis = _section_body(brief.get("executive_synopsis"))
+        takeaways.append(_first_sentences(synopsis, 2))
+    return _bullets(_dedupe_text(takeaways, limit=6))
+
+
+def _nct_kpis(outputs: dict[str, tuple[Any, dict[str, Any]]]) -> str:
+    agent3 = _output(outputs, "clinical_outcome_prediction")
+    agent4 = _output(outputs, "due_diligence")
+    agent5 = _output(outputs, "protocol_design")
+    endpoint = _dict(agent3.get("endpoint_risk_assessment")) if agent3 else {}
+    enrollment = _dict(agent3.get("enrollment_duration_risk")) if agent3 else {}
+    pos = _dict((agent4 or {}).get("pos")) or _dict((agent3 or {}).get("historical_pos_estimate"))
+    approval = _dict((agent3 or {}).get("approval_likelihood_proxy"))
+    commercial = _dict((agent4 or {}).get("commercial_model"))
+    rnpv = _dict((agent4 or {}).get("rnpv"))
+    benchmark = _dict((agent5 or {}).get("analog_benchmark_bundle"))
+    return _kpi_grid(
+        [
+            ("Historical PoS", _percent(pos.get("probability_of_success")), _pretty_lookup(pos.get("lookup_key")) or pos.get("current_phase")),
+            ("Approval Proxy", _percent(approval.get("probability")), approval.get("basis")),
+            ("Endpoint Risk", endpoint.get("risk_level") or "NA", "Agent 3 endpoint assessment."),
+            ("Enrollment Risk", enrollment.get("risk_level") or "NA", "Agent 3 operational timing assessment."),
+            ("Peak Net Sales", _money_or_not_calculable(commercial.get("peak_net_sales")), "Deterministic commercial model."),
+            ("Base rNPV", _money_or_not_calculable(rnpv.get("rnpv")), "Deterministic rNPV."),
+            ("LOE", rnpv.get("loe_year") or _nested(agent4 or {}, "patent_loe_review", "estimated_loe_year") or "NA", "Loss-of-exclusivity assumption or estimate."),
+            ("Analog Confidence", _percent(benchmark.get("confidence")), "Agent 5 analog benchmark confidence."),
+        ]
+    )
+
+
+def _lifecycle_summary_table(outputs: dict[str, tuple[Any, dict[str, Any]]]) -> str:
+    rows = []
+    labels = {
+        "clinical_outcome_prediction": "Agent 3 - Clinical Outcome Prediction",
+        "due_diligence": "Agent 4 - Due Diligence",
+        "protocol_design": "Agent 5 - Protocol Design",
+    }
+    for workflow_name in ("clinical_outcome_prediction", "due_diligence", "protocol_design"):
+        item = outputs.get(workflow_name)
+        if item is None:
+            rows.append({"workflow": labels[workflow_name], "status": "not available", "run": "", "updated": "", "confidence": "", "gate": ""})
+            continue
+        run, output = item
+        gate = _dict(output.get("human_gate"))
+        rows.append(
+            {
+                "workflow": labels[workflow_name],
+                "status": _pretty_status(output.get("validation_status") or getattr(run, "validation_status", None)),
+                "run": getattr(run, "run_id", output.get("run_id")),
+                "updated": _date(getattr(run, "completed_at", None)),
+                "confidence": _percent(output.get("confidence")),
+                "gate": _pretty_status(gate.get("decision") or ""),
+            }
+        )
+    return _dict_table(rows, ("workflow", "status", "updated", "confidence", "gate", "run"))
+
+
+def _cumulative_agent3_section(output: dict[str, Any]) -> str:
+    trial = _dict(output.get("trial_identity"))
+    asset = _dict(output.get("asset_identity"))
+    endpoint = _dict(output.get("endpoint_risk_assessment"))
+    enrollment = _dict(output.get("enrollment_duration_risk"))
+    comparator = _dict(output.get("comparator_benchmarking"))
+    pos = _dict(output.get("historical_pos_estimate"))
+    approval = _dict(output.get("approval_likelihood_proxy"))
+    failure = _dict(output.get("failure_mode_classification"))
+    safety = _dict(output.get("safety_context"))
+    findings = _dedupe_text(
+        [
+            _risk_sentence("Endpoint", endpoint),
+            _risk_sentence("Enrollment", enrollment),
+            _first_sentences(comparator.get("benchmark_summary"), 2, max_chars=340),
+            safety.get("summary") or _first_missing_reason(safety),
+        ],
+        limit=5,
+    )
+    risks = _top_risk_items([
+        *_list(failure.get("likely_failure_modes")),
+        *_list(output.get("missing_data_flags")),
+    ], limit=5)
+    review_flags = top_review_flags_from_payload(output, limit=5)
+    body = "".join(
+        [
+            _compact_workflow_header(
+                "Agent 3 - Clinical Outcome Prediction",
+                _join_sentence_parts(
+                    [
+                        f"{asset.get('asset_name') or trial.get('nct_id')} has endpoint risk {_display(endpoint.get('risk_level')).lower()}" if endpoint.get("risk_level") else None,
+                        f"enrollment risk {_display(enrollment.get('risk_level')).lower()}" if enrollment.get("risk_level") else None,
+                        f"historical PoS {_percent(pos.get('probability_of_success'))}" if pos.get("probability_of_success") is not None else None,
+                    ]
+                ),
+                output,
+            ),
+            _workflow_body(
+                _cards(
+                    [
+                        ("Key Findings", _bullets(findings)),
+                        ("Major Risks And Uncertainties", _bullets(risks)),
+                    ]
+                ),
+                _kv_table(
+                    {
+                        "nct_id": trial.get("nct_id") or _nested(output, "input", "nct_id"),
+                        "phase": _pretty_phase_list(_list(trial.get("phases"))),
+                        "status": _pretty_status(trial.get("overall_status")),
+                        "asset": asset.get("asset_name"),
+                        "indication": asset.get("normalized_indication") or ", ".join(_list(trial.get("conditions"))),
+                        "historical_pos": _percent(pos.get("probability_of_success")),
+                        "approval_proxy": _percent(approval.get("probability")),
+                        "matched_comparator_trials": comparator.get("matched_public_trials_count"),
+                    }
+                ),
+            ),
+            _details("Review Context", _flag_table(list(review_flags)) + _source_context_line(output)),
+        ]
+    )
+    return _section("Agent 3 - Clinical Outcome Prediction", body)
+
+
+def _cumulative_agent4_section(output: dict[str, Any]) -> str:
+    trial = _dict(output.get("target_trial"))
+    asset = _dict(output.get("asset_identity"))
+    memo = _dict(output.get("asset_memo"))
+    clinical = _dict(output.get("clinical_risk_summary"))
+    evidence = _dict(output.get("clinical_evidence"))
+    landscape = _dict(output.get("competitive_landscape"))
+    safety = _dict(output.get("safety_label_summary"))
+    patent = _dict(output.get("patent_loe_review"))
+    pricing = _dict(output.get("pricing"))
+    commercial = _dict(output.get("commercial_model"))
+    rnpv = _dict(output.get("rnpv"))
+    red_flags = _top_risk_items(_list(output.get("red_flags")), limit=5)
+    missing = _top_risk_items(_list(output.get("missing_data_flags")), limit=4)
+    review_flags = top_review_flags_from_payload(output, limit=5)
+    findings = _dedupe_text(
+        [
+            _first_sentences(memo.get("summary"), 2),
+            _clinical_risk_sentence(clinical),
+            _ctgov_evidence_sentence(trial, evidence),
+            _first_sentences(landscape.get("benchmark_summary"), 2, max_chars=340),
+            patent.get("review_summary"),
+            safety.get("warnings_summary"),
+        ],
+        limit=6,
+    )
+    body = "".join(
+        [
+            _compact_workflow_header("Agent 4 - Clinical-Stage Due Diligence", _first_sentences(memo.get("summary"), 2), output),
+            _workflow_body(
+                _cards(
+                    [
+                        ("Decision-Relevant Findings", _bullets(findings)),
+                        ("Major Risks And Uncertainties", _bullets(_dedupe_risk_texts([*red_flags, *missing], limit=5))),
+                    ]
+                ),
+                _kv_table(
+                    {
+                        "asset": asset.get("asset_name"),
+                        "indication": asset.get("normalized_indication"),
+                        "clinical_pos": _percent(_nested(output, "pos", "probability_of_success") or clinical.get("historical_pos")),
+                        "pricing_analog": _brief_pricing_analog(pricing.get("matched_product")),
+                        "annual_wac": _money(pricing.get("annual_wac")),
+                        "peak_net_sales": _money_or_not_calculable(commercial.get("peak_net_sales")),
+                        "base_rnpv": _money_or_not_calculable(rnpv.get("rnpv")),
+                        "loe_year": rnpv.get("loe_year") or patent.get("estimated_loe_year"),
+                        "commercial_calculable": commercial.get("calculable"),
+                        "rnpv_calculable": rnpv.get("calculable"),
+                    }
+                ),
+            ),
+            _details("Review Flags", _flag_table(list(review_flags)) + _source_context_line(output)),
+        ]
+    )
+    return _section("Agent 4 - Due Diligence", body)
+
+
+def _cumulative_agent5_section(output: dict[str, Any]) -> str:
+    brief = _dict(output.get("protocol_design_brief"))
+    intent = _dict(output.get("next_study_intent") or brief.get("next_study_intent"))
+    benchmark = _dict(output.get("analog_benchmark_bundle"))
+    reviewer = _dict(brief.get("reviewer_critique"))
+    synopsis = _section_body(brief.get("executive_synopsis"))
+    findings = _dedupe_text(
+        [
+            _first_sentences(_section_body(brief.get("strategic_rationale")), 2, max_chars=340),
+            _protocol_benchmark_sentence(benchmark),
+            _section_body(brief.get("endpoint_strategy")),
+            _section_body(brief.get("operational_feasibility_risks")),
+        ],
+        limit=5,
+    )
+    decisions = [
+        _protocol_design_decision(item)
+        for item in _list(output.get("analog_derived_design_decisions"))
+        if isinstance(item, dict) and item.get("proposed_value")
+    ][:5]
+    limitations = _dedupe_risk_texts(
+        [
+            *_list(benchmark.get("limitations")),
+            *_list(reviewer.get("limitations")),
+            *_top_risk_items(_list(output.get("missing_data_flags")), limit=3),
+        ],
+        limit=5,
+    )
+    review_flags = top_review_flags_from_payload(output, limit=5)
+    body = "".join(
+        [
+            _compact_workflow_header("Agent 5 - Protocol Design Brief", _protocol_takeaway(intent, synopsis), output),
+            _workflow_body(
+                _cards(
+                    [
+                        ("Protocol Strategy Findings", _bullets(findings)),
+                        ("Risks And Limitations", _bullets(limitations)),
+                    ]
+                ),
+                _kv_table(
+                    {
+                        "proposed_next_stage": _brief_stage(intent.get("proposed_next_stage")),
+                        "study_role": _brief_stage(intent.get("study_role")),
+                        "key_clinical_question": intent.get("key_clinical_question"),
+                        "selected_analogs": len(_list(benchmark.get("selected_analog_ids"))),
+                        "follow_on_trials": len(_list(output.get("follow_on_trials"))),
+                        "median_enrollment": _summary_value(benchmark.get("enrollment"), "median"),
+                        "median_duration": _summary_value(benchmark.get("planned_duration_months"), "median"),
+                        "benchmark_confidence": _percent(benchmark.get("confidence")),
+                    }
+                ),
+            ),
+            _cards([("Analog-Derived Design Signals", _bullets(decisions or ["No analog-derived design signals were emitted."]))]),
+            _details(
+                "Review Flags",
+                _flag_table(list(review_flags)) + _source_context_line(output),
+            ),
+        ]
+    )
+    return _section("Agent 5 - Protocol Design", body)
+
+
+def _compact_workflow_header(title: str, takeaway: Any, output: dict[str, Any]) -> str:
+    status = output.get("validation_status")
+    review_flags = top_review_flags_from_payload(output, limit=5)
+    chips = [
+        ("Validation", status),
+        ("Confidence", _percent(output.get("confidence"))),
+        ("Review Flags", _review_flag_badge(review_flags)),
+        ("Run", output.get("run_id")),
+    ]
+    return (
+        "<div class='workflow-head'>"
+        f"<div><p class='eyebrow'>{escape(title)}</p>{_paragraphs([takeaway])}</div>"
+        f"<div class='status-strip'>{''.join(_status_pill(label, value) for label, value in chips if _display(value))}</div>"
+        "</div>"
+    )
+
+
+def _workflow_body(narrative: str, metrics: str) -> str:
+    return f"<div class='workflow-body'><div class='workflow-narrative'>{narrative}</div><aside class='metrics-panel'>{metrics}</aside></div>"
+
+
+def _status_pill(label: str, value: Any) -> str:
+    text = _display(value)
+    shown = _pretty_status(text) if label == "Validation" else text
+    status_class = "status-warn" if any(token in text.casefold() for token in ("review", "warning", "failed", "blocked", "non-calculable")) else "status-ok"
+    return f"<span class='status-pill {status_class}'><strong>{escape(label)}</strong>{escape(shown)}</span>"
+
+
+def _review_flag_badge(flags: tuple[dict[str, Any], ...]) -> str:
+    if not flags:
+        return "None"
+    top = flags[0]
+    if len(flags) == 1:
+        return f"{_display(top.get('severity')).title()}: {_truncate(_display(top.get('reason')), 72)}"
+    counts = {}
+    for flag in flags:
+        severity = _display(flag.get("severity")).casefold() or "medium"
+        counts[severity] = counts.get(severity, 0) + 1
+    summary = ", ".join(f"{count} {severity}" for severity, count in counts.items())
+    return f"{len(flags)} flags: {summary}"
+
+
+def _first_review_reason(flags: tuple[dict[str, Any], ...]) -> str:
+    if not flags:
+        return ""
+    top = flags[0]
+    return f"{_display(top.get('severity')).title()}: {_truncate(_display(top.get('reason')), 120)}"
+
+
+def _source_confidence_context(outputs: dict[str, tuple[Any, dict[str, Any]]]) -> str:
+    rows = []
+    labels = {
+        "clinical_outcome_prediction": "Agent 3 - Clinical Outcome Prediction",
+        "due_diligence": "Agent 4 - Due Diligence",
+        "protocol_design": "Agent 5 - Protocol Design",
+    }
+    for workflow_name, (run, output) in outputs.items():
+        summary = _dict(output.get("execution_mode_summary"))
+        review_flags = top_review_flags_from_payload(output, limit=5)
+        rows.append(
+            {
+                "workflow": labels.get(workflow_name, _label(workflow_name)),
+                "sources": len(_list(output.get("sources"))),
+                "claims": len(_list(output.get("claims"))),
+                "review_flags": len(review_flags),
+                "top_review_reason": _first_review_reason(review_flags),
+                "validation": _pretty_status(output.get("validation_status") or getattr(run, "validation_status", None)),
+                "execution": summary.get("summary") or "",
+            }
+        )
+    return (
+        _paragraphs(["This report is generated only from persisted typed workflow outputs in Scientific Memory. It intentionally omits raw JSON, full trace logs, low-value flags, and repetitive generated sections."])
+        + _dict_table(rows, ("workflow", "sources", "claims", "review_flags", "top_review_reason", "validation", "execution"))
+    )
+
+
+def _source_context_line(output: dict[str, Any]) -> str:
+    review_flags = top_review_flags_from_payload(output, limit=5)
+    pieces = [
+        f"{len(_list(output.get('sources')))} persisted sources",
+        f"{len(_list(output.get('claims')))} source-backed claims",
+        f"{len(review_flags)} review flags surfaced",
+    ]
+    return f"<p class='sources'>{escape('; '.join(pieces))}</p>"
+
+
+def _details(title: str, body: str) -> str:
+    return f"<details><summary>{escape(title)}</summary>{body}</details>"
+
+
+def _output(outputs: dict[str, tuple[Any, dict[str, Any]]], workflow_name: str) -> dict[str, Any] | None:
+    item = outputs.get(workflow_name)
+    return item[1] if item else None
+
+
+def _section_body(value: Any) -> str:
+    item = _dict(value)
+    if item:
+        return _display(item.get("body") or item.get("summary") or item.get("rationale"))
+    return _display(value)
+
+
+def _risk_sentence(label: str, section: dict[str, Any]) -> str:
+    if not section:
+        return ""
+    top_gap = _top_risk_items(_list(section.get("missing_data_flags")), limit=1)
+    return _join_sentence_parts(
+        [
+            f"{label} risk: {section.get('risk_level')}",
+            _first_sentences(section.get("rationale"), 1, max_chars=260),
+            f"Key uncertainty: {top_gap[0].split(': ', 1)[-1]}" if top_gap else None,
+        ]
+    )
+
+
+def _clinical_risk_sentence(clinical: dict[str, Any]) -> str:
+    return _join_sentence_parts(
+        [
+            f"Endpoint risk {clinical.get('endpoint_risk_level')}" if clinical.get("endpoint_risk_level") else None,
+            f"enrollment risk {clinical.get('enrollment_duration_risk_level')}" if clinical.get("enrollment_duration_risk_level") else None,
+            f"historical PoS {_percent(clinical.get('historical_pos'))}" if clinical.get("historical_pos") is not None else None,
+        ]
+    )
+
+
+def _ctgov_evidence_sentence(trial: dict[str, Any], evidence: dict[str, Any]) -> str:
+    if not trial and not evidence:
+        return ""
+    phase = _pretty_phase_list(_list(trial.get("phases")))
+    status = _pretty_status(trial.get("overall_status"))
+    primary_count = len(_list(trial.get("primary_endpoints")))
+    pubmed_count = evidence.get("pubmed_article_count")
+    trial_context = " ".join(part for part in (phase, status) if part)
+    pieces = [
+        f"CT.gov confirms {trial_context} target-trial evidence" if trial_context else "CT.gov target-trial evidence is available",
+        f"{primary_count} primary endpoint{'s' if primary_count != 1 else ''}" if primary_count else None,
+        f"PubMed metadata count {pubmed_count}" if pubmed_count is not None else None,
+    ]
+    return _join_sentence_parts(pieces)
+
+
+def _brief_pricing_analog(value: Any) -> str:
+    text = _display(value)
+    if not text:
+        return ""
+    for marker in (" (pricing analog:", " - "):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+            break
+    return _truncate(text, 120)
+
+
+def _protocol_takeaway(intent: dict[str, Any], synopsis: Any) -> str:
+    indication = intent.get("indication")
+    stage = _brief_stage(intent.get("proposed_next_stage"))
+    role = _brief_stage(intent.get("study_role"))
+    pieces = [
+        f"Draft next-study strategy brief for {indication}" if indication else _first_sentences(synopsis, 1, max_chars=180),
+        f"proposed next stage: {stage}" if stage else None,
+        f"role: {role}" if role else None,
+        "human review is required before protocol use",
+    ]
+    return _join_sentence_parts(pieces)
+
+
+def _protocol_benchmark_sentence(benchmark: dict[str, Any]) -> str:
+    selected_count = len(_list(benchmark.get("selected_analog_ids")))
+    enrollment = _summary_value(benchmark.get("enrollment"), "median")
+    duration = _summary_value(benchmark.get("planned_duration_months"), "median")
+    comparator = ""
+    categories = _list(benchmark.get("comparator_categories"))
+    if categories and isinstance(categories[0], dict):
+        comparator = _brief_stage(categories[0].get("label"))
+    pieces = [
+        f"Benchmarking is based on {selected_count} selected analog CT.gov trial{'s' if selected_count != 1 else ''}",
+        f"median enrollment {enrollment}" if enrollment != "NA" else None,
+        f"median planned duration {duration}" if duration != "NA" else None,
+        f"comparator pattern {comparator}" if comparator else None,
+    ]
+    return _join_sentence_parts(pieces)
+
+
+def _protocol_design_decision(item: dict[str, Any]) -> str:
+    field = _label(item.get("field_name"))
+    value = _brief_stage(item.get("proposed_value"))
+    method = _brief_stage(item.get("derivation_method"))
+    return f"{field}: {value} ({method})" if method else f"{field}: {value}"
+
+
+def _brief_stage(value: Any) -> str:
+    text = _pretty_embedded_enums(_display(value)).replace("_", " ").replace("Phase 2", "Phase II")
+    text = text.replace("study.)", "study)").replace("'.", "'").strip()
+    return _truncate(text, 180)
+
+
+def _join_sentence_parts(parts: list[Any]) -> str:
+    text = "; ".join(_display(part).strip(" .;") for part in parts if _display(part).strip())
+    if text and text[-1] not in ".!?":
+        text += "."
+    return text
+
+
+def _first_sentences(value: Any, count: int = 1, *, max_chars: int = 520) -> str:
+    text = " ".join(_display(value).split())
+    if not text:
+        return ""
+    sentences: list[str] = []
+    for sentence in text.replace("? ", "?. ").replace("! ", "!. ").split(". "):
+        clean = sentence.strip()
+        if not clean:
+            continue
+        if clean[-1] not in ".!?":
+            clean += "."
+        sentences.append(clean)
+        if len(sentences) >= count:
+            break
+    result = " ".join(sentences) or text
+    return _pretty_embedded_enums(_truncate(result, max_chars))
+
+
+def _dedupe_text(values: list[Any], *, limit: int) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for value in values:
+        text = " ".join(_display(value).split())
+        if not text or text.casefold() in seen:
+            continue
+        seen.add(text.casefold())
+        results.append(_truncate(text, 420))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _top_risk_items(items: list[Any], *, limit: int) -> list[str]:
+    rows = [item for item in items if isinstance(item, dict)]
+    rows.sort(key=lambda item: (_severity_rank(item.get("severity")), _display(item.get("reason") or item.get("rationale"))))
+    texts = []
+    seen_fingerprints: set[str] = set()
+    for item in rows:
+        reason = item.get("reason") or item.get("rationale") or item.get("message")
+        severity = item.get("severity")
+        fingerprint = _risk_fingerprint(reason)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        if reason:
+            texts.append(f"{severity}: {reason}" if severity else reason)
+    return _dedupe_text(texts, limit=limit)
+
+
+def _dedupe_risk_texts(values: list[Any], *, limit: int) -> list[str]:
+    seen_fingerprints: set[str] = set()
+    results: list[str] = []
+    for value in values:
+        text = " ".join(_display(value).split())
+        if not text:
+            continue
+        text = _humanized_risk_text(text)
+        fingerprint = _risk_fingerprint(text)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+        results.append(_truncate(text, 320))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _humanized_risk_text(text: str) -> str:
+    if "commercial-population-measure-missing" in text:
+        return text.replace("commercial-population-measure-missing", "the population measure required for commercial sizing is missing")
+    if any(token in text for token in ("market_pubmed_no_articles", "pubmed_market_query_failed", "PubMedError")):
+        severity = text.split(":", 1)[0] if ":" in text else "medium"
+        return f"{severity}: Commercial sizing could not retrieve adequate PubMed market epidemiology evidence."
+    return _pretty_embedded_enums(text)
+
+
+def _risk_fingerprint(value: Any) -> str:
+    text = _display(value).casefold()
+    if "benchmark stability" in text or "fewer than five selected analog" in text:
+        return "benchmark-stability"
+    if "pubmed market epidemiology" in text or "market_pubmed" in text or "pubmed_market_query_failed" in text:
+        return "market-pubmed-gap"
+    if "commercial" in text and "calculable" in text:
+        return "commercial-not-calculable"
+    if "rnpv" in text and "calculable" in text:
+        return "rnpv-not-calculable"
+    if "selected_population_measure" in text or "commercial-population" in text:
+        return "commercial-population-gap"
+    if "rxnorm" in text:
+        return "rxnorm-missing"
+    if "modality" in text:
+        return "modality-missing"
+    if "label" in text or "openfda" in text:
+        return "label-missing"
+    return text
+
+
+def _severity_rank(value: Any) -> int:
+    return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(_display(value).casefold(), 4)
+
+
+def _first_missing_reason(section: dict[str, Any]) -> str:
+    for item in _list(section.get("missing_data_flags")):
+        if isinstance(item, dict) and item.get("reason"):
+            return item["reason"]
+    return ""
+
+
+def _review_questions_from_output(output: dict[str, Any], risks: list[str], *, limit: int) -> list[str]:
+    gate = _dict(output.get("human_gate"))
+    questions = []
+    if gate.get("gate_reason"):
+        questions.append(gate["gate_reason"])
+    questions.extend(risks)
+    return _dedupe_text(questions, limit=limit)
+
+
+def _date(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    text = str(value)
+    return text[:10]
+
+
+def _pretty_phase_list(values: list[Any]) -> str:
+    phases = [_pretty_phase(value) for value in values if _display(value)]
+    return ", ".join(phases)
+
+
+def _pretty_phase(value: Any) -> str:
+    text = _display(value).replace("_", " ").strip()
+    compact = text.replace(" ", "").upper()
+    mapping = {
+        "PHASE1": "Phase I",
+        "PHASE2": "Phase II",
+        "PHASE3": "Phase III",
+        "PHASE4": "Phase IV",
+        "EARLYPHASE1": "Early Phase I",
+    }
+    return mapping.get(compact, text.title())
+
+
+def _pretty_status(value: Any) -> str:
+    text = _display(value).replace("_", " ").strip()
+    if not text:
+        return ""
+    return text.title().replace(" And ", " and ").replace(" Of ", " of ")
+
+
+def _pretty_lookup(value: Any) -> str:
+    return _display(value).replace("|", " / ")
+
+
+def _pretty_embedded_enums(value: Any) -> str:
+    text = _display(value)
+    replacements = {
+        "PHASE1": "Phase I",
+        "PHASE2": "Phase II",
+        "PHASE3": "Phase III",
+        "PHASE4": "Phase IV",
+        "ACTIVE_NOT_RECRUITING": "Active Not Recruiting",
+        "NOT_YET_RECRUITING": "Not Yet Recruiting",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text.replace("_", " ") if text.isupper() and "_" in text else text
+
+
+def _money_or_not_calculable(value: Any) -> str:
+    return _money(value) if _float(value) is not None else "Not calculable"
 
 
 def _workflow_report_section(output_json: Any, workflow_name: str) -> str:
@@ -537,6 +1321,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
     patent = _dict(output.get("patent_loe_review"))
     red_flags = _list(output.get("red_flags"))
     missing_flags = _list(output.get("missing_data_flags"))
+    review_flags = top_review_flags_from_payload(output, limit=5)
     investment = _dict(output.get("investment_report")) or build_due_diligence_report_payload(output)
 
     title = memo.get("title") or f"Clinical-Stage Due Diligence Memo: {_display(asset.get('asset_name') or target.get('nct_id'))}"
@@ -597,7 +1382,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
             ),
             _section("Pricing Source Logic", _pricing_section(pricing)),
             _section("Deterministic Commercial Calculations", _commercial_section(commercial)),
-            _section("Market Conversion Assumptions", _dict_table(_list(investment.get("market_conversion_assumptions")), ("conversion", "step", "base_fraction", "resulting_patients", "source", "human_review_required"))),
+            _section("Market Conversion Assumptions", _dict_table(_list(investment.get("market_conversion_assumptions")), ("conversion", "step", "base_fraction", "resulting_patients", "source"))),
             _section("Deterministic rNPV Calculation", _rnpv_section(rnpv, commercial)),
             _section("Sensitivity Summary", _dict_table(_list(investment.get("sensitivity_summary")), ("variable", "low_input", "low_case_rnpv", "base_case_rnpv", "high_input", "high_case_rnpv"))),
             _section(
@@ -608,8 +1393,7 @@ def _due_diligence_report(output: dict[str, Any]) -> str:
                 "Human Review Surface",
                 _cards(
                     [
-                        ("Rule-Based Red Flags", _flag_table(red_flags)),
-                        ("Missing Data Flags", _flag_table(missing_flags)),
+                        ("Top Review Flags", _flag_table(list(review_flags))),
                         ("Memo Review Questions", _bullets(_list(memo.get("review_questions")) or ["None emitted."])),
                     ]
                 ),
@@ -623,6 +1407,7 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
     brief = _dict(output.get("protocol_design_brief"))
     intent = _dict(output.get("next_study_intent") or brief.get("next_study_intent"))
     benchmark = _dict(output.get("analog_benchmark_bundle"))
+    follow_on_benchmark = _dict(output.get("follow_on_benchmark_bundle"))
     candidates = _list(output.get("analog_candidates"))
     selected_ids = set(_list(benchmark.get("selected_analog_ids")))
     selected_candidates = [item for item in candidates if _nested(item, "trial", "nct_id") in selected_ids]
@@ -646,10 +1431,10 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
                 [
                     ("Next Study", intent.get("proposed_next_stage"), _display(intent.get("study_role"))),
                     ("Selected Analogs", len(_list(benchmark.get("selected_analog_ids"))), "CT.gov analog trials selected by Agent 5."),
+                    ("Follow-on Trials", len(_list(output.get("follow_on_trials"))), "Lineage-confirmed follow-on trials found for selected analogs."),
                     ("Benchmark Confidence", _percent(benchmark.get("confidence")), "Confidence after deterministic analog coverage checks."),
                     ("Median Enrollment", _summary_value(benchmark.get("enrollment"), "median"), "Selected analog participant median."),
                     ("Median Duration", _summary_value(benchmark.get("planned_duration_months"), "median"), "Selected analog planned duration median."),
-                    ("Median Sites", _summary_value(benchmark.get("site_count"), "median"), "Selected analog site-count median."),
                 ]
             ),
             _section("Next Study Intent", _next_study_intent_section(intent)),
@@ -667,9 +1452,10 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
                     }
                 ),
             ),
-            _section("Analog Benchmark", _analog_benchmark_section(benchmark)),
+            _section("Direct Analog Benchmark", _analog_benchmark_section(benchmark)),
             _section("Analog Search Plan", _search_plan_section(_dict(benchmark.get("search_plan")))),
             _section("Selected Analog Trials", _selected_analogs_table(selected_candidates)),
+            _section("Follow-on Lineage", _follow_on_lineage_section(output, follow_on_benchmark)),
             _section("Protocol Brief Sections", _protocol_sections(brief)),
             _section(
                 "Review And Limitations",
@@ -748,6 +1534,8 @@ def _commercial_section(commercial: dict[str, Any]) -> str:
     population = _dict(commercial.get("selected_population_measure"))
     funnel = _dict(commercial.get("patient_funnel"))
     input_summary = _dict(commercial.get("commercial_input_bundle_summary"))
+    denominator = _dict(input_summary.get("us_population_denominator"))
+    query_diagnostics = _list(input_summary.get("market_query_diagnostics"))[:12]
     review_questions = _list(commercial.get("human_review_questions"))
     confidence_flags = _list(commercial.get("confidence_flags"))
     forecast_rows = []
@@ -815,6 +1603,35 @@ def _commercial_section(commercial: dict[str, Any]) -> str:
                         "commercially_addressable": _patients(funnel.get("commercially_addressable_patients")),
                     }
                 ),
+            ),
+            _mini_heading("Market Evidence Diagnostics"),
+            _two_col(
+                _kv_table(
+                    {
+                        "us_population_total": _patients(denominator.get("total_us_population")),
+                        "adult_population": _patients(denominator.get("adult_population")),
+                        "pediatric_population": _patients(denominator.get("pediatric_population")),
+                        "population_source": denominator.get("source_id"),
+                        "population_source_type": denominator.get("source_type"),
+                        "population_source_year": denominator.get("source_year"),
+                        "population_review_required": denominator.get("human_review_required"),
+                    }
+                ),
+                _dict_table(
+                    [
+                        {
+                            "query": item.get("query"),
+                            "status": item.get("status"),
+                            "articles": item.get("article_count"),
+                            "error": item.get("error_type") or item.get("error"),
+                        }
+                        for item in query_diagnostics
+                        if isinstance(item, dict)
+                    ],
+                    ("query", "status", "articles", "error"),
+                )
+                if query_diagnostics
+                else "<p class='muted'>No market-query diagnostics were available.</p>",
             ),
             _mini_heading("Commercial Assumption Ledger"),
             _dict_table(ledger_rows, ("assumption", "base", "source", "review", "rationale")),
@@ -1243,6 +2060,57 @@ def _selected_analogs_table(candidates: list[Any]) -> str:
     return _dict_table(rows, ("nct_id", "title", "status", "phase", "enrollment", "primary_completion", "queries"))
 
 
+def _follow_on_lineage_section(output: dict[str, Any], follow_on_benchmark: dict[str, Any]) -> str:
+    adjudications = _list(output.get("follow_on_adjudications"))
+    follow_on_trials = _list(output.get("follow_on_trials"))
+    adjudication_rows = [
+        {
+            "anchor_analog": item.get("anchor_analog_nct_id"),
+            "status": item.get("status"),
+            "selected_follow_ons": ", ".join(_list(item.get("selected_follow_on_nct_ids"))),
+            "alternatives": ", ".join(_list(item.get("alternative_follow_on_nct_ids"))),
+            "confidence": _percent(item.get("confidence")),
+            "rationale": item.get("rationale"),
+        }
+        for item in adjudications
+        if isinstance(item, dict)
+    ]
+    trial_rows = [
+        {
+            "nct_id": trial.get("nct_id"),
+            "title": trial.get("brief_title") or trial.get("official_title"),
+            "status": trial.get("overall_status"),
+            "phase": ", ".join(_list(trial.get("phases"))),
+            "sponsor": _nested(trial, "lead_sponsor", "name"),
+            "start": trial.get("start_date"),
+        }
+        for trial in follow_on_trials
+        if isinstance(trial, dict)
+    ]
+    if not adjudication_rows and not trial_rows:
+        return _paragraphs(["No lineage-confirmed follow-on trials were emitted for the selected analog set."])
+    return "".join(
+        [
+            _cards(
+                [
+                    (
+                        "Follow-on Benchmark Limitations",
+                        _bullets(_list(follow_on_benchmark.get("limitations")) or ["None emitted."]),
+                    ),
+                    (
+                        "Follow-on Missing Data",
+                        _flag_table(_list(follow_on_benchmark.get("missing_data_flags"))),
+                    ),
+                ]
+            ),
+            _mini_heading("Lineage Adjudications"),
+            _dict_table(adjudication_rows, ("anchor_analog", "status", "selected_follow_ons", "alternatives", "confidence", "rationale")),
+            _mini_heading("Fetched Follow-on Trials"),
+            _dict_table(trial_rows, ("nct_id", "title", "status", "phase", "sponsor", "start")),
+        ]
+    )
+
+
 def _protocol_sections(brief: dict[str, Any]) -> str:
     keys = (
         "executive_synopsis",
@@ -1330,7 +2198,7 @@ def _table_section(title: str, rows: tuple[Any, ...], fields: tuple[str, ...]) -
 
 def _kv_table(values: dict[str, Any]) -> str:
     rows = "".join(
-        f"<tr><th>{escape(str(key))}</th><td>{escape(_display(value))}</td></tr>"
+        f"<tr><th>{escape(_label(key))}</th><td>{escape(_display(value))}</td></tr>"
         for key, value in values.items()
     )
     return f"<table><tbody>{rows}</tbody></table>"
@@ -1339,11 +2207,26 @@ def _kv_table(values: dict[str, Any]) -> str:
 def _dict_table(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> str:
     if not rows:
         return "<p class='muted'>None.</p>"
-    head = "".join(f"<th>{escape(field)}</th>" for field in fields)
+    head = "".join(f"<th>{escape(_label(field))}</th>" for field in fields)
     body = []
     for row in rows:
         body.append("<tr>" + "".join(f"<td>{escape(_display(row.get(field)))}</td>" for field in fields) + "</tr>")
     return f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+def _label(value: Any) -> str:
+    special = {
+        "nct": "NCT",
+        "id": "ID",
+        "pos": "PoS",
+        "rnpv": "rNPV",
+        "wac": "WAC",
+        "loe": "LOE",
+        "ctgov": "CT.gov",
+        "api": "API",
+        "url": "URL",
+    }
+    return " ".join(special.get(part.casefold(), part.title()) for part in _display(value).replace("_", " ").replace("-", " ").split())
 
 
 def _assumptions_table(assumptions: list[Any]) -> str:
@@ -1364,14 +2247,14 @@ def _assumptions_table(assumptions: list[Any]) -> str:
 def _flag_table(flags: list[Any]) -> str:
     rows = [
         {
-            "severity": item.get("severity"),
-            "category": item.get("category") or item.get("section"),
+            "rating": item.get("rating") or item.get("severity"),
+            "area": item.get("module") or item.get("category") or item.get("section") or item.get("target_id"),
             "reason": item.get("reason"),
         }
         for item in flags
         if isinstance(item, dict)
     ]
-    return _dict_table(rows, ("severity", "category", "reason"))
+    return _dict_table(rows, ("rating", "area", "reason"))
 
 
 def _numeric_summary_table(summary: dict[str, Any]) -> str:
@@ -1775,4 +2658,37 @@ svg rect.pos{fill:#0e6f68}
 svg rect.neg{fill:#a94f13}
 @media(max-width:980px){main{padding:16px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.two-col,.cards{grid-template-columns:1fr}.hero h2{font-size:26px}}
 @media(max-width:560px){.kpis{grid-template-columns:1fr}section{padding:14px}.hero{padding:20px}table{font-size:12px}}
+"""
+
+
+_CUMULATIVE_CSS = """
+.cumulative-report{max-width:1160px;padding-bottom:72px}
+.cumulative-report h1{font-size:30px}
+.cumulative-report section{margin:18px 0;padding:22px}
+.cumulative-report .hero{border-radius:10px;padding:30px;background:#0f2d2f}
+.cumulative-report .hero h2{font-size:36px;letter-spacing:0;max-width:940px}
+.cumulative-report .hero p{font-size:15px}
+.cumulative-report .kpis{grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.cumulative-report .kpi{min-height:104px;border-radius:8px}
+.workflow-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:start;margin:-2px 0 16px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.workflow-head p{margin-bottom:0}
+.workflow-head .eyebrow{color:#0e6f68!important;margin-bottom:6px}
+.workflow-body{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(360px,.8fr);gap:22px;align-items:start}
+.workflow-body .cards{grid-template-columns:1fr;gap:12px}
+.workflow-body .cards article{padding:16px 18px}
+.metrics-panel table{margin-top:0}
+.metrics-panel th{width:34%;min-width:150px}
+.status-strip{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;max-width:430px}
+.status-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid #d4dde5;border-radius:999px;background:#f7fafb;color:#334152;padding:5px 9px;font-size:12px;white-space:nowrap}
+.status-pill strong{color:#657282;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.status-pill.status-warn{border-color:#f3d6b6;background:#fff7ed;color:#8a3b0d}
+.status-pill.status-ok{border-color:#cfe5e2;background:#edf8f6;color:#0f4a46}
+.cumulative-report details{border:1px solid var(--line);border-radius:8px;background:#fbfcfd;padding:10px 12px}
+.cumulative-report details[open]{padding-bottom:14px}
+.cumulative-report summary{color:#334152}
+.cumulative-report .sources{margin:10px 0 0}
+.cumulative-report table{font-size:12.5px}
+.cumulative-report .cards article{background:#fff}
+@media(max-width:980px){.cumulative-report .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.workflow-head,.workflow-body{grid-template-columns:1fr}.status-strip{justify-content:flex-start;max-width:none}}
+@media(max-width:560px){.cumulative-report .kpis{grid-template-columns:1fr}.cumulative-report .hero h2{font-size:28px}.status-pill{white-space:normal}}
 """

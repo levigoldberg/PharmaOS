@@ -19,6 +19,7 @@ from pharma_os.execution_modes import (
     summarize_execution_modes,
 )
 from pharma_os.human_readable import build_human_readable_module_output
+from pharma_os.html_report import write_nct_report_if_persistent
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -117,6 +118,7 @@ def run_clinical_outcome_prediction_workflow(
         run_id=run_id,
         validation_results=validation_results,
         risk_flags=output.missing_data_flags,
+        human_gate=gate,
     )
     validation_status = aggregate_validation_status(validation_results)
     if gate and validation_status == "passed":
@@ -220,6 +222,7 @@ def run_clinical_outcome_prediction_workflow(
             current_output_id=output.output_id,
         )
     build_report(run_id, memory=store)
+    write_nct_report_if_persistent(input_data.nct_id, memory=store)
     return output
 
 

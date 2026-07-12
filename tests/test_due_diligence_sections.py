@@ -120,6 +120,103 @@ def test_clinical_evidence_extracts_ctgov_and_pubmed_with_sources() -> None:
     assert any(claim.source_ids == ("pubmed:123",) for claim in claims)
 
 
+def test_pubmed_client_retries_transient_failures_and_normalizes_articles() -> None:
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("esearch.fcgi"):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return httpx.Response(429, headers={"retry-after": "0"})
+            return httpx.Response(200, json={"esearchresult": {"idlist": ["123"]}})
+        return httpx.Response(
+            200,
+            text="""
+            <PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>123</PMID>
+            <Article><ArticleTitle>Atopic dermatitis prevalence in the United States</ArticleTitle>
+            <Journal><Title>Example Journal</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+            <Abstract><AbstractText>Prevalence evidence.</AbstractText></Abstract></Article>
+            </MedlineCitation></PubmedArticle></PubmedArticleSet>
+            """,
+        )
+
+    client = PubMedClient(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_interval=0,
+        max_retries=2,
+    )
+
+    articles = client.search("atopic dermatitis prevalence United States", max_results=1)
+
+    assert calls["count"] == 2
+    assert articles[0].pmid == "123"
+    assert articles[0].title == "Atopic dermatitis prevalence in the United States"
+
+
+def test_pubmed_client_falls_back_from_rejected_quoted_query() -> None:
+    terms: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("esearch.fcgi"):
+            term = str(request.url.params.get("term"))
+            terms.append(term)
+            if '"' in term:
+                return httpx.Response(400, text="quoted query rejected")
+            return httpx.Response(200, json={"esearchresult": {"idlist": ["456"]}})
+        return httpx.Response(
+            200,
+            text="""
+            <PubmedArticleSet><PubmedArticle><MedlineCitation><PMID>456</PMID>
+            <Article><ArticleTitle>Psoriasis epidemiology in the United States</ArticleTitle>
+            <AuthorList><Author><ForeName>Alex</ForeName><LastName>Smith</LastName></Author></AuthorList>
+            <Journal><Title>Example Journal</Title><JournalIssue><PubDate><Year>2024</Year></PubDate></JournalIssue></Journal>
+            <Abstract><AbstractText>US prevalence evidence.</AbstractText></Abstract></Article>
+            </MedlineCitation><PubmedData><ArticleIdList><ArticleId IdType="doi">10.1000/example</ArticleId></ArticleIdList></PubmedData>
+            </PubmedArticle></PubmedArticleSet>
+            """,
+        )
+
+    client = PubMedClient(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_interval=0,
+        max_retries=1,
+    )
+
+    articles = client.search('"psoriasis" prevalence United States', max_results=1)
+
+    assert terms == ['"psoriasis" prevalence United States', "psoriasis prevalence United States"]
+    assert articles[0].pmid == "456"
+    assert articles[0].authors == ("Alex Smith",)
+    assert articles[0].doi == "10.1000/example"
+
+
+def test_pubmed_client_skips_single_malformed_article() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("esearch.fcgi"):
+            return httpx.Response(200, json={"esearchresult": {"idlist": ["bad", "123"]}})
+        return httpx.Response(
+            200,
+            text="""
+            <PubmedArticleSet>
+              <PubmedArticle><MedlineCitation><PMID>bad</PMID><Article /></MedlineCitation></PubmedArticle>
+              <PubmedArticle><MedlineCitation><PMID>123</PMID>
+              <Article><ArticleTitle>Usable epidemiology article</ArticleTitle></Article>
+              </MedlineCitation></PubmedArticle>
+            </PubmedArticleSet>
+            """,
+        )
+
+    client = PubMedClient(
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        min_interval=0,
+        max_retries=1,
+    )
+
+    articles = client.search("epidemiology", max_results=2)
+
+    assert [article.pmid for article in articles] == ["123"]
+
+
 def test_competitive_landscape_reuses_agent3_comparators() -> None:
     summary = build_competitive_landscape_summary(_agent3())
 

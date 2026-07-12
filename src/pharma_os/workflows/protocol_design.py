@@ -16,6 +16,7 @@ from pharma_os.execution_modes import (
     summarize_execution_modes,
 )
 from pharma_os.human_readable import build_human_readable_module_output
+from pharma_os.html_report import write_nct_report_if_persistent
 from pharma_os.memory import MemoryStore
 from pharma_os.report import build_report
 from pharma_os.schemas import (
@@ -183,7 +184,13 @@ def run_protocol_design_workflow(
         agent4_handoff=agent4_handoff,
         next_study_intent=manager_result.next_study_intent,
         analog_candidates=analog_candidates,
-        analog_benchmark_bundle=benchmark_bundle,
+        analog_follow_on_candidates=manager_result.analog_follow_on_candidates,
+        follow_on_adjudications=manager_result.follow_on_adjudication.adjudications,
+        follow_on_trials=manager_result.follow_on_trials,
+        analog_benchmark_bundle=manager_result.direct_analog_benchmark_bundle,
+        follow_on_benchmark_bundle=manager_result.follow_on_benchmark_bundle,
+        qualitative_protocol_synthesis=manager_result.qualitative_synthesis,
+        analog_derived_design_decisions=manager_result.design_decisions,
         protocol_design_brief=brief,
         sources=sources,
         claims=claims,
@@ -216,6 +223,7 @@ def run_protocol_design_workflow(
         run_id=run_id,
         validation_results=validation_results,
         risk_flags=missing_data_flags,
+        human_gate=gate,
     )
     validation_status = aggregate_validation_status(validation_results)
     if gate and validation_status == "passed":
@@ -337,6 +345,7 @@ def run_protocol_design_workflow(
             current_output_id=output.output_id,
         )
     build_report(run_id, memory=store)
+    write_nct_report_if_persistent(input_data.nct_id, memory=store)
     return output
 
 
@@ -614,7 +623,10 @@ def _subagent_output_envelope(
         "ProtocolDesignManagerPlan": "ProtocolDesignManagerAgent",
         "AnalogSearchPlanOutput": "AnalogSearchPlannerAgent",
         "AnalogTrialSelectionOutput": "AnalogSelectionAgent",
+        "FollowOnTrialAdjudicationOutput": "FollowOnTrialAdjudicatorAgent",
         "BenchmarkInterpretation": "AnalogBenchmarkInterpreterAgent",
+        "QualitativeProtocolSynthesis": "QualitativeProtocolSynthesisAgent",
+        "AnalogDerivedDesignDecision": "ProtocolDesignManagerAgent",
         "ProtocolReviewerCritique": "RegulatoryCriticAgent",
         "ProtocolDesignBrief": "ProtocolBriefWriterAgent",
     }.get(payload.__class__.__name__, payload.__class__.__name__)

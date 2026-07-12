@@ -97,6 +97,7 @@ def run_trial_intelligence_workflow(
         run_id=run_id,
         validation_results=validation_results,
         risk_flags=output.risk_flags,
+        human_gate=human_gate,
     )
     validation_status = aggregate_validation_status(validation_results)
     if human_gate and validation_status == "passed":

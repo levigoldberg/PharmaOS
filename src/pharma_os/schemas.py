@@ -618,6 +618,7 @@ class HumanReadableModuleOutput(StrictSchema):
     key_findings: tuple[HumanReadableFinding, ...] = Field(default_factory=tuple)
     handoff_summary: str = Field(..., min_length=1)
     limitations: tuple[str, ...] = Field(default_factory=tuple)
+    review_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.5, ge=0, le=1)
@@ -954,7 +955,6 @@ class ClinicalOutcomePredictionOutput(StrictSchema):
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
     human_readable_summary: HumanReadableModuleOutput | None = None
-    investment_report: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
     execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
@@ -1059,12 +1059,14 @@ class CommercialInputBundle(StrictSchema):
     """Compact evidence bundle supplied to the market-sizing interpretation agent."""
 
     asset_summary: dict[str, Any] = Field(default_factory=dict)
+    us_population_denominator: dict[str, Any] = Field(default_factory=dict)
     disease_population_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
     prevalence_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
     incidence_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
     segmentation_evidence: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
     trial_eligibility_criteria: dict[str, Any] = Field(default_factory=dict)
     pricing_benchmark: dict[str, Any] = Field(default_factory=dict)
+    market_query_diagnostics: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
     missing_inputs: tuple[str, ...] = Field(default_factory=tuple)
     user_overrides: dict[str, Any] = Field(default_factory=dict)
     predefined_archetype_assumptions: dict[str, Any] = Field(default_factory=dict)
@@ -1348,6 +1350,7 @@ class DueDiligenceOutput(StrictSchema):
     confidence_flags: tuple[ConfidenceFlag, ...] = Field(default_factory=tuple)
     human_gate: HumanGate | None = None
     human_readable_summary: HumanReadableModuleOutput | None = None
+    investment_report: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     validation_status: ValidationStatus = "not_run"
     execution_mode_summary: ExecutionModeSummary = Field(default_factory=ExecutionModeSummary)
@@ -1420,6 +1423,7 @@ class AnalogCandidateRecord(StrictSchema):
     candidate_id: str = Field(..., min_length=1)
     trial: ClinicalTrialRecord
     query_ids: tuple[str, ...] = Field(default_factory=tuple)
+    similarity_features: dict[str, Any] = Field(default_factory=dict)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     provenance: str = Field(..., min_length=1)
 
@@ -1452,6 +1456,43 @@ class AnalogTrialSelectionOutput(StrictSchema):
     target_nct_id: str = Field(..., min_length=1)
     selected_analogs: tuple[SelectedAnalogTrial, ...] = Field(default_factory=tuple)
     excluded_candidates: tuple[ExcludedAnalogTrial, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class FollowOnCandidateRecord(StrictSchema):
+    """A candidate follow-on trial for a selected analog development program."""
+
+    candidate_id: str = Field(..., min_length=1)
+    anchor_analog_nct_id: str = Field(..., min_length=1)
+    trial: ClinicalTrialRecord
+    lineage_features: dict[str, Any] = Field(default_factory=dict)
+    exclusion_reason: str | None = None
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    provenance: str = Field(..., min_length=1)
+
+
+class FollowOnTrialAdjudication(StrictSchema):
+    """Adjudication of same-asset/same-indication/same-sponsor follow-on candidates."""
+
+    anchor_analog_nct_id: str = Field(..., min_length=1)
+    status: Literal["clear_follow_on", "multiple_plausible_branches", "no_plausible_follow_on"]
+    selected_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
+    alternative_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
+    excluded_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
+    rationale: str = Field(..., min_length=1)
+    ambiguity_flags: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class FollowOnTrialAdjudicationOutput(StrictSchema):
+    """Follow-on adjudication subagent output across selected analogs."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    adjudications: tuple[FollowOnTrialAdjudication, ...] = Field(default_factory=tuple)
+    rationale_summary: str = Field(..., min_length=1)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.5, ge=0, le=1)
 
@@ -1564,6 +1605,51 @@ class BenchmarkInterpretation(StrictSchema):
     confidence: float = Field(default=0.5, ge=0, le=1)
 
 
+class QualitativeProtocolSynthesis(StrictSchema):
+    """Qualitative synthesis of recurring protocol patterns across actual follow-on trials."""
+
+    output_id: str = Field(..., min_length=1)
+    target_nct_id: str = Field(..., min_length=1)
+    study_role_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    target_population_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    study_design_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    comparator_control_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    primary_endpoint_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    secondary_endpoint_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    inclusion_criteria_themes: tuple[str, ...] = Field(default_factory=tuple)
+    exclusion_criteria_themes: tuple[str, ...] = Field(default_factory=tuple)
+    biomarker_requirement_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    prior_treatment_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    safety_monitoring_concepts: tuple[str, ...] = Field(default_factory=tuple)
+    assessment_schedule_concepts: tuple[str, ...] = Field(default_factory=tuple)
+    treatment_duration_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    follow_up_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    dominant_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    minority_patterns: tuple[str, ...] = Field(default_factory=tuple)
+    conflicting_precedent: tuple[str, ...] = Field(default_factory=tuple)
+    insufficient_evidence: tuple[str, ...] = Field(default_factory=tuple)
+    human_review_questions: tuple[str, ...] = Field(default_factory=tuple)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
+class AnalogDerivedDesignDecision(StrictSchema):
+    """One proposed protocol choice derived from observed follow-on precedent."""
+
+    decision_id: str = Field(..., min_length=1)
+    field_name: str = Field(..., min_length=1)
+    proposed_value: str = Field(..., min_length=1)
+    derivation_method: Literal["median", "frequency", "qualitative_consensus", "agent_adjudicated_precedent"]
+    supporting_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
+    observed_count: int = Field(default=0, ge=0)
+    total_eligible_follow_on_trials: int = Field(default=0, ge=0)
+    rationale: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+    confidence: float = Field(default=0.5, ge=0, le=1)
+    assumptions: tuple[AssumptionRecord, ...] = Field(default_factory=tuple)
+    missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)
+
+
 class ProtocolSectionAgentOutput(StrictSchema):
     """Typed output from a section-specific protocol strategy subagent."""
 
@@ -1584,6 +1670,10 @@ class ProtocolDesignBrief(StrictSchema):
     artifact_type: Literal["draft_protocol_design_brief"] = "draft_protocol_design_brief"
     requires_human_review: bool = True
     next_study_intent: NextStudyIntent
+    follow_on_trial_ids: tuple[str, ...] = Field(default_factory=tuple)
+    analog_lineage_mappings: tuple[FollowOnTrialAdjudication, ...] = Field(default_factory=tuple)
+    qualitative_synthesis: QualitativeProtocolSynthesis | None = None
+    design_decisions: tuple[AnalogDerivedDesignDecision, ...] = Field(default_factory=tuple)
     executive_synopsis: ProtocolSectionDraft
     strategic_rationale: ProtocolSectionDraft
     analog_trial_benchmark_summary: ProtocolSectionDraft
@@ -1617,7 +1707,13 @@ class ProtocolDesignOutput(StrictSchema):
     agent4_handoff: Agent4HandoffReference
     next_study_intent: NextStudyIntent
     analog_candidates: tuple[AnalogCandidateRecord, ...] = Field(default_factory=tuple)
+    analog_follow_on_candidates: tuple[FollowOnCandidateRecord, ...] = Field(default_factory=tuple)
+    follow_on_adjudications: tuple[FollowOnTrialAdjudication, ...] = Field(default_factory=tuple)
+    follow_on_trials: tuple[ClinicalTrialRecord, ...] = Field(default_factory=tuple)
     analog_benchmark_bundle: AnalogBenchmarkBundle
+    follow_on_benchmark_bundle: AnalogBenchmarkBundle | None = None
+    qualitative_protocol_synthesis: QualitativeProtocolSynthesis | None = None
+    analog_derived_design_decisions: tuple[AnalogDerivedDesignDecision, ...] = Field(default_factory=tuple)
     protocol_design_brief: ProtocolDesignBrief
     sources: tuple[SourceMetadata, ...] = Field(default_factory=tuple)
     claims: tuple[EvidenceClaim, ...] = Field(default_factory=tuple)

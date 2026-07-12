@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from pharma_os.control_tower import run_control_tower_agent, validate_execution_plan
 from pharma_os.execution_modes import primary_execution_mode, summarize_execution_modes
+from pharma_os.html_report import write_nct_report_if_persistent
 from pharma_os.memory import MemoryStore
 from pharma_os.registry import WorkflowRegistry
 from pharma_os.schemas import (
@@ -344,6 +345,7 @@ class Orchestrator:
             },
         )
         self.memory.save_validation_results(parent_run_id, tuple(validation_results))
+        write_nct_report_if_persistent(request.nct_id, memory=self.memory)
         return record
 
     def _run_registered_workflow(

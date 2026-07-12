@@ -1,5 +1,17 @@
 schema_version: "1.0"
 forecast_years: 6
+us_population_denominator:
+  total_us_population: 340110990
+  adult_population: 267181678
+  pediatric_population: 72929312
+  geography: United States
+  source_year: 2024
+  dataset: ACS 1-Year Subject Tables
+  source_id: census:acs1_subject:2024:us_population_config_fallback
+  source_url: https://api.census.gov/data/2024/acs/acs1/subject?get=NAME%2CS0101_C01_001E%2CS0101_C01_022E%2CS0101_C01_026E&for=us%3A1
+  source_type: config_fallback
+  human_review_required: true
+  rationale: Static fallback copied from the Panoptic Census ACS denominator so PharmaOS can convert prevalence evidence when live Census lookup is unavailable.
 price_sensitivity_multipliers:
   low: 0.8
   high: 1.2

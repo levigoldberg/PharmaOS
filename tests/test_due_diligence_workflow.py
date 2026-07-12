@@ -303,6 +303,8 @@ def test_due_diligence_workflow_persists_bundle(monkeypatch) -> None:
     assert output.human_readable_summary is not None
     assert output.human_readable_summary.module_name == "due_diligence"
     assert "Agent 5" in output.human_readable_summary.handoff_summary
+    assert output.investment_report
+    assert output.investment_report["investment_snapshot"]["drug"] == "Examplemab"
     assert bundle.sources
     assert bundle.claims
     assert bundle.validation_results
@@ -324,6 +326,7 @@ def test_due_diligence_workflow_persists_bundle(monkeypatch) -> None:
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in bundle.agent_traces)
     payload = json.loads(store._connection.execute("SELECT output_json FROM runs WHERE run_id = ?", (output.run_id,)).fetchone()["output_json"])
     assert payload["human_readable_summary"]["module_name"] == "due_diligence"
+    assert payload["investment_report"]["investment_snapshot"]["drug"] == "Examplemab"
     assert bundle.reports
 
 
@@ -457,6 +460,7 @@ def test_due_diligence_cli_persists_report(monkeypatch, tmp_path) -> None:
     assert payload["clinical_risk_summary"]["nct_id"] == "NCT12345678"
     assert payload["clinical_evidence"]["pubmed_article_count"] == 1
     assert payload["asset_memo"]["requires_human_review"] is True
+    assert payload["investment_report"]["investment_snapshot"]["drug"] == "Examplemab"
     report_path = tmp_path / "report.json"
     exit_code = main(["report", "--run-id", payload["run_id"], "--db-path", str(db_path), "--output-json", str(report_path)])
     assert exit_code == 0
