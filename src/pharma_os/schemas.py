@@ -19,6 +19,15 @@ GateDecision = Literal["approved", "rejected", "needs_human_review", "blocked"]
 WorkflowStatus = Literal["pending", "running", "completed", "failed", "blocked"]
 MetadataValue = str | int | float | bool | None | list[str] | list[int] | list[float] | list[bool]
 ExecutionMode = Literal["live_agent", "direct_llm", "deterministic_fallback", "reused_artifact"]
+BenchmarkEvidenceMode = Literal["follow_on", "direct_analog", "target_only", "none"]
+SupportSourceType = Literal[
+    "target_trial_supported",
+    "analog_majority_supported",
+    "follow_on_supported",
+    "minority_precedent",
+    "unresolved",
+    "human_decision_required",
+]
 
 
 class StrictSchema(BaseModel):
@@ -136,6 +145,7 @@ class ClinicalTrialIntelligenceInput(StrictSchema):
     disease: str = Field(..., min_length=1, description="Disease or indication to search.")
     drug: str | None = Field(default=None, description="Optional drug or intervention name.")
     target: str | None = Field(default=None, description="Optional biological target.")
+    sponsor: str | None = Field(default=None, description="Optional sponsor/collaborator search filter.")
     phase: str | None = Field(default=None, description="Optional trial phase filter.")
     limit: int = Field(default=10, ge=1, le=50, description="Maximum trials to retrieve.")
 
@@ -194,6 +204,7 @@ class ClinicalTrialRecord(StrictSchema):
     overall_status: str | None = None
     phases: tuple[str, ...] = Field(default_factory=tuple)
     study_type: str | None = None
+    primary_purpose: str | None = None
     allocation: str | None = None
     intervention_model: str | None = None
     masking: str | None = None
@@ -201,6 +212,7 @@ class ClinicalTrialRecord(StrictSchema):
     number_of_arms: int | None = Field(default=None, ge=0)
     conditions: tuple[str, ...] = Field(default_factory=tuple)
     interventions: tuple[TrialIntervention, ...] = Field(default_factory=tuple)
+    intervention_browse_terms: tuple[str, ...] = Field(default_factory=tuple)
     arm_groups: tuple[TrialArmGroup, ...] = Field(default_factory=tuple)
     lead_sponsor: TrialSponsor | None = None
     collaborators: tuple[TrialSponsor, ...] = Field(default_factory=tuple)
@@ -676,6 +688,7 @@ class AssetIdentityOutput(StrictSchema):
     rxnorm_match: RxNormMatch | None = None
     sponsor: str | None = None
     normalized_indication: str | None = None
+    secondary_indications: tuple[str, ...] = Field(default_factory=tuple)
     therapeutic_area: str | None = None
     modality: str | None = None
     rule_ids: tuple[str, ...] = Field(default_factory=tuple)
@@ -1467,6 +1480,14 @@ class ExcludedAnalogTrial(StrictSchema):
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
 
 
+class UnevaluableAnalogTrial(StrictSchema):
+    """Candidate analog that could not be adjudicated because required fields were missing."""
+
+    nct_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=1)
+    source_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
 class AnalogTrialSelectionOutput(StrictSchema):
     """Analog-selection subagent output."""
 
@@ -1474,6 +1495,7 @@ class AnalogTrialSelectionOutput(StrictSchema):
     target_nct_id: str = Field(..., min_length=1)
     selected_analogs: tuple[SelectedAnalogTrial, ...] = Field(default_factory=tuple)
     excluded_candidates: tuple[ExcludedAnalogTrial, ...] = Field(default_factory=tuple)
+    unevaluable_candidates: tuple[UnevaluableAnalogTrial, ...] = Field(default_factory=tuple)
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     confidence: float = Field(default=0.5, ge=0, le=1)
 
@@ -1494,7 +1516,13 @@ class FollowOnTrialAdjudication(StrictSchema):
     """Adjudication of same-asset/same-indication/same-sponsor follow-on candidates."""
 
     anchor_analog_nct_id: str = Field(..., min_length=1)
-    status: Literal["clear_follow_on", "multiple_plausible_branches", "no_plausible_follow_on"]
+    status: Literal[
+        "clear_follow_on",
+        "multiple_plausible_branches",
+        "no_plausible_follow_on",
+        "retrieval_failed",
+        "unevaluable",
+    ]
     selected_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
     alternative_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
     excluded_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
@@ -1543,12 +1571,18 @@ class AnalogBenchmarkBundle(StrictSchema):
 
     bundle_id: str = Field(..., min_length=1)
     target_nct_id: str = Field(..., min_length=1)
+    evidence_mode: BenchmarkEvidenceMode = "direct_analog"
     selected_analog_ids: tuple[str, ...] = Field(default_factory=tuple)
     excluded_analog_ids: tuple[str, ...] = Field(default_factory=tuple)
     search_plan: AnalogSearchPlanOutput
     selection: AnalogTrialSelectionOutput
     enrollment: BenchmarkNumericSummary
     planned_duration_months: BenchmarkNumericSummary
+    treatment_duration_weeks: BenchmarkNumericSummary = Field(default_factory=BenchmarkNumericSummary)
+    primary_endpoint_timing_weeks: BenchmarkNumericSummary = Field(default_factory=BenchmarkNumericSummary)
+    follow_up_duration_weeks: BenchmarkNumericSummary = Field(default_factory=BenchmarkNumericSummary)
+    enrollment_period_months: BenchmarkNumericSummary = Field(default_factory=BenchmarkNumericSummary)
+    total_study_execution_duration_months: BenchmarkNumericSummary = Field(default_factory=BenchmarkNumericSummary)
     randomized_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
     blinding_frequency: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
     arm_count_distribution: tuple[BenchmarkFrequency, ...] = Field(default_factory=tuple)
@@ -1658,7 +1692,9 @@ class AnalogDerivedDesignDecision(StrictSchema):
     field_name: str = Field(..., min_length=1)
     proposed_value: str = Field(..., min_length=1)
     derivation_method: Literal["median", "frequency", "qualitative_consensus", "agent_adjudicated_precedent"]
+    support_source_type: SupportSourceType = "unresolved"
     supporting_follow_on_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
+    supporting_analog_nct_ids: tuple[str, ...] = Field(default_factory=tuple)
     observed_count: int = Field(default=0, ge=0)
     total_eligible_follow_on_trials: int = Field(default=0, ge=0)
     rationale: str = Field(..., min_length=1)

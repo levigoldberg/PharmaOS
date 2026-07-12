@@ -476,7 +476,8 @@ def _cumulative_agent5_section(output: dict[str, Any]) -> str:
                         "selected_analogs": len(_list(benchmark.get("selected_analog_ids"))),
                         "follow_on_trials": len(_list(output.get("follow_on_trials"))),
                         "median_enrollment": _summary_value(benchmark.get("enrollment"), "median"),
-                        "median_duration": _summary_value(benchmark.get("planned_duration_months"), "median"),
+                        "median_primary_completion_interval": _summary_value(benchmark.get("planned_duration_months"), "median"),
+                        "benchmark_evidence_mode": benchmark.get("evidence_mode"),
                         "benchmark_confidence": _percent(benchmark.get("confidence")),
                     }
                 ),
@@ -667,7 +668,7 @@ def _protocol_benchmark_sentence(benchmark: dict[str, Any]) -> str:
     pieces = [
         f"Benchmarking is based on {selected_count} selected analog CT.gov trial{'s' if selected_count != 1 else ''}",
         f"median enrollment {enrollment}" if enrollment != "NA" else None,
-        f"median planned duration {duration}" if duration != "NA" else None,
+        f"median primary-completion interval {duration}" if duration != "NA" else None,
         f"comparator pattern {comparator}" if comparator else None,
     ]
     return _join_sentence_parts(pieces)
@@ -919,6 +920,12 @@ def _execution_mode_summary_section(bundle: Any) -> str:
 def _control_tower_report(output: dict[str, Any]) -> str:
     report = _dict(output.get("report"))
     request = _dict(output.get("request"))
+    if not request:
+        request = _dict(_dict(output.get("snapshot")).get("request"))
+    if not request:
+        request = _dict(_dict(output.get("final_snapshot")).get("request"))
+    if not request:
+        request = _dict(_dict(output.get("plan")).get("request"))
     plans = _list(output.get("plans") or ([output.get("plan")] if output.get("plan") else []))
     steps = _list(output.get("step_results"))
     replans = _list(output.get("replans"))
@@ -1436,7 +1443,8 @@ def _protocol_design_report(output: dict[str, Any]) -> str:
                     ("Follow-on Trials", len(_list(output.get("follow_on_trials"))), "Lineage-confirmed follow-on trials found for selected analogs."),
                     ("Benchmark Confidence", _percent(benchmark.get("confidence")), "Confidence after deterministic analog coverage checks."),
                     ("Median Enrollment", _summary_value(benchmark.get("enrollment"), "median"), "Selected analog participant median."),
-                    ("Median Duration", _summary_value(benchmark.get("planned_duration_months"), "median"), "Selected analog planned duration median."),
+                    ("Median Primary Completion Interval", _summary_value(benchmark.get("planned_duration_months"), "median"), "Selected analog start-to-primary-completion interval median."),
+                    ("Median Endpoint Timing", _summary_value(benchmark.get("primary_endpoint_timing_weeks"), "median"), "Selected analog primary endpoint timing median."),
                 ]
             ),
             _section("Next Study Intent", _next_study_intent_section(intent)),
@@ -2000,7 +2008,9 @@ def _analog_benchmark_section(benchmark: dict[str, Any]) -> str:
             _cards(
                 [
                     ("Enrollment", _numeric_summary_table(_dict(benchmark.get("enrollment")))),
-                    ("Planned Duration", _numeric_summary_table(_dict(benchmark.get("planned_duration_months")))),
+                    ("Primary Completion Interval", _numeric_summary_table(_dict(benchmark.get("planned_duration_months")))),
+                    ("Treatment Duration", _numeric_summary_table(_dict(benchmark.get("treatment_duration_weeks")))),
+                    ("Primary Endpoint Timing", _numeric_summary_table(_dict(benchmark.get("primary_endpoint_timing_weeks")))),
                     ("Site Count", _numeric_summary_table(_dict(benchmark.get("site_count")))),
                     ("Benchmark Limitations", _bullets(_list(benchmark.get("limitations")) or ["None emitted."])),
                 ]
@@ -2200,7 +2210,7 @@ def _table_section(title: str, rows: tuple[Any, ...], fields: tuple[str, ...]) -
 
 def _kv_table(values: dict[str, Any]) -> str:
     rows = "".join(
-        f"<tr><th>{escape(_label(key))}</th><td>{escape(_display(value))}</td></tr>"
+        f"<tr data-key='{escape(str(key))}'><th>{escape(_label(key))}</th><td>{escape(_display(value))}</td></tr>"
         for key, value in values.items()
     )
     return f"<table><tbody>{rows}</tbody></table>"

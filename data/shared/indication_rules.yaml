@@ -32,6 +32,18 @@ rules:
     terms: [Rheumatoid Arthritis]
     normalized_indication: rheumatoid arthritis
     therapeutic_area: immunology
+  - id: indication_atopic_dermatitis
+    terms: [Atopic Dermatitis, AD, Eczema]
+    normalized_indication: atopic dermatitis
+    therapeutic_area: immunology/dermatology
+  - id: indication_systemic_lupus_erythematosus
+    terms: [Systemic Lupus Erythematosus, SLE, Lupus]
+    normalized_indication: systemic lupus erythematosus
+    therapeutic_area: immunology
+  - id: indication_psoriasis
+    terms: [Psoriasis, Plaque Psoriasis, Psoriatic]
+    normalized_indication: psoriasis
+    therapeutic_area: immunology/dermatology
   - id: indication_type_2_diabetes
     terms: [Type 2 Diabetes, Diabetes Mellitus, Type 2]
     normalized_indication: type 2 diabetes mellitus

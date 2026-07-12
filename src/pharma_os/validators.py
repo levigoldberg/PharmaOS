@@ -17,6 +17,7 @@ from pharma_os.schemas import (
     ProtocolDesignOutput,
     ValidationResult,
 )
+from pharma_os.tools.clinical_semantics import comparable_modality, endpoint_family, same_indication
 
 
 HIGH_RISK_RE = re.compile(
@@ -542,7 +543,212 @@ def validate_protocol_design_constraints(
                 provenance="pharma_os.validators.validate_protocol_design_constraints",
             )
         )
+
+    results.extend(_protocol_design_semantic_results(run_id=run_id, output=output))
     return tuple(results)
+
+
+def _protocol_design_semantic_results(*, run_id: str, output: ProtocolDesignOutput) -> list[ValidationResult]:
+    results: list[ValidationResult] = []
+    results.append(_validate_candidate_disposition(run_id=run_id, output=output))
+    results.append(_validate_similarity_consistency(run_id=run_id, output=output))
+    results.append(_validate_endpoint_family_consistency(run_id=run_id, output=output))
+    results.append(_validate_zero_follow_on_semantics(run_id=run_id, output=output))
+    results.append(_validate_missing_flag_contradictions(run_id=run_id, output=output))
+    results.append(_validate_fractional_enrollment(run_id=run_id, output=output))
+    results.append(_validate_duration_label_semantics(run_id=run_id, output=output))
+    results.append(_validate_support_source_consistency(run_id=run_id, output=output))
+    return results
+
+
+def _validate_candidate_disposition(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    candidate_ids = [candidate.trial.nct_id for candidate in output.analog_candidates]
+    selection = output.analog_benchmark_bundle.selection
+    dispositions = [
+        *(item.nct_id for item in selection.selected_analogs),
+        *(item.nct_id for item in selection.excluded_candidates),
+        *(item.nct_id for item in selection.unevaluable_candidates),
+    ]
+    missing = sorted(set(candidate_ids) - set(dispositions))
+    duplicate = sorted(nct_id for nct_id in set(dispositions) if dispositions.count(nct_id) > 1)
+    unknown = sorted(set(dispositions) - set(candidate_ids))
+    status = "failed" if missing or duplicate or unknown else "passed"
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-candidate-disposition",
+        target_id=output.output_id,
+        status=status,
+        validator="protocol_design_candidate_disposition",
+        message=(
+            f"Analog candidate disposition gaps: missing={missing}; duplicate={duplicate}; unknown={unknown}."
+            if status == "failed"
+            else "Every retrieved analog candidate has exactly one selected, excluded, or unevaluable disposition."
+        ),
+        confidence=1.0,
+        gate_reason="Every retrieved analog candidate must have exactly one disposition." if status == "failed" else None,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_similarity_consistency(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    indication_mismatches = []
+    modality_mismatches = []
+    for candidate in output.analog_candidates:
+        features = candidate.similarity_features or {}
+        if same_indication(output.target_trial.conditions, candidate.trial.conditions) and features.get("same_indication") is False:
+            indication_mismatches.append(candidate.trial.nct_id)
+        if comparable_modality(output.target_trial, candidate.trial) is True and features.get("same_modality") is False:
+            modality_mismatches.append(candidate.trial.nct_id)
+    findings = []
+    if indication_mismatches:
+        findings.append(f"same-indication false despite normalized match: {', '.join(indication_mismatches[:8])}")
+    if modality_mismatches:
+        findings.append(f"same-modality false despite normalized active route/modality match: {', '.join(modality_mismatches[:8])}")
+    status = "warning" if findings else "passed"
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-similarity-semantics",
+        target_id=output.output_id,
+        status=status,
+        validator="protocol_design_similarity_semantics",
+        message="; ".join(findings) if findings else "Indication and modality similarity features are semantically consistent.",
+        confidence=0.95,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_endpoint_family_consistency(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    bad = []
+    trials = (output.target_trial, *(candidate.trial for candidate in output.analog_candidates), *output.follow_on_trials)
+    for trial in trials:
+        for endpoint in (*trial.primary_endpoints, *trial.secondary_endpoints):
+            text = " ".join(item for item in (endpoint.measure, endpoint.description, endpoint.time_frame) if item).casefold()
+            family = endpoint_family(endpoint.measure, endpoint.description, endpoint.time_frame)
+            if any(term in text for term in ("pasi", "pga", "iga", "dlqi")) and family in {"safety", "other"}:
+                bad.append(f"{trial.nct_id}:{endpoint.measure}")
+    status = "warning" if bad else "passed"
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-endpoint-family-semantics",
+        target_id=output.output_id,
+        status=status,
+        validator="protocol_design_endpoint_family_semantics",
+        message=f"Endpoint-family misclassifications detected: {'; '.join(bad[:8])}" if bad else "Endpoint families are semantically classified for PASI/PGA/IGA/DLQI endpoints.",
+        confidence=0.95,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_zero_follow_on_semantics(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    text = " ".join(_string_values(output.protocol_design_brief.model_dump(mode="json"))).casefold()
+    decisions = output.analog_derived_design_decisions
+    contradiction = not output.follow_on_trials and (
+        "observed follow-on" in text
+        or "selected follow-on trial" in text
+        or any(decision.support_source_type == "follow_on_supported" for decision in decisions)
+    )
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-zero-follow-on-semantics",
+        target_id=output.output_id,
+        status="failed" if contradiction else "passed",
+        validator="protocol_design_zero_follow_on_semantics",
+        message=(
+            "Output claims follow-on-supported precedent despite zero selected follow-on trials."
+            if contradiction
+            else "Zero-follow-on outputs do not claim observed follow-on precedent."
+        ),
+        confidence=1.0,
+        gate_reason="Follow-on-supported language requires selected follow-on trials." if contradiction else None,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_missing_flag_contradictions(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    eligibility = output.target_trial.eligibility_criteria or ""
+    eligibility_lower = eligibility.casefold()
+    full_text = len(eligibility) >= 1000 and "inclusion" in eligibility_lower and "exclusion" in eligibility_lower
+    contradicted = [
+        flag.flag_id
+        for flag in output.missing_data_flags
+        if full_text
+        and "eligibility" in f"{flag.flag_id} {flag.field} {flag.reason}".casefold()
+        and "truncat" in f"{flag.flag_id} {flag.reason}".casefold()
+    ]
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-missing-flag-semantics",
+        target_id=output.output_id,
+        status="warning" if contradicted else "passed",
+        validator="protocol_design_missing_flag_semantics",
+        message=f"Contradicted eligibility missing-data flags remain: {', '.join(contradicted)}" if contradicted else "Missing-data flags do not contradict full target eligibility text.",
+        confidence=0.95,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_fractional_enrollment(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    text = " ".join(_string_values(output.protocol_design_brief.model_dump(mode="json"))).casefold()
+    bad = re.findall(r"\b\d+\.\d+\s+(?:participants|patients|subjects)\b", text)
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-fractional-enrollment",
+        target_id=output.output_id,
+        status="failed" if bad else "passed",
+        validator="protocol_design_fractional_enrollment",
+        message=f"Fractional enrollment recommendation detected: {', '.join(sorted(set(bad)))}" if bad else "Enrollment recommendations use whole participants or nonnumeric review language.",
+        confidence=1.0,
+        gate_reason="Participant counts must not be fractional." if bad else None,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_duration_label_semantics(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    text = " ".join(_string_values(output.protocol_design_brief.model_dump(mode="json"))).casefold()
+    bad = bool(re.search(r"treatment duration[^.]{0,120}start-to-primary-completion|start-to-primary-completion[^.]{0,120}treatment duration", text))
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-duration-labels",
+        target_id=output.output_id,
+        status="warning" if bad else "passed",
+        validator="protocol_design_duration_label_semantics",
+        message=(
+            "Brief may conflate treatment duration with start-to-primary-completion interval."
+            if bad
+            else "Duration language separates treatment duration from execution/primary-completion intervals."
+        ),
+        confidence=0.9,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _validate_support_source_consistency(*, run_id: str, output: ProtocolDesignOutput) -> ValidationResult:
+    bad = []
+    for decision in output.analog_derived_design_decisions:
+        if decision.support_source_type == "follow_on_supported" and not decision.supporting_follow_on_nct_ids:
+            bad.append(decision.decision_id)
+        if decision.support_source_type == "analog_majority_supported" and not decision.supporting_analog_nct_ids:
+            bad.append(decision.decision_id)
+    status = "failed" if bad else "passed"
+    return ValidationResult(
+        validation_id=f"validation-{run_id}-protocol-design-support-source-consistency",
+        target_id=output.output_id,
+        status=status,
+        validator="protocol_design_support_source_consistency",
+        message=f"Support-source labels lack matching supporting IDs: {', '.join(bad)}" if bad else "Support-source labels are consistent with supporting trial IDs.",
+        confidence=1.0,
+        gate_reason="Support-source labels must match available evidence." if bad else None,
+        provenance="pharma_os.validators.validate_protocol_design_constraints",
+    )
+
+
+def _string_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        values: list[str] = []
+        for item in value.values():
+            values.extend(_string_values(item))
+        return values
+    if isinstance(value, (list, tuple)):
+        values = []
+        for item in value:
+            values.extend(_string_values(item))
+        return values
+    return []
 
 
 def assign_human_gate(

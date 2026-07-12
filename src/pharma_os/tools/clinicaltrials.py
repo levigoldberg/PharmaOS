@@ -117,6 +117,8 @@ def _search_params(input_data: ClinicalTrialIntelligenceInput) -> dict[str, str]
     }
     if input_data.drug:
         params["query.intr"] = input_data.drug
+    if input_data.sponsor:
+        params["query.spons"] = input_data.sponsor
     if query_term:
         params["query.term"] = query_term
     return params
@@ -135,11 +137,16 @@ def _normalize_study(payload: dict[str, Any]) -> ClinicalTrialRecord:
     outcomes_module = protocol.get("outcomesModule") or {}
     eligibility_module = protocol.get("eligibilityModule") or {}
     contacts_locations_module = protocol.get("contactsLocationsModule") or {}
+    derived = payload.get("derivedSection") or {}
+    intervention_browse_module = derived.get("interventionBrowseModule") or {}
     nct_id = identification.get("nctId")
     if not isinstance(nct_id, str):
         raise ClinicalTrialsGovError("ClinicalTrials.gov response is missing nctId")
     normalized_nct = ClinicalTrialsGovClient.normalize_nct_id(nct_id)
+    design_info = design.get("designInfo") or {}
     enrollment = design.get("enrollmentInfo") or {}
+    arm_groups = tuple(_arm_group(item) for item in arms_module.get("armGroups") or ())
+    structured_arm_count = _int(design.get("numberOfArms"))
     return ClinicalTrialRecord(
         nct_id=normalized_nct,
         brief_title=identification.get("briefTitle"),
@@ -147,14 +154,16 @@ def _normalize_study(payload: dict[str, Any]) -> ClinicalTrialRecord:
         overall_status=status.get("overallStatus"),
         phases=tuple(str(value) for value in design.get("phases") or ()),
         study_type=design.get("studyType"),
-        allocation=design.get("allocation"),
-        intervention_model=design.get("interventionModel"),
-        masking=_masking_value(design),
-        observational_model=design.get("observationalModel"),
-        number_of_arms=_int(design.get("numberOfArms")),
+        primary_purpose=design_info.get("primaryPurpose") or design.get("primaryPurpose"),
+        allocation=design_info.get("allocation") or design.get("allocation"),
+        intervention_model=design_info.get("interventionModel") or design.get("interventionModel"),
+        masking=_masking_value(design_info) or _masking_value(design),
+        observational_model=design_info.get("observationalModel") or design.get("observationalModel"),
+        number_of_arms=structured_arm_count if structured_arm_count is not None else (len(arm_groups) if arm_groups else None),
         conditions=tuple(str(value) for value in conditions_module.get("conditions") or ()),
         interventions=tuple(_intervention(item) for item in arms_module.get("interventions") or ()),
-        arm_groups=tuple(_arm_group(item) for item in arms_module.get("armGroups") or ()),
+        intervention_browse_terms=_intervention_browse_terms(intervention_browse_module),
+        arm_groups=arm_groups,
         lead_sponsor=_sponsor(sponsor_module.get("leadSponsor")),
         collaborators=tuple(
             sponsor
@@ -226,6 +235,15 @@ def _masking_value(design: dict[str, Any]) -> str | None:
             return str(masking)
     masking = design.get("masking")
     return str(masking) if masking else None
+
+
+def _intervention_browse_terms(module: dict[str, Any]) -> tuple[str, ...]:
+    terms: list[str] = []
+    for group_name in ("meshes", "ancestors"):
+        for item in module.get(group_name) or ():
+            if isinstance(item, dict) and item.get("term"):
+                terms.append(str(item["term"]))
+    return tuple(dict.fromkeys(terms))
 
 
 def _sponsor(item: dict[str, Any] | None) -> TrialSponsor | None:

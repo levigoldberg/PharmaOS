@@ -7,6 +7,7 @@ from typing import Any
 
 from pharma_os.schemas import AssetIdentityOutput, ClinicalTrialRecord, MissingDataFlag, SourceMetadata
 from pharma_os.tools._due_diligence_common import missing
+from pharma_os.tools.clinical_semantics import active_interventions, title_code_aliases
 from pharma_os.tools.rxnorm import RxNormClient, RxNormError
 from pharma_os.tools.rules import human_override, load_rule_config
 
@@ -35,11 +36,7 @@ def resolve_asset_identity(
     ]
     flags: list[MissingDataFlag] = []
     overrides = human_override(trial.nct_id)
-    candidates = [
-        item
-        for item in trial.interventions
-        if (item.type or "").upper() in {"DRUG", "BIOLOGICAL", "GENETIC"} and "placebo" not in item.name.casefold()
-    ]
+    candidates = list(active_interventions(trial))
     if not candidates:
         candidates = [item for item in trial.interventions if "placebo" not in item.name.casefold()]
     selected = candidates[0] if candidates else None
@@ -89,10 +86,15 @@ def resolve_asset_identity(
         dict.fromkeys(
             [
                 *(selected.other_names if selected else ()),
-                *_title_code_aliases(trial),
+                *title_code_aliases(trial),
                 *(rxnorm_match.aliases if rxnorm_match else ()),
             ]
         )
+    )
+    secondary_indications = tuple(
+        item
+        for item in _secondary_indications(trial)
+        if indication is None or item.casefold() != indication.casefold()
     )
     confidence = 0.85 - min(len(flags), 4) * 0.15
     return (
@@ -105,6 +107,7 @@ def resolve_asset_identity(
             rxnorm_match=rxnorm_match,
             sponsor=sponsor,
             normalized_indication=indication,
+            secondary_indications=secondary_indications,
             therapeutic_area=therapeutic_area,
             modality=modality,
             rule_ids=tuple(item for item in (modality_rule, indication_rule, sponsor_rule) if item),
@@ -126,29 +129,54 @@ def _infer_modality(selected: Any) -> tuple[str, str | None]:
     return str(config.get("default", "unknown")), None
 
 
-def _title_code_aliases(trial: ClinicalTrialRecord) -> tuple[str, ...]:
-    """Extract asset-like development codes from CT.gov titles."""
-
-    text = " ".join(item for item in (trial.brief_title, trial.official_title) if item)
-    aliases = []
-    for match in re.finditer(r"\b[A-Z]{2,}[A-Z0-9]*-\d+[A-Z0-9]*\b", text):
-        alias = match.group(0)
-        if alias.casefold() != "placebo":
-            aliases.append(alias)
-    return tuple(dict.fromkeys(aliases))
-
-
 def _infer_indication(trial: ClinicalTrialRecord) -> tuple[str | None, str | None, str | None]:
-    text = " | ".join([*trial.conditions, trial.brief_title or "", trial.official_title or ""]).casefold()
+    condition_match = _match_indication_text(" | ".join(trial.conditions))
+    if condition_match is not None:
+        return condition_match
+    title_match = _match_indication_text(" | ".join([trial.brief_title or "", trial.official_title or ""]))
+    if title_match is not None:
+        return title_match
+    if len(trial.conditions) == 1:
+        return trial.conditions[0], None, None
+    return None, None, None
+
+
+def _match_indication_text(text: str) -> tuple[str | None, str | None, str | None] | None:
+    text = text.casefold()
+    if not text.strip():
+        return None
     for rule in load_rule_config("indication_rules.yaml").get("rules", []):
         all_terms = [str(term).casefold() for term in rule.get("all_terms", [])]
         terms = [str(term).casefold() for term in rule.get("terms", [])]
-        if (all_terms and all(term in text for term in all_terms)) or any(term in text for term in terms):
+        if (all_terms and all(_term_matches(text, term) for term in all_terms)) or any(_term_matches(text, term) for term in terms):
             return (
                 str(rule.get("normalized_indication")),
                 str(rule.get("therapeutic_area")),
                 str(rule.get("id") or "indication_rule"),
             )
-    if len(trial.conditions) == 1:
-        return trial.conditions[0], None, None
-    return None, None, None
+    return None
+
+
+def _secondary_indications(trial: ClinicalTrialRecord) -> tuple[str, ...]:
+    matches: list[str] = []
+    for text in (
+        " | ".join([trial.brief_title or "", trial.official_title or ""]),
+        " | ".join(trial.conditions),
+    ):
+        lowered = text.casefold()
+        if not lowered.strip():
+            continue
+        for rule in load_rule_config("indication_rules.yaml").get("rules", []):
+            all_terms = [str(term).casefold() for term in rule.get("all_terms", [])]
+            terms = [str(term).casefold() for term in rule.get("terms", [])]
+            if (all_terms and all(_term_matches(lowered, term) for term in all_terms)) or any(_term_matches(lowered, term) for term in terms):
+                value = rule.get("normalized_indication")
+                if value:
+                    matches.append(str(value))
+    return tuple(dict.fromkeys(matches))
+
+
+def _term_matches(text: str, term: str) -> bool:
+    if len(term) <= 3 or re.fullmatch(r"[a-z0-9-]+", term):
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text))
+    return term in text

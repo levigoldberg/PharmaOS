@@ -34,21 +34,27 @@ from pharma_os.schemas import (
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
     ClinicalRiskSummary,
+    ClinicalTrialRecord,
+    CommercialModelOutput,
     DueDiligenceInput,
     DueDiligenceOutput,
     EvidenceClaim,
+    MissingDataFlag,
+    PricingOutput,
     SourceMetadata,
     WorkflowRun,
 )
 from pharma_os.workflows.clinical_outcome_prediction import run_clinical_outcome_prediction_workflow
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovClient
 from pharma_os.tools.asset_identity import resolve_asset_identity
-from pharma_os.tools.commercial_model import build_commercial_model_with_trace
+from pharma_os.tools.commercial_model import CommercialModelRunResult, build_commercial_model_with_trace
 from pharma_os.tools.patents_lens import search_patent_exclusivity
 from pharma_os.tools.pos import lookup_pos
 from pharma_os.tools.pricing import lookup_pricing
 from pharma_os.tools.rnpv import build_rnpv
-from pharma_os.tools.rules import config_source
+from pharma_os.tools._due_diligence_common import missing
+from pharma_os.tools.clinical_semantics import same_indication
+from pharma_os.tools.rules import config_source, human_override
 from pharma_os.validators import (
     aggregate_validation_status,
     assign_human_gate,
@@ -82,7 +88,7 @@ def run_due_diligence_workflow(
 
     agent3_output, handoff = _get_or_run_agent3(input_data, memory=store)
     clinical_risk_summary = _clinical_risk_summary(agent3_output)
-    trial = ClinicalTrialsGovClient().fetch_trial(input_data.nct_id)
+    trial = _canonicalize_trial_design_fields(ClinicalTrialsGovClient().fetch_trial(input_data.nct_id))
     asset_identity, identity_sources = resolve_asset_identity(trial)
     clinical_evidence, clinical_evidence_sources, clinical_evidence_claims = build_clinical_evidence_summary(
         run_id=run_id,
@@ -101,20 +107,27 @@ def run_due_diligence_workflow(
         asset_identity,
         workbook_path=input_data.pos_workbook_path,
     )
-    pricing, pricing_sources = lookup_pricing(
-        asset_identity,
-        wac_data_path=input_data.wac_data_path,
-    )
-    commercial_result = build_commercial_model_with_trace(
-        annual_patients=input_data.annual_patients,
-        peak_penetration=input_data.peak_penetration,
-        gross_to_net=input_data.gross_to_net,
-        pricing=pricing,
-        trial=trial,
-        asset=asset_identity,
-        clinical_evidence=clinical_evidence,
-        run_id=run_id,
-    )
+    commercial_indication_flag = _commercial_indication_conflict_flag(trial, asset_identity)
+    if commercial_indication_flag is None:
+        pricing, pricing_sources = lookup_pricing(
+            asset_identity,
+            wac_data_path=input_data.wac_data_path,
+        )
+        commercial_result = build_commercial_model_with_trace(
+            annual_patients=input_data.annual_patients,
+            peak_penetration=input_data.peak_penetration,
+            gross_to_net=input_data.gross_to_net,
+            pricing=pricing,
+            trial=trial,
+            asset=asset_identity,
+            clinical_evidence=clinical_evidence,
+            run_id=run_id,
+        )
+    else:
+        pricing, pricing_sources, commercial_result = _blocked_commercial_outputs(
+            flag=commercial_indication_flag,
+            asset=asset_identity,
+        )
     commercial_model = commercial_result.output
     rnpv = build_rnpv(
         commercial=commercial_model,
@@ -148,7 +161,17 @@ def run_due_diligence_workflow(
         *config_sources,
         user_source,
     ))
-    missing_data_flags = (
+    clinical_risk_summary = _reconcile_model_missing_flags(trial, clinical_risk_summary)
+    clinical_evidence = _reconcile_model_missing_flags(trial, clinical_evidence)
+    competitive_landscape = _reconcile_model_missing_flags(trial, competitive_landscape)
+    safety_label_summary = _reconcile_model_missing_flags(trial, safety_label_summary)
+    patent_exclusivity = _reconcile_model_missing_flags(trial, patent_exclusivity)
+    patent_loe_review = _reconcile_model_missing_flags(trial, patent_loe_review)
+    pos = _reconcile_model_missing_flags(trial, pos)
+    pricing = _reconcile_model_missing_flags(trial, pricing)
+    commercial_model = _reconcile_model_missing_flags(trial, commercial_model)
+    rnpv = _reconcile_model_missing_flags(trial, rnpv)
+    missing_data_flags = reconcile_due_diligence_missing_data_flags(trial, (
         *asset_identity.missing_data_flags,
         *clinical_risk_summary.missing_data_flags,
         *clinical_evidence.missing_data_flags,
@@ -159,7 +182,7 @@ def run_due_diligence_workflow(
         *pricing.missing_data_flags,
         *commercial_model.missing_data_flags,
         *rnpv.missing_data_flags,
-    )
+    ))
     assumptions = tuple(
         assumption.model_copy(update={"source_ids": (user_source.source_id,)})
         if not assumption.source_ids and (assumption.provenance.startswith("cli.") or "override" in assumption.provenance.casefold())
@@ -441,6 +464,116 @@ def run_due_diligence_workflow(
     build_report(run_id, memory=store)
     write_nct_report_if_persistent(input_data.nct_id, memory=store)
     return output
+
+
+def _canonicalize_trial_design_fields(trial: ClinicalTrialRecord) -> ClinicalTrialRecord:
+    """Fill only registry-obvious design facts used to suppress contradictory flags."""
+
+    updates: dict[str, object] = {}
+    title_text = " ".join(item for item in (trial.brief_title, trial.official_title) if item).casefold()
+    if trial.number_of_arms is None and trial.arm_groups:
+        updates["number_of_arms"] = len(trial.arm_groups)
+    if trial.allocation is None and any(term in title_text for term in ("randomized", "randomised")):
+        updates["allocation"] = "RANDOMIZED"
+    if trial.masking is None:
+        if any(term in title_text for term in ("quadruple-blind", "quadruple blind")):
+            updates["masking"] = "QUADRUPLE"
+        elif any(term in title_text for term in ("triple-blind", "triple blind")):
+            updates["masking"] = "TRIPLE"
+        elif any(term in title_text for term in ("double-blind", "double blind")):
+            updates["masking"] = "DOUBLE"
+        elif any(term in title_text for term in ("single-blind", "single blind")):
+            updates["masking"] = "SINGLE"
+        elif "open-label" in title_text or "open label" in title_text:
+            updates["masking"] = "NONE"
+    return trial.model_copy(update=updates) if updates else trial
+
+
+def _commercial_indication_conflict_flag(
+    trial: ClinicalTrialRecord,
+    asset: object,
+) -> MissingDataFlag | None:
+    """Block commercial outputs when asset indication conflicts with the current trial."""
+
+    indication_override = human_override(trial.nct_id).get("indication")
+    asset_indication = getattr(asset, "normalized_indication", None)
+    if indication_override or not trial.conditions or not asset_indication:
+        return None
+    if same_indication(trial.conditions, (str(asset_indication),)):
+        return None
+    return missing(
+        "commercial-indication-mismatch-block",
+        "commercial_model",
+        "normalized_indication",
+        "Commercial pricing, market sizing, peak sales, and rNPV are blocked because target trial "
+        f"conditions ({', '.join(trial.conditions)}) conflict with asset_identity.normalized_indication "
+        f"({asset_indication}); current trial conditions are canonical unless a reviewed human override is supplied.",
+        "high",
+    )
+
+
+def _blocked_commercial_outputs(
+    *,
+    flag: MissingDataFlag,
+    asset: object,
+) -> tuple[PricingOutput, tuple[SourceMetadata, ...], CommercialModelRunResult]:
+    source_ids = tuple(getattr(asset, "source_ids", ()) or ())
+    pricing = PricingOutput(
+        source_ids=source_ids,
+        missing_data_flags=(flag,),
+        confidence=0.0,
+    )
+    commercial_model = CommercialModelOutput(
+        calculable=False,
+        source_ids=source_ids,
+        missing_data_flags=(flag,),
+        confidence=0.0,
+    )
+    return pricing, (), CommercialModelRunResult(output=commercial_model)
+
+
+def _reconcile_model_missing_flags(target_trial: ClinicalTrialRecord, model: object) -> object:
+    flags = getattr(model, "missing_data_flags", None)
+    if flags is None or not hasattr(model, "model_copy"):
+        return model
+    reconciled = reconcile_due_diligence_missing_data_flags(target_trial, tuple(flags))
+    return model.model_copy(update={"missing_data_flags": reconciled}) if reconciled != flags else model
+
+
+def reconcile_due_diligence_missing_data_flags(
+    target_trial: ClinicalTrialRecord,
+    flags: tuple[MissingDataFlag, ...],
+) -> tuple[MissingDataFlag, ...]:
+    """Remove narrow missing-data claims contradicted by the canonical trial record."""
+
+    target_trial = _canonicalize_trial_design_fields(target_trial)
+    eligibility_present = bool((target_trial.eligibility_criteria or "").strip())
+    allocation_present = bool(target_trial.allocation)
+    masking_present = bool(target_trial.masking)
+    arms_count_present = target_trial.number_of_arms is not None or bool(target_trial.arm_groups)
+    reconciled: list[MissingDataFlag] = []
+    for flag in flags:
+        text = f"{flag.flag_id} {flag.section} {flag.field} {flag.reason}".casefold()
+        if eligibility_present and _is_contradicted_eligibility_flag(text):
+            continue
+        if allocation_present and "allocation" in text and _claims_missing_or_compacted(text):
+            continue
+        if masking_present and ("masking" in text or "blinding" in text) and _claims_missing_or_compacted(text):
+            continue
+        if arms_count_present and "arm" in text and ("count" in text or "number_of_arms" in text or "arms_count" in text) and _claims_missing_or_compacted(text):
+            continue
+        reconciled.append(flag)
+    return _dedupe_missing_flags(tuple(reconciled))  # type: ignore[return-value]
+
+
+def _is_contradicted_eligibility_flag(text: str) -> bool:
+    if "eligibility" not in text and "exclusion" not in text:
+        return False
+    return any(term in text for term in ("truncat", "omit", "context-compact", "context compact", "missing"))
+
+
+def _claims_missing_or_compacted(text: str) -> bool:
+    return any(term in text for term in ("missing", "null", "omit", "inconsisten", "context-compact", "context compact"))
 
 
 def _claims(

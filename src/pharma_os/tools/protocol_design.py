@@ -21,6 +21,7 @@ from pharma_os.schemas import (
     ClinicalTrialsSearchResult,
     DueDiligenceOutput,
     EvidenceClaim,
+    ExcludedAnalogTrial,
     FollowOnCandidateRecord,
     FollowOnTrialAdjudication,
     FollowOnTrialAdjudicationOutput,
@@ -32,8 +33,24 @@ from pharma_os.schemas import (
     ProtocolSectionDraft,
     SelectedAnalogTrial,
     SourceMetadata,
+    UnevaluableAnalogTrial,
 )
 from pharma_os.tools._due_diligence_common import missing, slug
+from pharma_os.tools.clinical_semantics import (
+    active_intervention_text,
+    asset_aliases as semantic_asset_aliases,
+    asset_matches as semantic_asset_matches,
+    comparable_modality,
+    condition_variants as semantic_condition_variants,
+    endpoint_family as semantic_endpoint_family,
+    endpoint_family_from_trial as semantic_endpoint_family_from_trial,
+    expanded_asset_aliases as semantic_expanded_asset_aliases,
+    normalized_sponsor_names,
+    route_set,
+    same_endpoint_domain,
+    same_indication as semantic_same_indication,
+    strip_dose_suffix as semantic_strip_dose_suffix,
+)
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovClient, ClinicalTrialsGovError
 
 
@@ -205,6 +222,152 @@ def annotate_analog_similarity_features(
     )
 
 
+def score_current_trial_candidate(
+    target_trial: ClinicalTrialRecord,
+    candidate: AnalogCandidateRecord,
+) -> tuple[SelectedAnalogTrial, AnalogCandidateRecord]:
+    """Score a candidate against the current target trial using normalized semantics."""
+
+    trial = candidate.trial
+    features = candidate.similarity_features or _similarity_features(target_trial, trial)
+    matched: list[str] = []
+    mismatched: list[str] = []
+    unknown: list[str] = []
+    weights = {
+        "same_indication": 0.28,
+        "same_clinical_endpoint_domain": 0.16,
+        "same_endpoint_family": 0.12,
+        "same_comparator_structure": 0.1,
+        "same_modality": 0.1,
+        "same_or_comparable_phase": 0.08,
+        "randomized_placebo_controlled": 0.07,
+        "similar_population": 0.04,
+        "similar_biomarker_or_line": 0.03,
+        "target_or_moa_overlap": 0.02,
+    }
+    score = 0.0
+    for key, weight in weights.items():
+        value = features.get(key)
+        if value is True:
+            matched.append(key)
+            score += weight
+        elif value is False:
+            mismatched.append(key)
+        else:
+            unknown.append(key)
+    if features.get("primary_endpoint_is_pk_or_safety") is True:
+        mismatched.append("primary_endpoint_is_pk_or_safety")
+        score -= 0.12
+    if features.get("wrong_active_route") is True:
+        mismatched.append("wrong_active_route")
+        score -= 0.08
+    score = max(0.0, min(1.0, score))
+    confidence = "high" if score >= 0.7 else "medium" if score >= 0.45 else "low"
+    return (
+        SelectedAnalogTrial(
+            nct_id=trial.nct_id,
+            match_score=round(score, 3),
+            match_confidence=confidence,
+            matched_dimensions=tuple(dict.fromkeys(matched)),
+            mismatched_dimensions=tuple(dict.fromkeys(mismatched)),
+            unknown_dimensions=tuple(dict.fromkeys(unknown)),
+            reasoning="Selected by deterministic semantic similarity repair over indication, modality, endpoint family, design, comparator, and population.",
+            source_ids=candidate.source_ids,
+        ),
+        candidate,
+    )
+
+
+def normalize_analog_selection_output(
+    *,
+    run_id: str,
+    target_trial: ClinicalTrialRecord,
+    selection: AnalogTrialSelectionOutput,
+    candidates: tuple[AnalogCandidateRecord, ...],
+    top_k: int,
+) -> AnalogTrialSelectionOutput:
+    """Repair live/fallback selection so every retrieved candidate has one disposition."""
+
+    candidate_by_id = {candidate.trial.nct_id: candidate for candidate in candidates}
+    scored = [
+        score_current_trial_candidate(target_trial, candidate)
+        for candidate in candidates
+        if candidate.trial.nct_id != target_trial.nct_id
+    ]
+    scored.sort(key=lambda item: (-item[0].match_score, item[0].nct_id))
+    selected_rows = tuple(row for row in scored[:top_k] if row[0].match_score >= 0.35)
+    selected_by_id = {row[0].nct_id: row[0] for row in selected_rows}
+    if not selected_by_id:
+        for selected in selection.selected_analogs:
+            if selected.nct_id in candidate_by_id and selected.nct_id != target_trial.nct_id:
+                selected_by_id[selected.nct_id] = selected
+    selected_ids = set(selected_by_id)
+    live_exclusions = {
+        item.nct_id: item
+        for item in selection.excluded_candidates
+        if item.nct_id in candidate_by_id and item.nct_id not in selected_ids
+    }
+    unevaluable: list[UnevaluableAnalogTrial] = []
+    excluded: list[ExcludedAnalogTrial] = []
+    score_by_id = {row[0].nct_id: row[0] for row in scored}
+    for candidate in candidates:
+        nct_id = candidate.trial.nct_id
+        if nct_id in selected_ids:
+            continue
+        if nct_id == target_trial.nct_id:
+            excluded.append(
+                ExcludedAnalogTrial(
+                    nct_id=nct_id,
+                    reason="Target trial was retrieved and excluded from analog benchmarking.",
+                    source_ids=candidate.source_ids,
+                )
+            )
+            continue
+        if _candidate_unevaluable_reason(candidate.trial):
+            unevaluable.append(
+                UnevaluableAnalogTrial(
+                    nct_id=nct_id,
+                    reason=_candidate_unevaluable_reason(candidate.trial) or "Candidate lacked required structured fields for semantic analog adjudication.",
+                    source_ids=candidate.source_ids,
+                )
+            )
+            continue
+        if nct_id in live_exclusions:
+            excluded.append(live_exclusions[nct_id])
+            continue
+        score = score_by_id.get(nct_id)
+        reason = (
+            "Candidate ranked below the deterministic top-k analog cutoff after semantic normalization."
+            if score and score.match_score >= 0.35
+            else "Candidate did not meet the deterministic semantic similarity threshold after normalization."
+        )
+        excluded.append(
+            ExcludedAnalogTrial(
+                nct_id=nct_id,
+                reason=reason,
+                source_ids=candidate.source_ids,
+            )
+        )
+    selected = tuple(selected_by_id[nct_id] for nct_id in selected_by_id)
+    return selection.model_copy(
+        update={
+            "output_id": selection.output_id or f"analog-selection-{run_id}",
+            "selected_analogs": selected,
+            "excluded_candidates": tuple(_dedupe_disposition_rows(excluded)),
+            "unevaluable_candidates": tuple(_dedupe_disposition_rows(unevaluable)),
+            "source_ids": tuple(
+                dict.fromkeys(
+                    (
+                        *selection.source_ids,
+                        *(source_id for candidate in candidates for source_id in candidate.source_ids),
+                    )
+                )
+            ),
+            "confidence": max(selection.confidence, 0.75 if selected else 0.25),
+        }
+    )
+
+
 def retrieve_follow_on_candidates(
     *,
     selected_analogs: tuple[AnalogCandidateRecord, ...],
@@ -233,7 +396,7 @@ def retrieve_follow_on_candidates(
             continue
         alias_failures: list[MissingDataFlag] = []
         analog_had_result = False
-        for alias in aliases[:10]:
+        for alias in aliases[:16]:
             query_source = SourceMetadata(
                 source_id=f"ctgov_search:protocol_design_follow_on:{slug(analog.trial.nct_id)}:{slug(alias)}",
                 title=f"Follow-on search for {analog.trial.nct_id} using {alias}",
@@ -243,7 +406,7 @@ def retrieve_follow_on_candidates(
             )
             attempt_notes: list[str] = []
             results: list[ClinicalTrialsSearchResult] = []
-            for attempt_label, input_data in _follow_on_search_inputs(alias=alias, indication_terms=indication_terms):
+            for attempt_label, input_data in _follow_on_search_inputs(alias=alias, indication_terms=indication_terms, sponsors=sponsors):
                 try:
                     attempt_result = ctgov.search_trials(input_data)
                 except (ClinicalTrialsGovError, ValueError) as exc:
@@ -332,13 +495,20 @@ def adjudicate_follow_on_trials_deterministically(
         excluded = tuple(candidate.trial.nct_id for candidate in candidates if candidate.exclusion_reason)
         source_ids.extend(source_id for candidate in candidates for source_id in candidate.source_ids)
         if not viable:
+            status = "retrieval_failed" if not candidates else "no_plausible_follow_on"
+            rationale = (
+                "No candidate records were retrieved for this analog despite bounded alias and sponsor follow-on searches."
+                if not candidates
+                else "Candidates were retrieved, but none survived deterministic same-program lineage filters."
+            )
+            ambiguity = ("follow_on_retrieval_empty",) if not candidates else ("no_viable_follow_on_candidates",)
             adjudications.append(
                 FollowOnTrialAdjudication(
                     anchor_analog_nct_id=analog.trial.nct_id,
-                    status="no_plausible_follow_on",
+                    status=status,
                     excluded_follow_on_nct_ids=excluded,
-                    rationale="No same-asset, same-indication, same-sponsor candidate survived deterministic lineage filters.",
-                    ambiguity_flags=("no_viable_follow_on_candidates",),
+                    rationale=rationale,
+                    ambiguity_flags=ambiguity,
                     source_ids=tuple(dict.fromkeys(source_id for candidate in candidates for source_id in candidate.source_ids)),
                     confidence=0.35,
                 )
@@ -460,6 +630,7 @@ def calculate_follow_on_benchmark(
             for trial in follow_on_trials
         ),
         excluded_candidates=(),
+        unevaluable_candidates=(),
         source_ids=tuple(dict.fromkeys((*adjudication.source_ids, *(trial.source_id for trial in follow_on_trials)))),
         confidence=adjudication.confidence,
     )
@@ -471,7 +642,7 @@ def calculate_follow_on_benchmark(
         search_plan=search_plan,
     )
     limitations = tuple(dict.fromkeys(("Benchmark calculated from selected follow-on trials, not initial analog trials.", *bundle.limitations)))
-    return bundle.model_copy(update={"limitations": limitations})
+    return bundle.model_copy(update={"evidence_mode": "follow_on", "limitations": limitations})
 
 
 def build_qualitative_protocol_synthesis(
@@ -481,22 +652,26 @@ def build_qualitative_protocol_synthesis(
     follow_on_trials: tuple[ClinicalTrialRecord, ...],
     benchmark_bundle: AnalogBenchmarkBundle,
 ) -> QualitativeProtocolSynthesis:
-    """Deterministic fallback synthesis of recurring follow-on protocol patterns."""
+    """Deterministic fallback synthesis of recurring protocol patterns."""
 
     source_ids = tuple(dict.fromkeys((*benchmark_bundle.source_ids, *(trial.source_id for trial in follow_on_trials))))
+    evidence_mode = benchmark_bundle.evidence_mode
+    subject = "follow-on trials" if evidence_mode == "follow_on" and follow_on_trials else "direct selected analog trials"
     comparator = tuple(f"{item.label}: {item.count}/{sum(row.count for row in benchmark_bundle.comparator_categories) or item.count}" for item in benchmark_bundle.comparator_categories[:4])
     randomized = tuple(f"{item.label}: {item.count}" for item in benchmark_bundle.randomized_frequency[:4])
     endpoint = tuple(f"{item.label}: {item.count}" for item in benchmark_bundle.primary_endpoint_family_frequency[:4])
     phases = tuple(f"{item.label}: {item.count}" for item in _frequency(tuple(", ".join(trial.phases) or "unknown" for trial in follow_on_trials), source_ids)[:4])
     insufficient = []
-    if len(follow_on_trials) < 2:
+    if evidence_mode == "follow_on" and len(follow_on_trials) < 2:
         insufficient.append("Fewer than two selected follow-on trials; qualitative precedent is sparse.")
+    if evidence_mode != "follow_on":
+        insufficient.append("No lineage-confirmed follow-on trials were found; synthesis uses direct selected analogs as weaker evidence.")
     if not endpoint:
-        insufficient.append("No recurring primary endpoint pattern was available from follow-on trials.")
+        insufficient.append(f"No recurring primary endpoint pattern was available from {subject}.")
     return QualitativeProtocolSynthesis(
         output_id=f"qualitative-protocol-synthesis-{run_id}",
         target_nct_id=target_trial.nct_id,
-        study_role_patterns=phases or ("No phase/study-role pattern was confidently identified.",),
+        study_role_patterns=phases or ("No lineage-confirmed follow-on role pattern was identified.",),
         target_population_patterns=tuple(dict.fromkeys(_population_pattern(trial) for trial in follow_on_trials if _population_pattern(trial)))[:6],
         study_design_patterns=randomized or ("Randomization/design pattern insufficiently evidenced.",),
         comparator_control_patterns=comparator or ("Comparator/control pattern insufficiently evidenced.",),
@@ -507,7 +682,7 @@ def build_qualitative_protocol_synthesis(
         biomarker_requirement_patterns=benchmark_bundle.biomarker_testing_themes,
         prior_treatment_patterns=benchmark_bundle.prior_treatment_themes,
         safety_monitoring_concepts=benchmark_bundle.safety_exclusion_themes,
-        assessment_schedule_concepts=("Use follow-on CT.gov visit/endpoint schedules as precedent; exact visit timing requires human protocol authoring.",),
+        assessment_schedule_concepts=(f"Use {subject} endpoint timing and schedule fields as review inputs; exact visit timing requires human protocol authoring.",),
         treatment_duration_patterns=_duration_patterns(follow_on_trials),
         follow_up_patterns=("Follow-up approach must be human-reviewed against endpoint timing and safety context.",),
         dominant_patterns=tuple(dict.fromkeys((*randomized[:1], *comparator[:1], *endpoint[:1]))),
@@ -515,7 +690,7 @@ def build_qualitative_protocol_synthesis(
         conflicting_precedent=_conflicting_precedent(benchmark_bundle),
         insufficient_evidence=tuple(insufficient),
         human_review_questions=(
-            "Which follow-on precedent patterns are clinically appropriate for the target asset and indication?",
+            f"Which {subject} patterns are clinically appropriate for the target asset and indication?",
             "Which sparse or conflicting precedent should be excluded before protocol drafting?",
         ),
         source_ids=source_ids,
@@ -530,22 +705,30 @@ def build_analog_derived_design_decisions(
     benchmark_bundle: AnalogBenchmarkBundle,
     qualitative_synthesis: QualitativeProtocolSynthesis,
 ) -> tuple[AnalogDerivedDesignDecision, ...]:
-    """Create explicit protocol choices derived from observed follow-on precedent."""
+    """Create explicit protocol choices with evidence-mode support labels."""
 
     total = len(follow_on_trials)
     follow_on_ids = tuple(trial.nct_id for trial in follow_on_trials)
+    analog_ids = benchmark_bundle.selected_analog_ids if benchmark_bundle.evidence_mode != "follow_on" else ()
+    evidence_subject = _decision_evidence_subject(benchmark_bundle.evidence_mode, total)
     decisions: list[AnalogDerivedDesignDecision] = []
     if benchmark_bundle.enrollment.median is not None:
         decisions.append(
             AnalogDerivedDesignDecision(
                 decision_id=f"analog-derived-decision-{run_id}-target-enrollment",
                 field_name="proposed_enrollment",
-                proposed_value=f"{benchmark_bundle.enrollment.median:g} participants",
+                proposed_value=f"{_rounded_count(benchmark_bundle.enrollment.median)} participants",
                 derivation_method="median",
+                support_source_type=_support_source_type(
+                    benchmark_bundle=benchmark_bundle,
+                    observed_count=benchmark_bundle.enrollment.observed_count,
+                    total_follow_on=total,
+                ),
                 supporting_follow_on_nct_ids=follow_on_ids,
+                supporting_analog_nct_ids=analog_ids,
                 observed_count=benchmark_bundle.enrollment.observed_count,
                 total_eligible_follow_on_trials=total,
-                rationale="Target enrollment derived from median enrollment across selected follow-on trials.",
+                rationale=f"Target enrollment derived from median enrollment across {evidence_subject}; rounded to a whole participant count.",
                 source_ids=benchmark_bundle.enrollment.source_ids,
                 confidence=benchmark_bundle.confidence,
             )
@@ -555,12 +738,18 @@ def build_analog_derived_design_decisions(
             AnalogDerivedDesignDecision(
                 decision_id=f"analog-derived-decision-{run_id}-site-footprint",
                 field_name="proposed_site_footprint",
-                proposed_value=f"{benchmark_bundle.site_count.median:g} sites",
+                proposed_value=f"{_rounded_count(benchmark_bundle.site_count.median)} sites",
                 derivation_method="median",
+                support_source_type=_support_source_type(
+                    benchmark_bundle=benchmark_bundle,
+                    observed_count=benchmark_bundle.site_count.observed_count,
+                    total_follow_on=total,
+                ),
                 supporting_follow_on_nct_ids=follow_on_ids,
+                supporting_analog_nct_ids=analog_ids,
                 observed_count=benchmark_bundle.site_count.observed_count,
                 total_eligible_follow_on_trials=total,
-                rationale="Site footprint derived from median site count across selected follow-on trials.",
+                rationale=f"Site footprint derived from median site count across {evidence_subject}; rounded to a whole site count.",
                 source_ids=benchmark_bundle.site_count.source_ids,
                 confidence=benchmark_bundle.confidence,
             )
@@ -580,10 +769,17 @@ def build_analog_derived_design_decisions(
                 field_name=field_name,
                 proposed_value=top.label,
                 derivation_method="frequency",
+                support_source_type=_support_source_type(
+                    benchmark_bundle=benchmark_bundle,
+                    observed_count=top.count,
+                    total_follow_on=total,
+                    frequency=top.frequency,
+                ),
                 supporting_follow_on_nct_ids=follow_on_ids,
+                supporting_analog_nct_ids=analog_ids,
                 observed_count=top.count,
                 total_eligible_follow_on_trials=total,
-                rationale=f"{label} choice derived from the most frequent observed category across selected follow-on trials.",
+                rationale=f"{label} choice derived from the most frequent observed category across {evidence_subject}.",
                 source_ids=top.source_ids,
                 confidence=min(benchmark_bundle.confidence, top.frequency),
             )
@@ -596,16 +792,23 @@ def build_analog_derived_design_decisions(
     ):
         if not patterns:
             continue
+        qualitative_observed = total if benchmark_bundle.evidence_mode == "follow_on" else len(benchmark_bundle.selected_analog_ids)
         decisions.append(
             AnalogDerivedDesignDecision(
                 decision_id=f"analog-derived-decision-{run_id}-{slug(field_name)}",
                 field_name=field_name,
                 proposed_value="; ".join(patterns[:4]),
                 derivation_method="qualitative_consensus",
+                support_source_type=_support_source_type(
+                    benchmark_bundle=benchmark_bundle,
+                    observed_count=qualitative_observed,
+                    total_follow_on=total,
+                ),
                 supporting_follow_on_nct_ids=follow_on_ids,
-                observed_count=total,
+                supporting_analog_nct_ids=analog_ids,
+                observed_count=qualitative_observed,
                 total_eligible_follow_on_trials=total,
-                rationale="Qualitative design choice derived from recurring selected follow-on trial patterns.",
+                rationale=f"Qualitative design choice derived from recurring patterns across {evidence_subject}.",
                 source_ids=qualitative_synthesis.source_ids,
                 confidence=qualitative_synthesis.confidence,
             )
@@ -635,15 +838,36 @@ def calculate_analog_benchmark(
     )
     flags = list(_benchmark_missing_flags(selected))
     enrollment_values = [candidate.trial.enrollment_count for candidate in selected if candidate.trial.enrollment_count is not None]
-    duration_values = [
+    primary_completion_interval_values = [
         duration
         for candidate in selected
         if (duration := _planned_duration_months(candidate.trial.start_date, candidate.trial.primary_completion_date or candidate.trial.completion_date)) is not None
+    ]
+    total_execution_values = [
+        duration
+        for candidate in selected
+        if (duration := _planned_duration_months(candidate.trial.start_date, candidate.trial.completion_date)) is not None
+    ]
+    treatment_duration_values = [
+        value
+        for candidate in selected
+        if (value := _trial_treatment_duration_weeks(candidate.trial)) is not None
+    ]
+    primary_endpoint_timing_values = [
+        value
+        for candidate in selected
+        if (value := _primary_endpoint_timing_weeks(candidate.trial)) is not None
+    ]
+    follow_up_duration_values = [
+        value
+        for candidate in selected
+        if (value := _trial_follow_up_duration_weeks(candidate.trial)) is not None
     ]
     site_values = [len(candidate.trial.locations) for candidate in selected if candidate.trial.locations]
     return AnalogBenchmarkBundle(
         bundle_id=f"analog-benchmark-{run_id}",
         target_nct_id=target_trial.nct_id,
+        evidence_mode="direct_analog",
         selected_analog_ids=tuple(item.nct_id for item in selection.selected_analogs),
         excluded_analog_ids=tuple(item.nct_id for item in selection.excluded_candidates),
         search_plan=search_plan,
@@ -656,9 +880,38 @@ def calculate_analog_benchmark(
             source_ids=source_ids,
         ),
         planned_duration_months=_numeric_summary(
-            values=duration_values,
+            values=primary_completion_interval_values,
             selected_count=len(selected),
-            missing_count=len(selected) - len(duration_values),
+            missing_count=len(selected) - len(primary_completion_interval_values),
+            unit="months",
+            source_ids=source_ids,
+        ),
+        treatment_duration_weeks=_numeric_summary(
+            values=treatment_duration_values,
+            selected_count=len(selected),
+            missing_count=len(selected) - len(treatment_duration_values),
+            unit="weeks",
+            source_ids=source_ids,
+        ),
+        primary_endpoint_timing_weeks=_numeric_summary(
+            values=primary_endpoint_timing_values,
+            selected_count=len(selected),
+            missing_count=len(selected) - len(primary_endpoint_timing_values),
+            unit="weeks",
+            source_ids=source_ids,
+        ),
+        follow_up_duration_weeks=_numeric_summary(
+            values=follow_up_duration_values,
+            selected_count=len(selected),
+            missing_count=len(selected) - len(follow_up_duration_values),
+            unit="weeks",
+            source_ids=source_ids,
+        ),
+        enrollment_period_months=BenchmarkNumericSummary(missing_count=len(selected), unit="months", source_ids=source_ids),
+        total_study_execution_duration_months=_numeric_summary(
+            values=total_execution_values,
+            selected_count=len(selected),
+            missing_count=len(selected) - len(total_execution_values),
             unit="months",
             source_ids=source_ids,
         ),
@@ -666,11 +919,19 @@ def calculate_analog_benchmark(
         blinding_frequency=_frequency(_design_labels(selected, "blinding"), source_ids),
         arm_count_distribution=_frequency(tuple(str(_arm_count(candidate.trial)) for candidate in selected), source_ids),
         primary_endpoint_family_frequency=_frequency(
-            tuple(_endpoint_family(endpoint.measure) for candidate in selected for endpoint in candidate.trial.primary_endpoints),
+            tuple(
+                semantic_endpoint_family(endpoint.measure, endpoint.description, endpoint.time_frame)
+                for candidate in selected
+                for endpoint in candidate.trial.primary_endpoints
+            ),
             source_ids,
         ),
         secondary_endpoint_family_frequency=_frequency(
-            tuple(_endpoint_family(endpoint.measure) for candidate in selected for endpoint in candidate.trial.secondary_endpoints),
+            tuple(
+                semantic_endpoint_family(endpoint.measure, endpoint.description, endpoint.time_frame)
+                for candidate in selected
+                for endpoint in candidate.trial.secondary_endpoints
+            ),
             source_ids,
         ),
         comparator_categories=_frequency(tuple(_comparator_category(candidate.trial) for candidate in selected), source_ids),
@@ -701,14 +962,17 @@ def build_benchmark_summary(bundle: AnalogBenchmarkBundle) -> str:
     """Return concise source-grounded benchmark prose."""
 
     selected = len(bundle.selected_analog_ids)
-    subject = "selected follow-on CT.gov trials" if any("follow-on" in item.casefold() for item in bundle.limitations) else "selected CT.gov analog trials"
+    subject = "selected follow-on CT.gov trials" if bundle.evidence_mode == "follow_on" else "selected CT.gov analog trials"
     enrollment = _stat_phrase(bundle.enrollment)
-    duration = _stat_phrase(bundle.planned_duration_months)
+    primary_interval = _stat_phrase(bundle.planned_duration_months)
+    endpoint_timing = _stat_phrase(bundle.primary_endpoint_timing_weeks)
+    treatment_duration = _stat_phrase(bundle.treatment_duration_weeks)
     endpoints = ", ".join(f"{item.label}: {item.count}" for item in bundle.primary_endpoint_family_frequency[:4]) or "no classified primary endpoint families"
     controls = ", ".join(f"{item.label}: {item.count}" for item in bundle.comparator_categories[:4]) or "no comparator categories detected"
     return (
         f"Benchmark uses {selected} {subject}. "
-        f"Enrollment {enrollment}; planned duration {duration}. "
+        f"Enrollment {enrollment}; primary-completion interval {primary_interval}; "
+        f"primary endpoint timing {endpoint_timing}; treatment duration {treatment_duration}. "
         f"Primary endpoint families: {endpoints}. Comparator categories: {controls}. "
         "Limitations and missing fields are carried as flags."
     )
@@ -800,7 +1064,7 @@ def build_protocol_design_claims(
         claims.append(
             EvidenceClaim(
                 claim_id=f"claim-{run_id}-analog-enrollment",
-                claim_text=f"Selected analog median enrollment is {benchmark_bundle.enrollment.median:.1f} participants.",
+                claim_text=f"Selected analog median enrollment is {_rounded_count(benchmark_bundle.enrollment.median)} participants.",
                 source_ids=benchmark_bundle.enrollment.source_ids,
                 provenance="protocol_design.analog_benchmark.calculated",
                 confidence=benchmark_bundle.confidence,
@@ -811,7 +1075,7 @@ def build_protocol_design_claims(
         claims.append(
             EvidenceClaim(
                 claim_id=f"claim-{run_id}-analog-duration",
-                claim_text=f"Selected analog median planned duration is {benchmark_bundle.planned_duration_months.median:.1f} months.",
+                claim_text=f"Selected analog median start-to-primary-completion interval is {benchmark_bundle.planned_duration_months.median:.1f} months.",
                 source_ids=benchmark_bundle.planned_duration_months.source_ids,
                 provenance="protocol_design.analog_benchmark.calculated",
                 confidence=benchmark_bundle.confidence,
@@ -919,75 +1183,47 @@ def _similarity_features(target: ClinicalTrialRecord, candidate: ClinicalTrialRe
     candidate_endpoint = _endpoint_family_from_trial(candidate)
     target_comparator = _comparator_category(target)
     candidate_comparator = _comparator_category(candidate)
+    target_routes = route_set(target)
+    candidate_routes = route_set(candidate)
+    endpoint_domain = same_endpoint_domain(target_endpoint, candidate_endpoint)
+    primary_family = candidate_endpoint
     return {
         "same_indication": _indication_matches(target.conditions, candidate.conditions),
         "same_or_comparable_phase": bool(set(_norm_phase_values(target.phases)) & set(_norm_phase_values(candidate.phases))),
         "same_endpoint_family": bool(target_endpoint and target_endpoint == candidate_endpoint),
+        "same_clinical_endpoint_domain": endpoint_domain,
         "same_comparator_structure": bool(target_comparator and target_comparator == candidate_comparator),
-        "same_modality": _intervention_type_set(target) == _intervention_type_set(candidate) if _intervention_type_set(target) and _intervention_type_set(candidate) else None,
+        "randomized_placebo_controlled": _structured_design_label(candidate, "randomized") == "randomized" and candidate_comparator == "placebo_control",
+        "same_modality": comparable_modality(target, candidate),
+        "target_active_routes": tuple(sorted(target_routes)),
+        "candidate_active_routes": tuple(sorted(candidate_routes)),
+        "wrong_active_route": bool(target_routes and candidate_routes and not (target_routes & candidate_routes)),
+        "primary_endpoint_is_pk_or_safety": primary_family in {"pk", "safety"} if primary_family else None,
         "similar_population": _population_context(target) == _population_context(candidate) if _population_context(target) and _population_context(candidate) else None,
         "similar_biomarker_or_line": _has_any_keyword_overlap(target.eligibility_criteria, candidate.eligibility_criteria, ("biomarker", "mutation", "refractory", "prior", "line")),
         "target_or_moa_overlap": _has_any_keyword_overlap(_intervention_text(target), _intervention_text(candidate), ("inhibitor", "antibody", "agonist", "antagonist", "kinase", "receptor")),
+        "target_primary_endpoint_family": target_endpoint,
+        "candidate_primary_endpoint_family": candidate_endpoint,
         "current_trial_anchor": target.nct_id,
     }
 
 
 def _asset_aliases(trial: ClinicalTrialRecord) -> tuple[str, ...]:
-    aliases: list[str] = []
-    excluded = {"placebo", "standard of care", "best supportive care", "control", "vehicle"}
-    excluded_tokens = ("placebo", "control", "standardofcare", "bestsupportivecare", "vehicle")
-    for intervention in trial.interventions:
-        names = (intervention.name, *intervention.other_names)
-        for name in names:
-            cleaned = _clean_intervention_name(name)
-            cleaned_slug = slug(cleaned) if cleaned else ""
-            if cleaned and cleaned.casefold() not in excluded and not any(token in cleaned_slug for token in excluded_tokens):
-                aliases.append(cleaned)
-    return tuple(dict.fromkeys(aliases))
+    return semantic_asset_aliases(trial)
 
 
 def _expanded_asset_aliases(trial: ClinicalTrialRecord) -> tuple[str, ...]:
-    aliases: list[str] = []
-    for alias in _asset_aliases(trial):
-        aliases.append(alias)
-        base = _strip_dose_suffix(alias)
-        if base and base != alias:
-            aliases.append(base)
-        aliases.extend(_known_asset_aliases(alias))
-    return tuple(dict.fromkeys(alias for alias in aliases if alias and not _is_generic_or_control_intervention(alias)))
+    return semantic_expanded_asset_aliases(trial)
 
 
 def _strip_dose_suffix(value: str) -> str | None:
-    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|ug|g|ml|%)\b.*$", "", value, flags=re.I).strip(" -/,:;")
-    return text or None
-
-
-def _known_asset_aliases(value: str) -> tuple[str, ...]:
-    alias_sets = {
-        "cp-690-550": ("CP-690,550", "CP 690,550", "CP-690550", "tofacitinib", "tasocitinib"),
-        "cp-690550": ("CP-690,550", "CP 690,550", "CP-690550", "tofacitinib", "tasocitinib"),
-        "cp690550": ("CP-690,550", "CP 690,550", "CP-690550", "tofacitinib", "tasocitinib"),
-        "tofacitinib": ("tofacitinib", "CP-690,550", "CP 690,550", "CP-690550", "tasocitinib"),
-        "tasocitinib": ("tasocitinib", "tofacitinib", "CP-690,550", "CP 690,550", "CP-690550"),
-        "ain457": ("AIN457", "secukinumab"),
-        "secukinumab": ("secukinumab", "AIN457"),
-    }
-    return tuple(alias_sets.get(slug(value), ()))
-
-
-def _equivalent_asset_slugs(value: str) -> set[str]:
-    values = {value, *_known_asset_aliases(value)}
-    stripped = _strip_dose_suffix(value)
-    if stripped:
-        values.add(stripped)
-        values.update(_known_asset_aliases(stripped))
-    return {slug(item) for item in values if item}
+    return semantic_strip_dose_suffix(value)
 
 
 def _follow_on_indication_terms(trial: ClinicalTrialRecord) -> tuple[str, ...]:
     terms: list[str] = []
     for condition in trial.conditions:
-        terms.extend(_condition_variants(condition))
+            terms.extend(_condition_variants(condition))
     for title in (trial.brief_title, trial.official_title):
         if not title:
             continue
@@ -998,52 +1234,36 @@ def _follow_on_indication_terms(trial: ClinicalTrialRecord) -> tuple[str, ...]:
 
 
 def _condition_variants(value: str | None) -> tuple[str, ...]:
-    if not value:
-        return ()
-    text = " ".join(str(value).split()).strip(" .,:;")
-    variants = [text]
-    lowered = text.casefold()
-    for prefix in ("moderate to severe ", "moderate-to-severe ", "severe "):
-        if lowered.startswith(prefix):
-            variants.append(text[len(prefix) :].strip())
-    if "plaque psoriasis" in lowered:
-        variants.append("Psoriasis")
-    if "atopic dermatitis" in lowered:
-        variants.append("Atopic Dermatitis")
-    return tuple(dict.fromkeys(item for item in variants if item))
+    return semantic_condition_variants(value)
 
 
 def _follow_on_search_inputs(
     *,
     alias: str,
     indication_terms: tuple[str, ...],
+    sponsors: tuple[str, ...] = (),
 ) -> tuple[tuple[str, ClinicalTrialIntelligenceInput], ...]:
     attempts: list[tuple[str, ClinicalTrialIntelligenceInput]] = []
 
-    def add(label: str, *, disease: str, drug: str | None, target: str | None = None) -> None:
-        input_data = ClinicalTrialIntelligenceInput(disease=disease, drug=drug, target=target, limit=50)
-        signature = (input_data.disease, input_data.drug, input_data.target, input_data.phase, input_data.limit)
-        if not any((existing.disease, existing.drug, existing.target, existing.phase, existing.limit) == signature for _, existing in attempts):
+    def add(label: str, *, disease: str, drug: str | None, target: str | None = None, sponsor: str | None = None) -> None:
+        input_data = ClinicalTrialIntelligenceInput(disease=disease, drug=drug, target=target, sponsor=sponsor, limit=50)
+        signature = (input_data.disease, input_data.drug, input_data.target, input_data.sponsor, input_data.phase, input_data.limit)
+        if not any((existing.disease, existing.drug, existing.target, existing.sponsor, existing.phase, existing.limit) == signature for _, existing in attempts):
             attempts.append((label, input_data))
 
     for index, disease in enumerate(indication_terms[:4], start=1):
         add(f"condition_drug_{index}", disease=disease, drug=alias)
         add(f"condition_term_{index}", disease=disease, drug=None, target=alias)
+        for sponsor_index, sponsor in enumerate(sponsors[:3], start=1):
+            add(f"condition_sponsor_alias_{index}_{sponsor_index}", disease=disease, drug=None, target=alias, sponsor=sponsor)
+            add(f"condition_sponsor_rescue_{index}_{sponsor_index}", disease=disease, drug=None, target=None, sponsor=sponsor)
+    for sponsor_index, sponsor in enumerate(sponsors[:3], start=1):
+        add(f"sponsor_alias_rescue_{sponsor_index}", disease=indication_terms[0], drug=None, target=alias, sponsor=sponsor)
     return tuple(attempts)
 
 
-def _clean_intervention_name(name: str | None) -> str | None:
-    if not name:
-        return None
-    text = str(name).strip()
-    for prefix in ("Drug:", "Biological:", "Biologic:", "Device:", "Procedure:", "Radiation:", "Combination Product:"):
-        if text.casefold().startswith(prefix.casefold()):
-            text = text[len(prefix) :].strip()
-    return text or None
-
-
 def _sponsor_names(trial: ClinicalTrialRecord) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(sponsor.name for sponsor in (trial.lead_sponsor, *trial.collaborators) if sponsor and sponsor.name))
+    return normalized_sponsor_names(trial)
 
 
 def _lineage_features(*, anchor: ClinicalTrialRecord, candidate: ClinicalTrialRecord, alias: str) -> dict[str, object]:
@@ -1075,27 +1295,11 @@ def _lineage_features(*, anchor: ClinicalTrialRecord, candidate: ClinicalTrialRe
 
 
 def _asset_matches(trial: ClinicalTrialRecord, alias: str) -> bool:
-    alias_slugs = _equivalent_asset_slugs(alias)
-    for name in _expanded_asset_aliases(trial):
-        name_slugs = _equivalent_asset_slugs(name)
-        if alias_slugs & name_slugs:
-            return True
-        if any(left in right or right in left for left in alias_slugs for right in name_slugs):
-            return True
-    return False
+    return semantic_asset_matches(trial, alias)
 
 
 def _indication_matches(left_terms: tuple[str, ...], right_terms: tuple[str, ...]) -> bool:
-    left = {slug(term) for term in left_terms if term}
-    right = {slug(term) for term in right_terms if term}
-    if left & right:
-        return True
-    return any(
-        (len(left_term) >= 5 and left_term in right_term)
-        or (len(right_term) >= 5 and right_term in left_term)
-        for left_term in left
-        for right_term in right
-    )
+    return semantic_same_indication(left_terms, right_terms)
 
 
 def _follow_on_exclusion_reason(features: dict[str, object]) -> str | None:
@@ -1180,7 +1384,7 @@ def _duration_patterns(trials: tuple[ClinicalTrialRecord, ...]) -> tuple[str, ..
     ]
     if not durations:
         return ()
-    return (f"Observed planned duration median {round(median(durations), 1)} months across {len(durations)} follow-on trials.",)
+    return (f"Observed start-to-primary-completion interval median {round(median(durations), 1)} months across {len(durations)} trials.",)
 
 
 def _conflicting_precedent(bundle: AnalogBenchmarkBundle) -> tuple[str, ...]:
@@ -1197,33 +1401,11 @@ def _conflicting_precedent(bundle: AnalogBenchmarkBundle) -> tuple[str, ...]:
 
 
 def _endpoint_family_from_trial(trial: ClinicalTrialRecord) -> str | None:
-    text = " ".join(endpoint.measure for endpoint in (*trial.primary_endpoints, *trial.secondary_endpoints)).casefold()
-    if not text:
-        return None
-    if any(term in text for term in ("overall survival", "mortality", "death")):
-        return "survival"
-    if any(term in text for term in ("progression-free", "time to", "duration")):
-        return "time_to_event"
-    if any(term in text for term in ("response", "orr", "remission")):
-        return "response"
-    if any(term in text for term in ("safety", "adverse", "toxicity")):
-        return "safety"
-    if any(term in text for term in ("biomarker", "pharmacodynamic", "marker")):
-        return "biomarker"
-    return "other"
-
-
-def _intervention_type_set(trial: ClinicalTrialRecord) -> set[str]:
-    return {slug(item.type or "") for item in trial.interventions if item.type}
+    return semantic_endpoint_family_from_trial(trial)
 
 
 def _intervention_text(trial: ClinicalTrialRecord) -> str:
-    return " ".join(
-        item
-        for intervention in trial.interventions
-        for item in (intervention.name, intervention.description, *intervention.other_names)
-        if item
-    )
+    return active_intervention_text(trial)
 
 
 def _has_any_keyword_overlap(left: str | None, right: str | None, keywords: tuple[str, ...]) -> bool | None:
@@ -1232,6 +1414,107 @@ def _has_any_keyword_overlap(left: str | None, right: str | None, keywords: tupl
     left_text = left.casefold()
     right_text = right.casefold()
     return any(keyword in left_text and keyword in right_text for keyword in keywords)
+
+
+def _candidate_unevaluable_reason(trial: ClinicalTrialRecord) -> str | None:
+    if not trial.conditions:
+        return "Candidate lacks condition fields needed for indication similarity adjudication."
+    if not trial.interventions:
+        return "Candidate lacks intervention fields needed for active asset modality adjudication."
+    if not trial.primary_endpoints and not trial.secondary_endpoints:
+        return "Candidate lacks endpoint fields needed for endpoint-family adjudication."
+    return None
+
+
+def _dedupe_disposition_rows(rows: list[ExcludedAnalogTrial] | list[UnevaluableAnalogTrial]) -> tuple[ExcludedAnalogTrial, ...] | tuple[UnevaluableAnalogTrial, ...]:
+    by_nct = {}
+    for row in rows:
+        by_nct.setdefault(row.nct_id, row)
+    return tuple(by_nct.values())
+
+
+def _rounded_count(value: float) -> int:
+    return int(value + 0.5)
+
+
+def _decision_evidence_subject(evidence_mode: str, total_follow_on: int) -> str:
+    if evidence_mode == "follow_on" and total_follow_on:
+        return "selected follow-on trials"
+    if evidence_mode == "direct_analog":
+        return "direct selected analog trials"
+    if evidence_mode == "target_only":
+        return "target-trial evidence"
+    return "sparse or unresolved evidence"
+
+
+def _support_source_type(
+    *,
+    benchmark_bundle: AnalogBenchmarkBundle,
+    observed_count: int,
+    total_follow_on: int,
+    frequency: float | None = None,
+) -> str:
+    if benchmark_bundle.evidence_mode == "follow_on":
+        if total_follow_on and observed_count:
+            return "follow_on_supported"
+        return "unresolved"
+    if benchmark_bundle.evidence_mode == "direct_analog":
+        if not observed_count:
+            return "unresolved"
+        if frequency is not None and frequency < 0.5:
+            return "minority_precedent"
+        if observed_count >= max(2, len(benchmark_bundle.selected_analog_ids) // 2 + 1):
+            return "analog_majority_supported"
+        return "minority_precedent"
+    if benchmark_bundle.evidence_mode == "target_only":
+        return "target_trial_supported"
+    return "human_decision_required"
+
+
+def _primary_endpoint_timing_weeks(trial: ClinicalTrialRecord) -> float | None:
+    values = [
+        value
+        for endpoint in trial.primary_endpoints
+        if (value := _duration_weeks_from_text(" ".join(item for item in (endpoint.measure, endpoint.time_frame, endpoint.description) if item))) is not None
+    ]
+    return min(values) if values else None
+
+
+def _trial_treatment_duration_weeks(trial: ClinicalTrialRecord) -> float | None:
+    text = " ".join(
+        item
+        for item in (
+            active_intervention_text(trial),
+            *(endpoint.time_frame or "" for endpoint in trial.primary_endpoints),
+        )
+        if item
+    )
+    return _duration_weeks_from_text(text)
+
+
+def _trial_follow_up_duration_weeks(trial: ClinicalTrialRecord) -> float | None:
+    text = _trial_text(trial)
+    if "follow" not in text and "safety" not in text:
+        return None
+    return _duration_weeks_from_text(text)
+
+
+def _duration_weeks_from_text(text: str | None) -> float | None:
+    if not text:
+        return None
+    lowered = text.casefold()
+    candidates: list[float] = []
+    for match in re.finditer(r"\b(?:week|wk)s?\s*(?:up\s*to|through|to|at)?\s*(\d+(?:\.\d+)?)\b", lowered):
+        candidates.append(float(match.group(1)))
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*(?:week|wk)s?\b", lowered):
+        candidates.append(float(match.group(1)))
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*months?\b", lowered):
+        candidates.append(float(match.group(1)) * 4.345)
+    for match in re.finditer(r"\b(\d+(?:\.\d+)?)\s*days?\b", lowered):
+        candidates.append(float(match.group(1)) / 7)
+    if not candidates:
+        return None
+    return round(max(candidates), 1)
 
 
 def _numeric_summary(
@@ -1362,18 +1645,7 @@ def _structured_design_label(trial: ClinicalTrialRecord, field: str) -> str | No
 
 
 def _endpoint_family(measure: str) -> str:
-    text = measure.casefold()
-    if any(term in text for term in ("overall survival", "mortality", "death")):
-        return "survival"
-    if any(term in text for term in ("progression-free", "time to", "duration")):
-        return "time_to_event"
-    if any(term in text for term in ("response", "orr", "remission")):
-        return "response"
-    if any(term in text for term in ("safety", "adverse", "toxicity")):
-        return "safety"
-    if any(term in text for term in ("biomarker", "marker", "pharmacodynamic")):
-        return "biomarker"
-    return "other"
+    return semantic_endpoint_family(measure)
 
 
 def _comparator_category(trial: ClinicalTrialRecord) -> str:
@@ -1486,7 +1758,7 @@ def _benchmark_missing_flags(selected: tuple[AnalogCandidateRecord, ...]) -> tup
     if any(candidate.trial.enrollment_count is None for candidate in selected):
         flags.append(missing("protocol-design-analog-enrollment-missing", "analog_benchmark", "enrollment", "One or more selected analog trials lack enrollment count.", "medium"))
     if any(_planned_duration_months(candidate.trial.start_date, candidate.trial.primary_completion_date or candidate.trial.completion_date) is None for candidate in selected):
-        flags.append(missing("protocol-design-analog-duration-missing", "analog_benchmark", "planned_duration_months", "One or more selected analog trials lack calculable planned duration.", "medium"))
+        flags.append(missing("protocol-design-analog-duration-missing", "analog_benchmark", "planned_duration_months", "One or more selected analog trials lack calculable start-to-primary-completion interval.", "medium"))
     if any(not candidate.trial.primary_endpoints for candidate in selected):
         flags.append(missing("protocol-design-analog-primary-endpoints-missing", "analog_benchmark", "primary_endpoint_family_frequency", "One or more selected analog trials lack primary endpoints.", "medium"))
     if any(not candidate.trial.eligibility_criteria for candidate in selected):
@@ -1513,6 +1785,16 @@ def _stat_phrase(summary: BenchmarkNumericSummary) -> str:
     if summary.observed_count == 0:
         return f"not calculable with {summary.missing_count} missing values"
     return (
-        f"median {summary.median} {summary.unit or ''}, mean {summary.mean}, "
-        f"range {summary.minimum}-{summary.maximum}, IQR {summary.iqr}, missing {summary.missing_count}"
+        f"median {_format_summary_value(summary.median, summary.unit)} {summary.unit or ''}, "
+        f"mean {_format_summary_value(summary.mean, summary.unit)}, "
+        f"range {_format_summary_value(summary.minimum, summary.unit)}-{_format_summary_value(summary.maximum, summary.unit)}, "
+        f"IQR {_format_summary_value(summary.iqr, summary.unit)}, missing {summary.missing_count}"
     )
+
+
+def _format_summary_value(value: float | None, unit: str | None) -> str:
+    if value is None:
+        return "NA"
+    if unit in {"participants", "patients", "subjects", "sites"}:
+        return str(_rounded_count(value))
+    return f"{value:g}"

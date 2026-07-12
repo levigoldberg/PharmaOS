@@ -100,6 +100,58 @@ def test_search_trials_normalizes_structured_design_and_arm_fields() -> None:
     assert trial.interventions[0].arm_group_labels == ("Experimental Arm",)
 
 
+def test_search_trials_prefers_nested_design_info_and_sponsor_query() -> None:
+    payload = {
+        "studies": [
+            {
+                "hasResults": False,
+                "derivedSection": {
+                    "interventionBrowseModule": {
+                        "meshes": [{"term": "Secukinumab"}],
+                        "ancestors": [{"term": "Antibodies, Monoclonal"}],
+                    }
+                },
+                "protocolSection": {
+                    "identificationModule": {"nctId": "NCT01234568", "briefTitle": "Nested design trial"},
+                    "statusModule": {},
+                    "designModule": {
+                        "studyType": "INTERVENTIONAL",
+                        "designInfo": {
+                            "allocation": "RANDOMIZED",
+                            "interventionModel": "PARALLEL",
+                            "maskingInfo": {"masking": "QUADRUPLE"},
+                            "primaryPurpose": "TREATMENT",
+                        },
+                    },
+                    "conditionsModule": {"conditions": ["Plaque Psoriasis"]},
+                    "armsInterventionsModule": {
+                        "armGroups": [
+                            {"label": "Dose 1", "type": "EXPERIMENTAL", "interventionNames": ["Drug: AIN457"]},
+                            {"label": "Placebo", "type": "PLACEBO_COMPARATOR", "interventionNames": ["Drug: Placebo"]},
+                        ],
+                        "interventions": [{"name": "AIN457", "type": "BIOLOGICAL"}],
+                    },
+                },
+            }
+        ]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["query.spons"] == "Novartis"
+        return httpx.Response(200, json=payload)
+
+    client = ClinicalTrialsGovClient(client=httpx.Client(transport=httpx.MockTransport(handler)))
+    result = client.search_trials(ClinicalTrialIntelligenceInput(disease="Psoriasis", sponsor="Novartis"))
+    trial = result.trials[0]
+
+    assert trial.allocation == "RANDOMIZED"
+    assert trial.intervention_model == "PARALLEL"
+    assert trial.masking == "QUADRUPLE"
+    assert trial.primary_purpose == "TREATMENT"
+    assert trial.number_of_arms == 2
+    assert trial.intervention_browse_terms == ("Secukinumab", "Antibodies, Monoclonal")
+
+
 def test_fetch_trial_rejects_missing_protocol_section() -> None:
     client = ClinicalTrialsGovClient(
         client=httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json={})))

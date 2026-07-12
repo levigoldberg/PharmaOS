@@ -55,8 +55,11 @@ from pharma_os.tools.protocol_design import (
     calculate_follow_on_benchmark,
     fetch_selected_follow_on_trials,
     hydrate_selected_analog_candidates,
+    normalize_analog_selection_output,
     retrieve_follow_on_candidates,
+    score_current_trial_candidate,
 )
+from pharma_os.tools.clinical_semantics import endpoint_family_from_trial as semantic_endpoint_family_from_trial
 
 
 _DIRECT_LLM_AGENT_NAMES = frozenset(
@@ -155,6 +158,21 @@ def run_protocol_design_manager_agent(
     runtime_config = config
     traces: list[AgentRunTrace] = []
     payloads: list[BaseModel] = []
+    allowed_missing_flag_ids = {flag.flag_id for flag in missing_data_flags}
+    agent3_output = agent3_output.model_copy(
+        update={
+            "missing_data_flags": tuple(
+                flag for flag in agent3_output.missing_data_flags if flag.flag_id in allowed_missing_flag_ids
+            )
+        }
+    )
+    agent4_output = agent4_output.model_copy(
+        update={
+            "missing_data_flags": tuple(
+                flag for flag in agent4_output.missing_data_flags if flag.flag_id in allowed_missing_flag_ids
+            )
+        }
+    )
 
     manager_plan = _run_typed_agent(
         agent_name="ProtocolDesignManagerAgent",
@@ -224,32 +242,47 @@ def run_protocol_design_manager_agent(
         rationale_summary="Select analogs by match dimensions, not by retrieval alone.",
     )
     traces.append(selection.trace)
-    payloads.append(selection.output)
+    selection_output = selection.output
 
     analog_candidates, hydrated_sources, hydration_flags = hydrate_selected_analog_candidates(
         target_trial=target_trial,
-        selection=selection.output,
+        selection=selection_output,
         candidates=analog_candidates,
     )
     if hydrated_sources or hydration_flags:
         analog_candidates = annotate_analog_similarity_features(target_trial=target_trial, candidates=analog_candidates)
         analog_sources = tuple((*analog_sources, *hydrated_sources))
         retrieval_flags = tuple((*retrieval_flags, *hydration_flags))
+    selection_output = normalize_analog_selection_output(
+        run_id=run_id,
+        target_trial=target_trial,
+        selection=selection_output,
+        candidates=analog_candidates,
+        top_k=top_k,
+    )
+    payloads.append(selection_output)
 
-    direct_analog_benchmark_bundle = calculate_benchmark(target_trial, analog_candidates, selection.output, search_plan.output)
+    direct_analog_benchmark_bundle = calculate_benchmark(target_trial, analog_candidates, selection_output, search_plan.output)
     selected_candidate_by_nct = {candidate.trial.nct_id: candidate for candidate in analog_candidates}
     selected_analog_candidates = tuple(
         selected_candidate_by_nct[item.nct_id]
-        for item in selection.output.selected_analogs
+        for item in selection_output.selected_analogs
         if item.nct_id in selected_candidate_by_nct
     )
-    follow_on_candidates, follow_on_sources, follow_on_flags = retrieve_follow_on_candidates(selected_analogs=selected_analog_candidates)
+    lineage_anchor_candidates = _follow_on_anchor_candidates(
+        selected_analogs=selected_analog_candidates,
+        all_candidates=analog_candidates,
+        selection=selection_output,
+        target_trial=target_trial,
+        limit=max(top_k + 3, len(selected_analog_candidates)),
+    )
+    follow_on_candidates, follow_on_sources, follow_on_flags = retrieve_follow_on_candidates(selected_analogs=lineage_anchor_candidates)
     retrieval_flags = tuple((*retrieval_flags, *follow_on_flags))
     analog_sources = tuple((*analog_sources, *follow_on_sources))
     follow_on_fallback = adjudicate_follow_on_trials_deterministically(
         run_id=run_id,
         target_trial=target_trial,
-        selected_analogs=selected_analog_candidates,
+        selected_analogs=lineage_anchor_candidates,
         follow_on_candidates=follow_on_candidates,
     )
     follow_on_adjudication_config = (
@@ -262,10 +295,10 @@ def run_protocol_design_manager_agent(
         instructions=_follow_on_adjudicator_instructions(),
         output_type=FollowOnTrialAdjudicationOutput,
         run_id=run_id,
-        input_summary=f"Adjudicate follow-on lineages for {len(selected_analog_candidates)} selected analogs.",
+        input_summary=f"Adjudicate follow-on lineages for {len(lineage_anchor_candidates)} selected/rescue analogs.",
         payload={
             **_base_payload(target_trial, agent3_output, agent4_output, source_ids),
-            "selected_analogs": [_compact_analog_candidate(candidate) for candidate in selected_analog_candidates],
+            "selected_analogs": [_compact_analog_candidate(candidate) for candidate in lineage_anchor_candidates],
             "follow_on_candidates": [_compact_follow_on_candidate(candidate) for candidate in follow_on_candidates],
         },
         fallback_output=follow_on_fallback,
@@ -363,16 +396,42 @@ def run_protocol_design_manager_agent(
         qualitative_synthesis=qualitative_synthesis.output,
     )
     payloads.extend(design_decisions)
-    next_study_intent = build_next_study_intent_from_follow_on_precedent(
-        run_id=run_id,
-        target_trial=target_trial,
-        agent3_output=agent3_output,
-        agent4_output=agent4_output,
-        source_ids=source_ids,
-        missing_data_flags=missing_data_flags,
-        benchmark_bundle=benchmark_bundle,
-        qualitative_synthesis=qualitative_synthesis.output,
-    )
+    if follow_on_trials:
+        next_study_intent = build_next_study_intent_from_follow_on_precedent(
+            run_id=run_id,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent4_output=agent4_output,
+            source_ids=source_ids,
+            missing_data_flags=missing_data_flags,
+            benchmark_bundle=benchmark_bundle,
+            qualitative_synthesis=qualitative_synthesis.output,
+        )
+    else:
+        next_study_intent = build_next_study_intent(
+            run_id=run_id,
+            target_trial=target_trial,
+            agent3_output=agent3_output,
+            agent4_output=agent4_output,
+            source_ids=source_ids,
+            missing_data_flags=missing_data_flags,
+        ).model_copy(
+            update={
+                "rationale": (
+                    "No lineage-confirmed follow-on trials were found. This intent is anchored to the target trial, Agent 3 risk context, "
+                    "Agent 4 diligence context, and direct selected analog benchmark only; follow-on precedent is unresolved."
+                ),
+                "alternatives_considered": tuple(
+                    dict.fromkeys(
+                        (
+                            "defer protocol design until same-program follow-on evidence is confirmed",
+                            "use direct analog benchmark only as weaker, human-reviewed precedent",
+                        )
+                    )
+                ),
+                "confidence": min(0.5, benchmark_bundle.confidence),
+            }
+        )
     payloads.append(next_study_intent)
 
     section_outputs = tuple(
@@ -511,7 +570,7 @@ def run_protocol_design_manager_agent(
         analog_candidates=analog_candidates,
         analog_sources=analog_sources,
         retrieval_flags=retrieval_flags,
-        selection=selection.output,
+        selection=selection_output,
         analog_follow_on_candidates=follow_on_candidates,
         follow_on_adjudication=follow_on_adjudication.output,
         follow_on_trials=follow_on_trials,
@@ -831,8 +890,16 @@ def _compact_trial_record(trial: ClinicalTrialRecord, *, eligibility_chars: int 
         "overall_status": trial.overall_status,
         "phases": trial.phases,
         "study_type": trial.study_type,
+        "primary_purpose": trial.primary_purpose,
+        "allocation": trial.allocation,
+        "intervention_model": trial.intervention_model,
+        "masking": trial.masking,
+        "observational_model": trial.observational_model,
+        "number_of_arms": trial.number_of_arms,
         "conditions": trial.conditions,
         "interventions": [item.model_dump(mode="json") for item in trial.interventions[:8]],
+        "intervention_browse_terms": trial.intervention_browse_terms[:12],
+        "arm_groups": [item.model_dump(mode="json") for item in trial.arm_groups[:8]],
         "lead_sponsor": trial.lead_sponsor.model_dump(mode="json") if trial.lead_sponsor else None,
         "collaborators": [item.model_dump(mode="json") for item in trial.collaborators[:5]],
         "enrollment_count": trial.enrollment_count,
@@ -886,6 +953,38 @@ def _compact_follow_on_candidate(candidate: FollowOnCandidateRecord) -> dict[str
         "source_ids": candidate.source_ids,
         "provenance": candidate.provenance,
     }
+
+
+def _follow_on_anchor_candidates(
+    *,
+    selected_analogs: tuple[AnalogCandidateRecord, ...],
+    all_candidates: tuple[AnalogCandidateRecord, ...],
+    selection: AnalogTrialSelectionOutput,
+    target_trial: ClinicalTrialRecord,
+    limit: int,
+) -> tuple[AnalogCandidateRecord, ...]:
+    """Use selected analogs plus bounded high-score rescue anchors for lineage search."""
+
+    selected_ids = {candidate.trial.nct_id for candidate in selected_analogs}
+    excluded_or_unevaluable = {
+        item.nct_id
+        for item in (*selection.excluded_candidates, *selection.unevaluable_candidates)
+    }
+    rescue_rows = [
+        (score_current_trial_candidate(target_trial, candidate)[0], candidate)
+        for candidate in all_candidates
+        if candidate.trial.nct_id not in selected_ids and candidate.trial.nct_id in excluded_or_unevaluable
+    ]
+    rescue_rows.sort(key=lambda item: (-item[0].match_score, item[0].nct_id))
+    rescue = tuple(candidate for score, candidate in rescue_rows if score.match_score >= 0.55)[: max(0, limit - len(selected_analogs))]
+    ordered: list[AnalogCandidateRecord] = []
+    seen: set[str] = set()
+    for candidate in (*selected_analogs, *rescue):
+        if candidate.trial.nct_id in seen:
+            continue
+        seen.add(candidate.trial.nct_id)
+        ordered.append(candidate)
+    return tuple(ordered)
 
 
 def _compact_benchmark_bundle(bundle: AnalogBenchmarkBundle) -> dict[str, Any]:
@@ -950,6 +1049,7 @@ def _fallback_benchmark_interpretation(
     if benchmark_bundle.primary_endpoint_family_frequency:
         common_patterns.append(f"Primary endpoint family most often detected as {benchmark_bundle.primary_endpoint_family_frequency[0].label}.")
     weak = tuple(benchmark_bundle.limitations) or ("Benchmark interpretation is limited by available CT.gov fields.",)
+    evidence_subject = "follow-on benchmark" if benchmark_bundle.evidence_mode == "follow_on" else "direct analog benchmark"
     return BenchmarkInterpretation(
         output_id=f"benchmark-interpretation-{run_id}",
         target_nct_id=target_trial.nct_id,
@@ -957,17 +1057,17 @@ def _fallback_benchmark_interpretation(
         target_alignment=(
             f"Analog alignment should be reviewed against the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}, not only the anchor trial phase."
             if next_study_intent
-            else "Follow-on benchmark alignment is derived from observed successor trials, not a preselected future-study hypothesis.",
+            else f"{evidence_subject.title()} alignment is derived from source-backed CT.gov records, not a preselected future-study hypothesis.",
         ),
         target_misalignment=("No source-backed next-study misalignment should be treated as final without human review.",),
         strategy_implications=(
             f"Use benchmark patterns as review inputs for the proposed next study objective: {next_study_intent.development_objective}."
             if next_study_intent
-            else "Use follow-on benchmark patterns as review inputs for analog-derived protocol choices.",
+            else f"Use {evidence_subject} patterns as review inputs for analog-derived protocol choices.",
         ),
         weak_or_incomplete_findings=weak,
         human_review_questions=(
-            f"Do selected analogs fit the proposed next study role: {next_study_intent.study_role}?" if next_study_intent else "Do selected follow-on trials provide enough precedent for protocol drafting?",
+            f"Do selected analogs fit the proposed next study role: {next_study_intent.study_role}?" if next_study_intent else f"Does the {evidence_subject} provide enough precedent for protocol drafting?",
             "Which benchmark patterns are strong enough to influence protocol strategy?",
             "Which analog limitations should reduce confidence in protocol design choices?",
         ),
@@ -994,6 +1094,7 @@ def _section_agent_specs(
         next_study_intent=next_study_intent,
         source_ids=source_ids,
         benchmark_summary=build_benchmark_summary(benchmark_bundle),
+        benchmark_evidence_mode=benchmark_bundle.evidence_mode,
         agent3_output=agent3_output,
         agent4_output=agent4_output,
     )
@@ -1522,20 +1623,14 @@ def select_analog_trials(
     del agent3_output, agent4_output, search_plan, next_study_intent
     candidates = annotate_analog_similarity_features(target_trial=target_trial, candidates=candidates)
     scored = [
-        _score_current_trial_candidate(target_trial, candidate)
+        score_current_trial_candidate(target_trial, candidate)
         for candidate in candidates
         if candidate.trial.nct_id != target_trial.nct_id
     ]
     scored.sort(key=lambda item: (-item[0].match_score, item[0].nct_id))
     selected = tuple(item[0] for item in scored[:top_k] if item[0].match_score >= 0.35)
     selected_ids = {item.nct_id for item in selected}
-    excluded = [
-        ExcludedAnalogTrial(
-            nct_id=target_trial.nct_id,
-            reason="Target trial was excluded from analog benchmarking.",
-            source_ids=(target_trial.source_id,),
-        )
-    ]
+    excluded: list[ExcludedAnalogTrial] = []
     for selection, candidate in scored:
         if selection.nct_id in selected_ids:
             continue
@@ -1547,13 +1642,11 @@ def select_analog_trials(
             )
         )
     for candidate in candidates:
-        if candidate.trial.nct_id != target_trial.nct_id or candidate.trial.nct_id in selected_ids:
-            continue
-        if not any(item.nct_id == candidate.trial.nct_id for item in excluded):
+        if candidate.trial.nct_id == target_trial.nct_id and candidate.trial.nct_id not in selected_ids:
             excluded.append(
                 ExcludedAnalogTrial(
                     nct_id=candidate.trial.nct_id,
-                    reason="Target trial was excluded from analog benchmarking.",
+                    reason="Target trial was retrieved and excluded from analog benchmarking.",
                     source_ids=candidate.source_ids,
                 )
             )
@@ -1574,6 +1667,7 @@ def build_protocol_strategy_sections(
     next_study_intent: NextStudyIntent,
     source_ids: tuple[str, ...],
     benchmark_summary: str,
+    benchmark_evidence_mode: str,
     agent3_output: ClinicalOutcomePredictionOutput,
     agent4_output: DueDiligenceOutput,
 ) -> dict[str, ProtocolSectionDraft]:
@@ -1585,6 +1679,8 @@ def build_protocol_strategy_sections(
     endpoint = _endpoint_family(target_trial) or "endpoint family not clearly classified"
     risk = agent4_output.clinical_risk_summary.endpoint_risk_level or "unknown"
     population = _population_summary(target_trial)
+    evidence_subject = "selected follow-on trials" if benchmark_evidence_mode == "follow_on" else "direct selected analog trials"
+    support_label = "follow-on supported" if benchmark_evidence_mode == "follow_on" else "analog-majority, minority-precedent, unresolved, or human-decision-required"
     sections = {
         "executive_synopsis": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-executive-synopsis",
@@ -1602,7 +1698,7 @@ def build_protocol_strategy_sections(
             title="Strategic Rationale",
             body=(
                 f"Next-study rationale: {next_study_intent.rationale} Agent 3 clinical-risk context, Agent 4 diligence findings, "
-                f"and observed follow-on trial benchmarks from selected analog programs inform the draft. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags. "
+                f"and {evidence_subject} benchmarks inform the draft. Endpoint risk is {risk}; missing or low-confidence upstream items are carried as flags. "
                 f"Alternatives considered: {'; '.join(next_study_intent.alternatives_considered) or 'none recorded'}."
             ),
             source_ids=source_ids,
@@ -1630,7 +1726,7 @@ def build_protocol_strategy_sections(
             title="Study Design",
             body=(
                 f"Draft design should be benchmarked for the proposed {next_study_intent.proposed_next_stage} {next_study_intent.study_role}. "
-                "Selected follow-on trials should inform randomization, blinding, arm count, duration, and enrollment burden; no final protocol design decision is made by Agent 5."
+                f"{evidence_subject} should inform randomization, blinding, arm count, endpoint timing, treatment duration, and enrollment burden only with support labels ({support_label}); no final protocol design decision is made by Agent 5."
             ),
             source_ids=source_ids,
             confidence=0.6,
@@ -1638,7 +1734,7 @@ def build_protocol_strategy_sections(
         "comparator_and_landscape_rationale": ProtocolSectionDraft(
             section_id=f"pd-{run_id}-comparator-landscape",
             title="Comparator And Landscape Rationale",
-            body="Comparator rationale is based on named comparators and control categories detected in selected follow-on CT.gov trials plus Agent 4 competitive-landscape context.",
+            body=f"Comparator rationale is based on named comparators and control categories detected in {evidence_subject} plus Agent 4 competitive-landscape context.",
             source_ids=source_ids,
             confidence=0.6,
         ),
@@ -1808,63 +1904,8 @@ def _score_candidate(target: ClinicalTrialRecord, next_study_intent: NextStudyIn
     )
 
 
-def _score_current_trial_candidate(target: ClinicalTrialRecord, candidate: AnalogCandidateRecord) -> tuple[SelectedAnalogTrial, AnalogCandidateRecord]:
-    trial = candidate.trial
-    features = candidate.similarity_features or {}
-    matched: list[str] = []
-    mismatched: list[str] = []
-    unknown: list[str] = []
-    weights = {
-        "same_indication": 0.3,
-        "same_or_comparable_phase": 0.2,
-        "same_endpoint_family": 0.15,
-        "same_comparator_structure": 0.1,
-        "same_modality": 0.1,
-        "similar_population": 0.075,
-        "similar_biomarker_or_line": 0.05,
-        "target_or_moa_overlap": 0.025,
-    }
-    score = 0.0
-    for key, weight in weights.items():
-        value = features.get(key)
-        if value is True:
-            matched.append(key)
-            score += weight
-        elif value is False:
-            mismatched.append(key)
-        else:
-            unknown.append(key)
-    confidence = "high" if score >= 0.7 else "medium" if score >= 0.45 else "low"
-    return (
-        SelectedAnalogTrial(
-            nct_id=trial.nct_id,
-            match_score=round(score, 3),
-            match_confidence=confidence,
-            matched_dimensions=tuple(matched),
-            mismatched_dimensions=tuple(mismatched),
-            unknown_dimensions=tuple(unknown),
-            reasoning="Selected against current-trial similarity features; no future-study hypothesis was used.",
-            source_ids=candidate.source_ids,
-        ),
-        candidate,
-    )
-
-
 def _endpoint_family(trial: ClinicalTrialRecord) -> str | None:
-    text = " ".join(endpoint.measure for endpoint in (*trial.primary_endpoints, *trial.secondary_endpoints)).casefold()
-    if not text:
-        return None
-    if any(term in text for term in ("overall survival", "mortality", "death")):
-        return "survival"
-    if any(term in text for term in ("progression-free", "time to", "duration")):
-        return "time_to_event"
-    if any(term in text for term in ("response", "orr", "remission")):
-        return "response"
-    if any(term in text for term in ("safety", "adverse", "toxicity")):
-        return "safety"
-    if any(term in text for term in ("biomarker", "pharmacodynamic", "marker")):
-        return "biomarker"
-    return "other"
+    return semantic_endpoint_family_from_trial(trial)
 
 
 def _comparator_hint(trial: ClinicalTrialRecord) -> str | None:

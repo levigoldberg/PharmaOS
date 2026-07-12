@@ -38,8 +38,9 @@ from pharma_os.tools._due_diligence_common import (
     triplet_base,
 )
 from pharma_os.tools.census import CensusPopulationClient, CensusPopulationError
+from pharma_os.tools.clinical_semantics import same_indication
 from pharma_os.tools.pubmed import PubMedArticle, PubMedClient, PubMedError
-from pharma_os.tools.rules import config_provenance, config_source_id, load_config
+from pharma_os.tools.rules import config_provenance, config_source_id, human_override, load_config
 
 
 class CommercialModelRunResult(BaseModel):
@@ -517,7 +518,11 @@ def _title_indication_phrases(trial: ClinicalTrialRecord) -> tuple[list[str], li
 
 
 def _target_indication(trial: ClinicalTrialRecord, asset: AssetIdentityOutput | None) -> str | None:
-    return (asset.normalized_indication if asset else None) or (trial.conditions[0] if trial.conditions else None)
+    if asset and asset.normalized_indication and human_override(trial.nct_id).get("indication"):
+        return asset.normalized_indication
+    if trial.conditions and asset and asset.normalized_indication and same_indication(trial.conditions, (asset.normalized_indication,)):
+        return asset.normalized_indication
+    return (trial.conditions[0] if trial.conditions else None) or (asset.normalized_indication if asset else None)
 
 
 def _dedupe_articles(articles: list[PubMedArticle]) -> list[PubMedArticle]:

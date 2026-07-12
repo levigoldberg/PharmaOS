@@ -27,6 +27,7 @@ from pharma_os.schemas import (
     BenchmarkFrequency,
     ClinicalOutcomePredictionInput,
     ClinicalOutcomePredictionOutput,
+    ClinicalTrialRecord,
     DueDiligenceInput,
     DueDiligenceOutput,
     HumanGate,
@@ -102,7 +103,10 @@ def run_protocol_design_workflow(
         for assumption in (*agent3_output.assumptions, *agent4_output.assumptions)
         if assumption.requires_human_review or assumption.assumption_type in {"calculated", "missing", "user_reviewed"}
     )
-    upstream_missing_flags = _dedupe_missing_flags((*agent3_output.missing_data_flags, *agent4_output.missing_data_flags))
+    upstream_missing_flags = reconcile_missing_data_flags(
+        target_trial,
+        _dedupe_missing_flags((*agent3_output.missing_data_flags, *agent4_output.missing_data_flags)),
+    )
 
     manager_result = run_protocol_design_manager_agent(
         run_id=run_id,
@@ -137,13 +141,15 @@ def run_protocol_design_workflow(
         )
     )
     source_ids = tuple(source.source_id for source in sources)
-    missing_data_flags = _dedupe_missing_flags(
-        (
-            *manager_result.retrieval_flags,
-            *benchmark_bundle.missing_data_flags,
-            *agent3_output.missing_data_flags,
-            *agent4_output.missing_data_flags,
-        )
+    missing_data_flags = reconcile_missing_data_flags(
+        target_trial,
+        _dedupe_missing_flags(
+            (
+                *manager_result.retrieval_flags,
+                *benchmark_bundle.missing_data_flags,
+                *upstream_missing_flags,
+            )
+        ),
     )
     benchmark_bundle = benchmark_bundle.model_copy(
         update={
@@ -187,7 +193,7 @@ def run_protocol_design_workflow(
         analog_follow_on_candidates=manager_result.analog_follow_on_candidates,
         follow_on_adjudications=manager_result.follow_on_adjudication.adjudications,
         follow_on_trials=manager_result.follow_on_trials,
-        analog_benchmark_bundle=manager_result.direct_analog_benchmark_bundle,
+        analog_benchmark_bundle=benchmark_bundle if benchmark_bundle.evidence_mode == "direct_analog" else manager_result.direct_analog_benchmark_bundle,
         follow_on_benchmark_bundle=manager_result.follow_on_benchmark_bundle,
         qualitative_protocol_synthesis=manager_result.qualitative_synthesis,
         analog_derived_design_decisions=manager_result.design_decisions,
@@ -594,6 +600,11 @@ def _filter_benchmark_source_ids(
             "source_ids": filtered(bundle.source_ids),
             "enrollment": bundle.enrollment.model_copy(update={"source_ids": filtered(bundle.enrollment.source_ids)}),
             "planned_duration_months": bundle.planned_duration_months.model_copy(update={"source_ids": filtered(bundle.planned_duration_months.source_ids)}),
+            "treatment_duration_weeks": bundle.treatment_duration_weeks.model_copy(update={"source_ids": filtered(bundle.treatment_duration_weeks.source_ids)}),
+            "primary_endpoint_timing_weeks": bundle.primary_endpoint_timing_weeks.model_copy(update={"source_ids": filtered(bundle.primary_endpoint_timing_weeks.source_ids)}),
+            "follow_up_duration_weeks": bundle.follow_up_duration_weeks.model_copy(update={"source_ids": filtered(bundle.follow_up_duration_weeks.source_ids)}),
+            "enrollment_period_months": bundle.enrollment_period_months.model_copy(update={"source_ids": filtered(bundle.enrollment_period_months.source_ids)}),
+            "total_study_execution_duration_months": bundle.total_study_execution_duration_months.model_copy(update={"source_ids": filtered(bundle.total_study_execution_duration_months.source_ids)}),
             "site_count": bundle.site_count.model_copy(update={"source_ids": filtered(bundle.site_count.source_ids)}),
             "randomized_frequency": filtered_freqs(bundle.randomized_frequency),
             "blinding_frequency": filtered_freqs(bundle.blinding_frequency),
@@ -681,6 +692,31 @@ def _dedupe_missing_flags(flags: tuple[object, ...]) -> tuple[object, ...]:
     for flag in flags:
         deduped[getattr(flag, "flag_id")] = flag
     return tuple(deduped.values())
+
+
+def reconcile_missing_data_flags(target_trial: ClinicalTrialRecord, flags: tuple[object, ...]) -> tuple[object, ...]:
+    """Remove stale upstream flags contradicted by the current target trial record."""
+
+    eligibility = target_trial.eligibility_criteria or ""
+    eligibility_lower = eligibility.casefold()
+    full_eligibility_present = (
+        len(eligibility) >= 1000
+        and "inclusion" in eligibility_lower
+        and "exclusion" in eligibility_lower
+        and "[truncated]" not in eligibility_lower
+    )
+    if not full_eligibility_present:
+        return flags
+    reconciled = []
+    for flag in flags:
+        field = str(getattr(flag, "field", "") or "").casefold()
+        reason = str(getattr(flag, "reason", "") or "").casefold()
+        flag_id = str(getattr(flag, "flag_id", "") or "").casefold()
+        if "eligibility" in field or "eligibility" in reason or "eligibility" in flag_id:
+            if any(term in reason or term in flag_id for term in ("truncat", "detailed-eligibility", "detailed_eligibility")):
+                continue
+        reconciled.append(flag)
+    return _dedupe_missing_flags(tuple(reconciled))
 
 
 def _confidence(flags: tuple[object, ...], benchmark_confidence: float) -> float:

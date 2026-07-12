@@ -29,7 +29,20 @@ DEFAULT_RULES: dict[str, Any] = {
             {"id": "indication_parkinsons", "terms": ["Parkinson Disease", "Parkinson's Disease"], "normalized_indication": "Parkinson's disease", "therapeutic_area": "neurology"},
             {"id": "indication_dementia_related_psychosis", "terms": ["Dementia-related Psychosis", "Dementia With Lewy Bodies"], "normalized_indication": "dementia-related psychosis", "therapeutic_area": "neurology"},
             {"id": "indication_multiple_sclerosis", "terms": ["Multiple Sclerosis"], "normalized_indication": "multiple sclerosis", "therapeutic_area": "neurology/immunology"},
+            {"id": "indication_psoriasis", "terms": ["Psoriasis", "Plaque Psoriasis", "Psoriatic"], "normalized_indication": "psoriasis", "therapeutic_area": "immunology/dermatology"},
+            {"id": "indication_atopic_dermatitis", "terms": ["Atopic Dermatitis", "AD", "Eczema"], "normalized_indication": "atopic dermatitis", "therapeutic_area": "immunology/dermatology"},
+            {"id": "indication_systemic_lupus_erythematosus", "terms": ["Systemic Lupus Erythematosus", "SLE", "Lupus"], "normalized_indication": "systemic lupus erythematosus", "therapeutic_area": "immunology"},
         ],
+    },
+    "asset_aliases.yaml": {
+        "aliases": {
+            "CP-690,550": ["CP 690,550", "CP-690550", "tofacitinib", "tasocitinib"],
+            "AIN457": ["secukinumab"],
+            "secukinumab": ["AIN457"],
+            "JNJ-77242113": ["JNJ 77242113"],
+            "NDI-034858": ["TAK-279", "TAK279"],
+            "TAK-279": ["NDI-034858", "TAK279"],
+        }
     },
     "sponsor_aliases.yaml": {
         "aliases": {
@@ -47,6 +60,7 @@ DEFAULT_RULES: dict[str, Any] = {
 CONFIG_SOURCE_IDS = {
     "shared": {
         "human_overrides.yaml": "config:shared:human_overrides",
+        "asset_aliases.yaml": "config:shared:asset_aliases",
         "indication_rules.yaml": "config:shared:indication_rules",
         "modality_rules.yaml": "config:shared:modality_rules",
         "sponsor_aliases.yaml": "config:shared:sponsor_aliases",

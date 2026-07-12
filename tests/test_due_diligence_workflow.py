@@ -24,6 +24,7 @@ from pharma_os.schemas import (
     FailureModeClassification,
     HistoricalPoSEstimate,
     LabelExpansionClinicalRationale,
+    MissingDataFlag,
     PatentExclusivityOutput,
     PoSOutput,
     PricingOutput,
@@ -31,6 +32,7 @@ from pharma_os.schemas import (
     SafetyLabelSummary,
     SourceMetadata,
     SourceAvailabilityReport,
+    TrialArmGroup,
     TrialIntervention,
     TrialDesignFeatures,
     TrialIdentity,
@@ -590,6 +592,109 @@ def test_due_diligence_missing_loe_and_commercial_inputs_create_flags_and_questi
     assert any(flag.category in {"ip_loe", "rnpv"} for flag in output.red_flags)
     assert any("LOE" in question for question in output.asset_memo.review_questions)
     assert any("rNPV" in question for question in output.asset_memo.review_questions)
+
+
+def test_due_diligence_blocks_commercial_model_on_unresolved_indication_mismatch(monkeypatch) -> None:
+    monkeypatch.setattr(due_diligence, "human_override", lambda nct_id: {})
+    trial = ClinicalTrialRecord(
+        nct_id="NCT05966480",
+        conditions=("SLE",),
+        interventions=(TrialIntervention(name="Envudeucitinib", type="DRUG"),),
+        lead_sponsor=TrialSponsor(name="Alumis Inc"),
+        source_id="ctgov:NCT05966480",
+    )
+    asset = AssetIdentityOutput(
+        nct_id="NCT05966480",
+        asset_name="Envudeucitinib",
+        normalized_indication="atopic dermatitis",
+        source_ids=("ctgov:NCT05966480",),
+        confidence=0.7,
+    )
+
+    flag = due_diligence._commercial_indication_conflict_flag(trial, asset)
+    assert flag is not None
+    pricing, pricing_sources, commercial_result = due_diligence._blocked_commercial_outputs(flag=flag, asset=asset)
+
+    assert pricing_sources == ()
+    assert pricing.annual_wac is None
+    assert pricing.missing_data_flags == (flag,)
+    assert commercial_result.output.calculable is False
+    assert commercial_result.output.peak_net_sales is None
+    assert commercial_result.output.missing_data_flags == (flag,)
+
+
+def test_due_diligence_indication_override_allows_commercial_model(monkeypatch) -> None:
+    monkeypatch.setattr(due_diligence, "human_override", lambda nct_id: {"indication": "atopic dermatitis"})
+    trial = ClinicalTrialRecord(
+        nct_id="NCT05966480",
+        conditions=("SLE",),
+        interventions=(TrialIntervention(name="Envudeucitinib", type="DRUG"),),
+        source_id="ctgov:NCT05966480",
+    )
+    asset = AssetIdentityOutput(
+        nct_id="NCT05966480",
+        asset_name="Envudeucitinib",
+        normalized_indication="atopic dermatitis",
+        source_ids=("ctgov:NCT05966480",),
+        confidence=0.7,
+    )
+
+    assert due_diligence._commercial_indication_conflict_flag(trial, asset) is None
+
+
+def test_due_diligence_reconciles_nct05966480_false_missing_flags() -> None:
+    trial = ClinicalTrialRecord(
+        nct_id="NCT05966480",
+        brief_title="Phase 2 Placebo-Controlled Study of ESK-001 in Active Systemic Lupus Erythematosus",
+        official_title="A Phase 2, Randomized, Double-blind, Placebo-Controlled Study of ESK-001 in Adult Patients With Systemic Lupus Erythematosus",
+        conditions=("SLE",),
+        eligibility_criteria="Inclusion Criteria:\nActive SLE.\n\nExclusion Criteria:\nClinically significant uncontrolled disease.",
+        arm_groups=(
+            TrialArmGroup(label="ESK-001 Dose Level 1", type="EXPERIMENTAL", intervention_names=("Envudeucitinib",)),
+            TrialArmGroup(label="ESK-001 Dose Level 2", type="EXPERIMENTAL", intervention_names=("Envudeucitinib",)),
+            TrialArmGroup(label="ESK-001 Dose Level 3", type="EXPERIMENTAL", intervention_names=("Envudeucitinib",)),
+            TrialArmGroup(label="Placebo", type="PLACEBO_COMPARATOR", intervention_names=("Placebo",)),
+        ),
+        source_id="ctgov:NCT05966480",
+    )
+    canonical = due_diligence._canonicalize_trial_design_fields(trial)
+    flags = (
+        MissingDataFlag(
+            flag_id="blinding-allocation-missing",
+            section="trial_design",
+            field="allocation_and_masking",
+            reason="Allocation and masking fields are null in the supplied record.",
+            severity="high",
+        ),
+        MissingDataFlag(
+            flag_id="arms-count-inconsistency",
+            section="trial_design",
+            field="arms_count",
+            reason="Arm listings include multiple dose levels plus placebo but arms_count is inconsistent.",
+            severity="medium",
+        ),
+        MissingDataFlag(
+            flag_id="registry-safety-exclusions-omitted",
+            section="registry_record",
+            field="eligibility_criteria/exclusions",
+            reason="Registry extract is context-compacted and omits detailed safety exclusions.",
+            severity="medium",
+        ),
+        MissingDataFlag(
+            flag_id="patent-loe-review-required",
+            section="patent_exclusivity",
+            field="estimated_loe_year",
+            reason="No credible selected patent family or reviewed LOE year was available.",
+            severity="high",
+        ),
+    )
+
+    reconciled = due_diligence.reconcile_due_diligence_missing_data_flags(canonical, flags)
+
+    assert canonical.allocation == "RANDOMIZED"
+    assert canonical.masking == "DOUBLE"
+    assert canonical.number_of_arms == 4
+    assert {flag.flag_id for flag in reconciled} == {"patent-loe-review-required"}
 
 
 def test_due_diligence_guardrail_blocks_decision_language(monkeypatch) -> None:

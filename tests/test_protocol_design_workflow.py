@@ -65,6 +65,7 @@ from pharma_os.tools.protocol_design import (
     calculate_analog_benchmark,
     execute_ctgov_search_plan,
     hydrate_selected_analog_candidates,
+    normalize_analog_selection_output,
     retrieve_follow_on_candidates,
 )
 from pharma_os.tools.clinicaltrials import ClinicalTrialsGovError
@@ -642,6 +643,54 @@ def test_follow_on_search_expands_development_code_aliases_and_retries_broader_q
     assert not any(flag.flag_id.startswith("protocol-design-follow-on-search-nct00678210") for flag in flags)
 
 
+def test_follow_on_search_finds_later_secukinumab_program_with_sponsor_context() -> None:
+    anchor = ClinicalTrialRecord(
+        nct_id="NCT00669916",
+        brief_title="Study of AIN457 in Plaque Psoriasis",
+        overall_status="COMPLETED",
+        phases=("PHASE2",),
+        study_type="INTERVENTIONAL",
+        conditions=("Plaque Psoriasis",),
+        interventions=(TrialIntervention(name="AIN457", type="BIOLOGICAL"), TrialIntervention(name="Placebo", type="DRUG")),
+        lead_sponsor=TrialSponsor(name="Novartis Pharmaceuticals", sponsor_class="INDUSTRY"),
+        start_date="2008-01",
+        source_id="ctgov:NCT00669916",
+    )
+    follow_on = ClinicalTrialRecord(
+        nct_id="NCT01365455",
+        brief_title="Secukinumab Phase 3 Study in Moderate to Severe Plaque Psoriasis",
+        overall_status="COMPLETED",
+        phases=("PHASE3",),
+        study_type="INTERVENTIONAL",
+        conditions=("Moderate to Severe Plaque Psoriasis",),
+        interventions=(TrialIntervention(name="Secukinumab", type="BIOLOGICAL"), TrialIntervention(name="Placebo", type="DRUG")),
+        lead_sponsor=TrialSponsor(name="Novartis Pharmaceuticals", sponsor_class="INDUSTRY"),
+        start_date="2011-04",
+        source_id="ctgov:NCT01365455",
+    )
+    analog = AnalogCandidateRecord(candidate_id="analog", trial=anchor, source_ids=(anchor.source_id,), provenance="test")
+    seen_sponsors: list[str | None] = []
+
+    class FakeClient:
+        def search_trials(self, input_data):
+            seen_sponsors.append(input_data.sponsor)
+            if input_data.sponsor and (input_data.drug == "secukinumab" or input_data.target == "secukinumab"):
+                return ClinicalTrialsSearchResult(
+                    query=input_data,
+                    trials=(anchor, follow_on),
+                    sources=(_source(anchor.source_id, "clinical_trial_registry"), _source(follow_on.source_id, "clinical_trial_registry")),
+                    api_url="https://clinicaltrials.gov/api/v2/studies",
+                )
+            return ClinicalTrialsSearchResult(query=input_data, trials=(), sources=(), api_url="https://clinicaltrials.gov/api/v2/studies")
+
+    candidates, _, flags = retrieve_follow_on_candidates(selected_analogs=(analog,), client=FakeClient())
+
+    viable = [candidate.trial.nct_id for candidate in candidates if candidate.exclusion_reason is None]
+    assert "NCT01365455" in viable
+    assert any(sponsor == "Novartis Pharmaceuticals" for sponsor in seen_sponsors)
+    assert not any(flag.flag_id == "protocol-design-no-follow-on-candidates" for flag in flags)
+
+
 def test_follow_on_adjudication_supports_multiple_and_no_plausible_branches() -> None:
     analog_with_branches = AnalogCandidateRecord(candidate_id="a1", trial=_analog("NCT00000001"), source_ids=("ctgov:NCT00000001",), provenance="test")
     analog_without_branch = AnalogCandidateRecord(candidate_id="a2", trial=_analog("NCT00000002"), source_ids=("ctgov:NCT00000002",), provenance="test")
@@ -734,6 +783,133 @@ def test_analog_search_and_selection_use_current_trial_not_next_study_intent() -
     assert selection.selected_analogs
     assert "same_indication" in selection.selected_analogs[0].matched_dimensions
     assert "proposed_next_stage" not in selection.selected_analogs[0].matched_dimensions
+
+
+def test_analog_selection_normalizer_assigns_complete_candidate_disposition() -> None:
+    target = _target_trial()
+    candidates = tuple(
+        AnalogCandidateRecord(
+            candidate_id=f"c-{nct_id}",
+            trial=_analog(nct_id),
+            query_ids=("q1",),
+            source_ids=(f"ctgov:{nct_id}",),
+            provenance="test",
+        )
+        for nct_id in ("NCT00000001", "NCT00000002", "NCT00000003")
+    )
+    live_selection = AnalogTrialSelectionOutput(
+        output_id="selection",
+        target_nct_id=target.nct_id,
+        selected_analogs=(
+            SelectedAnalogTrial(
+                nct_id="NCT00000001",
+                match_score=0.9,
+                match_confidence="high",
+                reasoning="Live agent selected only one candidate.",
+            ),
+        ),
+    )
+
+    repaired = normalize_analog_selection_output(
+        run_id="run",
+        target_trial=target,
+        selection=live_selection,
+        candidates=candidates,
+        top_k=1,
+    )
+
+    dispositions = [
+        *(item.nct_id for item in repaired.selected_analogs),
+        *(item.nct_id for item in repaired.excluded_candidates),
+        *(item.nct_id for item in repaired.unevaluable_candidates),
+    ]
+    assert set(dispositions) == {candidate.trial.nct_id for candidate in candidates}
+    assert len(dispositions) == len(set(dispositions))
+
+
+def test_semantic_selection_prefers_oral_psoriasis_efficacy_over_iv_pk() -> None:
+    agent3, _, agent4, _ = _handoffs()
+    target = ClinicalTrialRecord(
+        nct_id="NCT04999839",
+        brief_title="Oral NDI-034858 in Plaque Psoriasis",
+        phases=("PHASE2",),
+        study_type="INTERVENTIONAL",
+        allocation="RANDOMIZED",
+        masking="DOUBLE",
+        conditions=("Moderate to Severe Plaque Psoriasis",),
+        interventions=(
+            TrialIntervention(name="NDI-034858 tablet", type="DRUG", description="Oral tablet once daily"),
+            TrialIntervention(name="Placebo", type="DRUG"),
+        ),
+        primary_endpoints=(TrialEndpoint(measure="PASI 75 response at Week 12", time_frame="Week 12", endpoint_type="primary"),),
+        source_id="ctgov:NCT04999839",
+    )
+    oral_pasi = AnalogCandidateRecord(
+        candidate_id="oral",
+        trial=ClinicalTrialRecord(
+            nct_id="NCT03635099",
+            brief_title="Oral psoriasis efficacy trial",
+            phases=("PHASE2",),
+            study_type="INTERVENTIONAL",
+            allocation="RANDOMIZED",
+            masking="DOUBLE",
+            conditions=("Plaque Psoriasis",),
+            interventions=(
+                TrialIntervention(name="BI 730357 tablet", type="DRUG", description="Oral tablet"),
+                TrialIntervention(name="Placebo", type="DRUG"),
+            ),
+            primary_endpoints=(TrialEndpoint(measure="PASI 75 response at Week 12", time_frame="Week 12", endpoint_type="primary"),),
+            source_id="ctgov:NCT03635099",
+        ),
+        query_ids=("q1",),
+        source_ids=("ctgov:NCT03635099",),
+        provenance="test",
+    )
+    iv_pk = AnalogCandidateRecord(
+        candidate_id="iv",
+        trial=ClinicalTrialRecord(
+            nct_id="NCT01585233",
+            brief_title="Intravenous PK psoriasis trial",
+            phases=("PHASE1",),
+            study_type="INTERVENTIONAL",
+            allocation="RANDOMIZED",
+            masking="NONE",
+            conditions=("Psoriasis",),
+            interventions=(TrialIntervention(name="ASKP1240 intravenous infusion", type="DRUG"),),
+            primary_endpoints=(TrialEndpoint(measure="Pharmacokinetic AUC and safety", time_frame="Week 4", endpoint_type="primary"),),
+            source_id="ctgov:NCT01585233",
+        ),
+        query_ids=("q1",),
+        source_ids=("ctgov:NCT01585233",),
+        provenance="test",
+    )
+    plan = AnalogSearchPlanOutput(
+        output_id="plan",
+        target_nct_id=target.nct_id,
+        queries=(
+            CTGovSearchQuery(
+                query_id="q1",
+                condition="Plaque Psoriasis",
+                expected_analog_dimension="semantic ranking fixture",
+                rationale="test",
+            ),
+        ),
+        rationale="test",
+    )
+
+    selection = protocol_design.select_analog_trials(
+        run_id="run",
+        target_trial=target,
+        candidates=(iv_pk, oral_pasi),
+        agent3_output=agent3,
+        agent4_output=agent4,
+        search_plan=plan,
+        top_k=1,
+    )
+
+    assert selection.selected_analogs[0].nct_id == "NCT03635099"
+    assert "same_indication" in selection.selected_analogs[0].matched_dimensions
+    assert "same_modality" in selection.selected_analogs[0].matched_dimensions
 
 
 def test_protocol_design_workflow_returns_brief_and_persists_bundle(monkeypatch) -> None:
@@ -899,8 +1075,13 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids(monkeyp
     assert result.search_plan.queries
     assert len(result.search_plan.queries) >= 3
     assert result.selection.selected_analogs
-    assert result.selection.excluded_candidates
-    assert all(item.reason for item in result.selection.excluded_candidates)
+    dispositions = {
+        *(item.nct_id for item in result.selection.selected_analogs),
+        *(item.nct_id for item in result.selection.excluded_candidates),
+        *(item.nct_id for item in result.selection.unevaluable_candidates),
+    }
+    assert dispositions == {candidate.trial.nct_id for candidate in result.analog_candidates}
+    assert all(item.reason for item in (*result.selection.excluded_candidates, *result.selection.unevaluable_candidates))
     assert result.follow_on_trials
     assert result.follow_on_adjudication.adjudications[0].status == "multiple_plausible_branches"
     assert result.benchmark_bundle.enrollment.median == 200.0
