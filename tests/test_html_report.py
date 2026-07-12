@@ -196,6 +196,51 @@ def test_cumulative_nct_report_uses_latest_outputs_in_lifecycle_order(tmp_path) 
     assert "old report" not in output_path.read_text(encoding="utf-8")
 
 
+def test_cumulative_nct_report_finds_nested_orchestration_payload_ncts() -> None:
+    store = MemoryStore(":memory:")
+    nct_id = "NCT77777777"
+    base_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    _save_workflow_output(
+        store,
+        "NESTED_A3",
+        "clinical_outcome_prediction",
+        nct_id,
+        base_time,
+        _agent3_output(nct_id, "NestedAsset"),
+        metadata={},
+        input_payload={"cli_input": {"nct_id": nct_id}},
+    )
+    _save_workflow_output(
+        store,
+        "NESTED_A4",
+        "due_diligence",
+        nct_id,
+        base_time + timedelta(minutes=1),
+        _agent4_output(nct_id),
+        validation_status="needs_human_review",
+        metadata={},
+        input_payload={"cli_input": {"nct_id": nct_id}},
+    )
+    _save_workflow_output(
+        store,
+        "NESTED_A5",
+        "protocol_design",
+        nct_id,
+        base_time + timedelta(minutes=2),
+        _agent5_output(nct_id),
+        validation_status="needs_human_review",
+        metadata={},
+        input_payload={"cli_input": {"nct_id": nct_id}},
+    )
+
+    html = build_nct_report_html(nct_id, memory=store)
+
+    assert "Agent 3 - Clinical Outcome Prediction" in html
+    assert "Agent 4 - Due Diligence" in html
+    assert "Agent 5 - Protocol Design" in html
+    assert "NestedAsset" in html
+
+
 def test_cumulative_nct_report_persistent_default_path(tmp_path) -> None:
     nct_id = "NCT88888888"
     store = MemoryStore(tmp_path / ".pharma_os" / "scientific_memory.sqlite")
@@ -207,6 +252,11 @@ def test_cumulative_nct_report_persistent_default_path(tmp_path) -> None:
     assert output_path.exists()
     assert "PharmaOS Cumulative Report" in output_path.read_text(encoding="utf-8")
     assert write_nct_report_if_persistent(nct_id, memory=MemoryStore(":memory:")) is None
+
+    explicit_store = MemoryStore(tmp_path / "memory.sqlite")
+    _save_cumulative_report_fixtures(explicit_store, nct_id, datetime(2026, 1, 2, tzinfo=timezone.utc))
+    explicit_path = write_nct_report_if_persistent(nct_id, memory=explicit_store)
+    assert explicit_path == tmp_path / "reports" / f"{nct_id}.html"
 
 
 def _save_cumulative_report_fixtures(store: MemoryStore, nct_id: str, base_time: datetime) -> None:
@@ -257,6 +307,7 @@ def _save_workflow_output(
     *,
     validation_status: str = "passed",
     metadata: dict | None = None,
+    input_payload: dict | None = None,
 ) -> None:
     run = WorkflowRun(
         run_id=run_id,
@@ -266,11 +317,11 @@ def _save_workflow_output(
         completed_at=completed_at,
         input_provenance="test",
         validation_status=validation_status,
-        metadata=metadata or {"nct_id": nct_id},
+        metadata={"nct_id": nct_id} if metadata is None else metadata,
     )
     output["run_id"] = run_id
     output["validation_status"] = validation_status
-    store.save_run(run, input_payload={"nct_id": nct_id}, output_payload=output)
+    store.save_run(run, input_payload=input_payload or {"nct_id": nct_id}, output_payload=output)
 
 
 def _agent3_output(nct_id: str, asset_name: str) -> dict:

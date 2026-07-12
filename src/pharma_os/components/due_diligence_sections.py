@@ -163,11 +163,18 @@ def build_patent_loe_review(patent: PatentExclusivityOutput) -> PatentLOEReview:
     """Convert Lens-only patent output into Agent 4 patent/LOE review."""
 
     if patent.estimated_loe_year is None:
-        summary = "No reviewed LOE year is available; Agent 4 does not invent or default LOE."
+        summary = (
+            f"Lens retrieved {len(patent.candidates)} candidates, but none was selected as plausibly covering the target asset; Agent 4 did not calculate LOE."
+            if patent.candidates
+            else "No reviewed LOE year is available; Agent 4 does not invent or default LOE."
+        )
     elif any(source_id.startswith("human_override:loe:") for source_id in patent.source_ids):
         summary = f"Reviewed LOE year is {patent.estimated_loe_year}; {len(patent.candidates)} Lens candidates were retrieved."
-    elif patent.candidates:
-        summary = f"Source-derived LOE year is {patent.estimated_loe_year} based on Lens patent-date evidence across {len(patent.candidates)} retrieved candidates; IP counsel review is still required."
+    elif patent.selected_candidate_id:
+        summary = (
+            f"Source-derived LOE year is {patent.estimated_loe_year} from selected Lens candidate "
+            f"{patent.selected_candidate_id} using {patent.loe_method or 'patent-date evidence'}; IP counsel review is still required."
+        )
     else:
         summary = f"Reviewed LOE year is {patent.estimated_loe_year}; no Lens patent family was selected from retrieved candidates."
     return PatentLOEReview(

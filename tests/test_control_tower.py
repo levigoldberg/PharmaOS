@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pharma_os.orchestrator as orchestrator_module
@@ -1031,9 +1032,13 @@ def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys,
     exported = payload["exported_files"]
     parent_json = tmp_path / exported["parent_json"]
     parent_html = tmp_path / exported["parent_html"]
+    cumulative_report = Path(exported["cumulative_nct_report"])
     family_dir = parent_json.parent
     assert parent_json.exists()
     assert parent_html.exists()
+    assert cumulative_report.exists()
+    assert cumulative_report == tmp_path / "reports" / "NCT04903795.html"
+    assert "Agent 5 - Protocol Design" in cumulative_report.read_text(encoding="utf-8")
     assert parent_html.parent == family_dir
     assert len(exported["child_runs"]) == 3
     for child in exported["child_runs"]:
@@ -1047,6 +1052,7 @@ def test_orchestrate_goal_only_uses_ai_understanding_and_default_outputs(capsys,
     assert list(family_dir.glob("clinical_outcome_prediction_*.json"))
     assert list(family_dir.glob("due_diligence_*.json"))
     assert list(family_dir.glob("protocol_design_*.json"))
+    assert "cumulative_nct_report:" in stdout
 
 
 def test_orchestrate_goal_only_ai_unavailable_returns_clear_error(capsys, tmp_path, monkeypatch) -> None:

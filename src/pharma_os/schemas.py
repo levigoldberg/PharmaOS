@@ -688,10 +688,23 @@ class PatentCandidate(StrictSchema):
     """Normalized patent search candidate from Lens."""
 
     candidate_id: str = Field(..., min_length=1)
+    lens_id: str | None = None
     title: str | None = None
+    abstract_excerpt: str | None = None
+    claim_excerpt: str | None = None
+    applicants_or_owners: tuple[str, ...] = Field(default_factory=tuple)
+    jurisdictions: tuple[str, ...] = Field(default_factory=tuple)
     jurisdiction: str | None = None
+    priority_date: str | None = None
+    application_date: str | None = None
     publication_date: str | None = None
+    anticipated_term_date: str | None = None
+    publication_or_application_identifiers: tuple[str, ...] = Field(default_factory=tuple)
     legal_status: str | None = None
+    matched_query_terms: tuple[str, ...] = Field(default_factory=tuple)
+    matched_company_terms: tuple[str, ...] = Field(default_factory=tuple)
+    source_search_strategy: str | None = None
+    source_url: str | None = None
     source_id: str = Field(..., min_length=1)
 
 
@@ -699,8 +712,13 @@ class PatentExclusivityOutput(StrictSchema):
     """Patent and loss-of-exclusivity section."""
 
     asset_name: str | None = None
+    asset_context: dict[str, Any] = Field(default_factory=dict)
     searched_terms: tuple[str, ...] = Field(default_factory=tuple)
     candidates: tuple[PatentCandidate, ...] = Field(default_factory=tuple)
+    selected_candidate_id: str | None = None
+    selected_candidate_rationale: str | None = None
+    selected_candidate_confidence: float | None = Field(default=None, ge=0, le=1)
+    loe_method: str | None = None
     estimated_loe_year: int | None = None
     source_ids: tuple[str, ...] = Field(default_factory=tuple)
     missing_data_flags: tuple[MissingDataFlag, ...] = Field(default_factory=tuple)

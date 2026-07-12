@@ -157,17 +157,12 @@ class MemoryStore:
         ).fetchall()
         normalized_nct = nct_id.strip().upper()
         for row in rows:
-            metadata = json.loads(row["metadata_json"] or "{}") or {}
+            metadata = _json_loads(row["metadata_json"]) or {}
             if metadata.get("artifact_lineage_status") == "superseded":
                 continue
-            input_payload = json.loads(row["input_json"] or "{}") or {}
-            output_payload = json.loads(row["output_json"] or "{}") or {}
-            candidate_nct = (
-                metadata.get("nct_id")
-                or input_payload.get("nct_id")
-                or (output_payload.get("input") or {}).get("nct_id")
-            )
-            if str(candidate_nct or "").strip().upper() != normalized_nct:
+            input_payload = _json_loads(row["input_json"]) or {}
+            output_payload = _json_loads(row["output_json"]) or {}
+            if _payload_nct(metadata, input_payload, output_payload) != normalized_nct:
                 continue
             return (
                 WorkflowRun(

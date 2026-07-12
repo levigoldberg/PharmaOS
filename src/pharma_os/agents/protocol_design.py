@@ -576,7 +576,7 @@ def _run_typed_agent(
     agent = object()
     if not call_config.disabled:
         if agent_name == "ProtocolDesignManagerAgent":
-            agent = build_protocol_design_manager_agent_with_tools(
+            agent = build_protocol_design_manager_agent(
                 instructions=instructions,
                 model=call_config.model,
                 output_type=output_type,
@@ -604,30 +604,14 @@ def _run_typed_agent(
     )
 
 
-def build_protocol_design_manager_agent_with_tools(*, instructions: str, model: str, output_type: type[Any]) -> Any:
-    """Construct the live manager with bounded specialist agents exposed as tools."""
+def build_protocol_design_manager_agent(*, instructions: str, model: str, output_type: type[Any]) -> Any:
+    """Construct the live manager as a plan-only coordinator."""
 
     Agent, _, _, _ = load_agents_sdk()
-    tool_specs = (
-        ("AnalogSelectionAgent", _analog_selection_instructions(), AnalogTrialSelectionOutput, "Select clinically meaningful analog trials and exclude weak candidates."),
-        ("FollowOnTrialAdjudicatorAgent", _follow_on_adjudicator_instructions(), FollowOnTrialAdjudicationOutput, "Adjudicate same-program follow-on candidates without forcing a successor."),
-        ("QualitativeProtocolSynthesisAgent", _qualitative_synthesis_instructions(), QualitativeProtocolSynthesis, "Synthesize recurring protocol patterns across selected follow-on trials."),
-        ("ProtocolCriticAgent", _regulatory_critic_instructions(), ProtocolReviewerCritique, "Critique sparse, ambiguous, conflicting, or weakly sourced protocol precedent."),
-    )
-    tools = []
-    for name, tool_instructions, schema, description in tool_specs:
-        specialist = Agent(
-            name=name,
-            instructions=tool_instructions,
-            model=model,
-            output_type=agents_sdk_output_schema(schema),
-        )
-        tools.append(specialist.as_tool(tool_name=name, tool_description=description))
     return Agent(
         name="ProtocolDesignManagerAgent",
         instructions=instructions,
         model=model,
-        tools=tools,
         output_type=agents_sdk_output_schema(output_type),
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import httpx
+from openpyxl import Workbook
 
 from pharma_os.components.due_diligence_sections import (
     build_asset_memo,
@@ -290,7 +291,7 @@ def test_lens_patent_search_estimates_loe_from_candidate_dates(monkeypatch) -> N
                     {
                         "lens_id": "123-456",
                         "biblio": {
-                            "invention_title": ["Example TYK2 inhibitor"],
+                            "invention_title": ["EX-001 Example TYK2 inhibitor"],
                             "application_reference": {"date": "2024-09-20"},
                         },
                         "jurisdiction": "US",
@@ -308,8 +309,64 @@ def test_lens_patent_search_estimates_loe_from_candidate_dates(monkeypatch) -> N
     review = build_patent_loe_review(patent)
 
     assert patent.estimated_loe_year == 2044
+    assert patent.selected_candidate_id == "123-456"
     assert not any(flag.flag_id == "patent-loe-review-required" for flag in patent.missing_data_flags)
     assert "Source-derived LOE year is 2044" in review.review_summary
+
+
+def test_lens_patent_search_rejects_irrelevant_max_date_candidate(monkeypatch) -> None:
+    monkeypatch.setenv("LENS_API_TOKEN", "test-token")
+    monkeypatch.setenv("PHARMA_OS_AGENTS_DISABLED", "true")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "lens_id": "irrelevant-999",
+                        "biblio": {
+                            "invention_title": ["Unrelated manufacturing device"],
+                            "application_reference": {"date": "2035-01-01"},
+                        },
+                        "abstract": "A mechanical packaging system for unrelated products.",
+                        "jurisdiction": "US",
+                        "date_published": "2036-01-01",
+                        "legal_status": "ACTIVE",
+                    }
+                ]
+            },
+        )
+
+    patent, _sources = search_patent_exclusivity(
+        AssetIdentityOutput(nct_id="NCT12345678", asset_name="Examplemab", sponsor="Example Bio", aliases=("EX-001",), confidence=0.9),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    review = build_patent_loe_review(patent)
+
+    assert patent.selected_candidate_id is None
+    assert patent.estimated_loe_year is None
+    assert "none was selected" in review.review_summary
+    assert any(flag.flag_id == "patent-no-plausible-selected-family" for flag in patent.missing_data_flags)
+    assert any(flag.flag_id == "patent-loe-review-required" for flag in patent.missing_data_flags)
+
+
+def test_lens_patent_search_keeps_loe_missing_when_no_candidates(monkeypatch) -> None:
+    monkeypatch.setenv("LENS_API_TOKEN", "test-token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": []})
+
+    patent, _sources = search_patent_exclusivity(
+        AssetIdentityOutput(nct_id="NCT12345678", asset_name="Examplemab", sponsor="Example Bio", aliases=("EX-001",), confidence=0.9),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert patent.candidates == ()
+    assert patent.selected_candidate_id is None
+    assert patent.estimated_loe_year is None
+    assert any(flag.flag_id == "patent-no-candidates" for flag in patent.missing_data_flags)
+    assert any(flag.flag_id == "patent-loe-review-required" for flag in patent.missing_data_flags)
 
 
 def test_pos_maps_sle_to_autoimmune_workbook_row() -> None:
@@ -423,6 +480,140 @@ def test_pricing_uses_atopic_dermatitis_source_constrained_analog(monkeypatch) -
     assert "openfda_label:cibinqo" in {source.source_id for source in sources}
 
 
+def test_pricing_prefers_openfda_label_lookup_by_ndc(tmp_path) -> None:
+    wac_path = _wac_workbook(
+        tmp_path,
+        [
+            {
+                "brand_name": "TestBrand",
+                "generic_name": "testgeneric",
+                "ndc": "12345-6789-01",
+                "product_description": "TestBrand 10 mg Tablet 30 Tablets",
+                "wac_value": 300,
+                "effective_date": "2026-01-01",
+                "source_year": 2026,
+            }
+        ],
+    )
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query = str(request.url.params.get("search", ""))
+        queries.append(query)
+        if 'openfda.product_ndc:"12345-6789"' not in query and 'openfda.package_ndc:"12345-6789-01"' not in query:
+            return httpx.Response(404, json={})
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "openfda": {
+                            "brand_name": ["TestBrand"],
+                            "generic_name": ["testgeneric"],
+                            "product_ndc": ["12345-6789"],
+                            "package_ndc": ["12345-6789-01"],
+                        },
+                        "dosage_and_administration": ["TestBrand 10 mg orally once daily."],
+                    }
+                ]
+            },
+        )
+
+    pricing, _sources = lookup_pricing(
+        AssetIdentityOutput(nct_id="NCT00000001", asset_name="TestBrand", normalized_indication="test indication", confidence=0.9),
+        wac_data_path=str(wac_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert queries[0] == 'openfda.product_ndc:"12345-6789"'
+    assert pricing.annual_wac == 3650.0
+    assert pricing.annualization_details["selected_dose_mg"] == 10
+    assert pricing.annualization_details["administrations_per_year"] == 365.0
+
+
+def test_pricing_disambiguates_multi_regimen_label_for_otezla_xr(tmp_path) -> None:
+    wac_path = _wac_workbook(
+        tmp_path,
+        [
+            {
+                "brand_name": "Otezla XR",
+                "generic_name": "apremilast",
+                "ndc": "59572-075-30",
+                "product_description": "Otezla XR 75 mg Tablet, Extended Release 30 Tablets",
+                "wac_value": 1000,
+                "effective_date": "2026-01-01",
+                "source_year": 2026,
+            }
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "openfda": {"brand_name": ["Otezla XR"], "generic_name": ["apremilast"], "product_ndc": ["59572-075"]},
+                        "dosage_and_administration": [
+                            "OTEZLA tablets: 30 mg orally twice daily. OTEZLA XR extended-release tablets: 75 mg orally once daily."
+                        ],
+                    }
+                ]
+            },
+        )
+
+    pricing, _sources = lookup_pricing(
+        AssetIdentityOutput(nct_id="NCT00000002", asset_name="Otezla XR", normalized_indication="plaque psoriasis", confidence=0.9),
+        wac_data_path=str(wac_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert pricing.annual_wac == 12166.67
+    assert pricing.annualization_details["selected_dose_mg"] == 75
+    assert pricing.annualization_details["administrations_per_year"] == 365.0
+    assert pricing.annualization_details["selected_frequency"] == "once daily"
+    assert pricing.annualization_details["semantic_validation_passed"] is True
+
+
+def test_pricing_blocks_otezla_xr_annualization_from_immediate_release_regimen(tmp_path) -> None:
+    wac_path = _wac_workbook(
+        tmp_path,
+        [
+            {
+                "brand_name": "Otezla XR",
+                "generic_name": "apremilast",
+                "ndc": "59572-075-30",
+                "product_description": "Otezla XR 75 mg Tablet, Extended Release 30 Tablets",
+                "wac_value": 1000,
+                "effective_date": "2026-01-01",
+                "source_year": 2026,
+            }
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "openfda": {"brand_name": ["Otezla"], "generic_name": ["apremilast"], "product_ndc": ["59572-030"]},
+                        "dosage_and_administration": ["OTEZLA tablets: 30 mg orally twice daily."],
+                    }
+                ]
+            },
+        )
+
+    pricing, _sources = lookup_pricing(
+        AssetIdentityOutput(nct_id="NCT00000003", asset_name="Otezla XR", normalized_indication="plaque psoriasis", confidence=0.9),
+        wac_data_path=str(wac_path),
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert pricing.annual_wac is None
+    assert any(flag.flag_id == "pricing-dosing-semantic-validation" for flag in pricing.missing_data_flags)
+
+
 def test_red_flags_and_memo_assembly_cover_noncalculable_sections() -> None:
     clinical = ClinicalRiskSummary(nct_id="NCT12345678", endpoint_risk_level="high", enrollment_duration_risk_level="low", confidence=0.5)
     safety = build_safety_label_summary(AssetIdentityOutput(nct_id="NCT12345678"))[0]
@@ -484,3 +675,33 @@ def test_serious_safety_label_language_creates_high_red_flag() -> None:
     )
 
     assert any(flag.flag_id == "safety-serious-label-warning" and flag.severity == "high" for flag in flags)
+
+
+def _wac_workbook(tmp_path, rows: list[dict[str, object]]):
+    path = tmp_path / "wac.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "combined_wac_increases"
+    headers = [
+        "brand_name",
+        "generic_name",
+        "manufacturer",
+        "ndc",
+        "product_description",
+        "strength",
+        "dosage_form",
+        "package_size",
+        "wac_value",
+        "currency",
+        "wac_unit_basis",
+        "effective_date",
+        "date_reported",
+        "source_file",
+        "source_sheet",
+        "source_year",
+    ]
+    ws.append(headers)
+    for row in rows:
+        ws.append([row.get(header) for header in headers])
+    wb.save(path)
+    return path

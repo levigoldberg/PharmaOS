@@ -910,7 +910,7 @@ def test_protocol_design_manager_offline_fallback_and_section_source_ids(monkeyp
     assert all(trace.provenance == "pharma_os.agent_runtime.offline" for trace in result.traces)
 
 
-def test_protocol_design_manager_agent_exposes_specialists_as_tools(monkeypatch) -> None:
+def test_protocol_design_manager_agent_is_plan_only(monkeypatch) -> None:
     created = []
 
     class FakeAgent:
@@ -919,25 +919,22 @@ def test_protocol_design_manager_agent_exposes_specialists_as_tools(monkeypatch)
             created.append(self)
 
         def as_tool(self, *, tool_name, tool_description):
-            return {"tool_name": tool_name, "tool_description": tool_description}
+            raise AssertionError(f"{tool_name} should not be exposed as a manager tool")
 
     monkeypatch.setattr(protocol_design_agents, "load_agents_sdk", lambda: (FakeAgent, object, object, object))
     monkeypatch.setattr(protocol_design_agents, "agents_sdk_output_schema", lambda schema: schema)
 
-    manager = protocol_design_agents.build_protocol_design_manager_agent_with_tools(
+    manager = protocol_design_agents.build_protocol_design_manager_agent(
         instructions="manager",
         model="gpt-test",
         output_type=protocol_design_agents.ProtocolDesignManagerPlan,
     )
 
-    tool_names = {tool["tool_name"] for tool in manager.kwargs["tools"]}
-    assert tool_names == {
-        "AnalogSelectionAgent",
-        "FollowOnTrialAdjudicatorAgent",
-        "QualitativeProtocolSynthesisAgent",
-        "ProtocolCriticAgent",
-    }
-    assert {agent.kwargs["name"] for agent in created} >= tool_names | {"ProtocolDesignManagerAgent"}
+    assert [agent.kwargs["name"] for agent in created] == ["ProtocolDesignManagerAgent"]
+    assert "tools" not in manager.kwargs
+    assert manager.kwargs["instructions"] == "manager"
+    assert manager.kwargs["model"] == "gpt-test"
+    assert manager.kwargs["output_type"] is protocol_design_agents.ProtocolDesignManagerPlan
 
 
 def test_protocol_section_assembly_uses_stable_ids_when_live_titles_change() -> None:

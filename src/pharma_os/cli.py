@@ -10,7 +10,7 @@ from pathlib import Path
 from pydantic import ValidationError
 from dotenv import find_dotenv, load_dotenv
 
-from pharma_os.html_report import write_run_html
+from pharma_os.html_report import write_nct_report_if_persistent, write_run_html
 from pharma_os.memory import DEFAULT_DB_PATH, MemoryStore
 from pharma_os.orchestrator import Orchestrator
 from pharma_os.registry import WorkflowRegistry
@@ -138,11 +138,13 @@ def main(argv: list[str] | None = None) -> int:
             family_dir = Path(output_json).parent
             for child_run_id in result.child_run_ids:
                 child_exports.append(_export_persisted_run(child_run_id, memory=store, output_dir=family_dir))
+            nct_report_path = write_nct_report_if_persistent(request.nct_id, memory=store)
             payload_data = result.model_dump(mode="json")
             payload_data["exported_files"] = _exported_files_manifest(
                 parent_json=output_json,
                 parent_html=str(parent_html_path),
                 child_exports=child_exports,
+                cumulative_nct_report=str(nct_report_path) if nct_report_path is not None else None,
             )
             payload = json.dumps(payload_data, default=str)
             _write_output(output_json, payload)
@@ -153,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
                     output_html=str(parent_html_path),
                     child_exports=child_exports,
                     step_results=payload_data.get("step_results", []),
+                    cumulative_nct_report=str(nct_report_path) if nct_report_path is not None else None,
                 )
             )
             return 0
@@ -546,12 +549,16 @@ def _exported_files_manifest(
     parent_json: str,
     parent_html: str,
     child_exports: list[dict[str, str]],
+    cumulative_nct_report: str | None = None,
 ) -> dict[str, object]:
-    return {
+    manifest = {
         "parent_json": parent_json,
         "parent_html": parent_html,
         "child_runs": child_exports,
     }
+    if cumulative_nct_report:
+        manifest["cumulative_nct_report"] = cumulative_nct_report
+    return manifest
 
 
 def _run_completion_summary(*, workflow_name: str, run_id: str, output_json: str, output_html: str) -> str:
@@ -573,6 +580,7 @@ def _orchestration_completion_summary(
     output_html: str,
     child_exports: list[dict[str, str]],
     step_results: object,
+    cumulative_nct_report: str | None = None,
 ) -> str:
     steps = step_results if isinstance(step_results, list) else []
     executed = [
@@ -601,6 +609,8 @@ def _orchestration_completion_summary(
         lines.append(f"attention: {', '.join(blocked_or_failed)}")
     if child_exports:
         lines.append(f"child_runs: {len(child_exports)}")
+    if cumulative_nct_report:
+        lines.append(f"cumulative_nct_report: {cumulative_nct_report}")
     lines.extend((f"json: {output_json}", f"html: {output_html}"))
     return "\n".join(lines)
 

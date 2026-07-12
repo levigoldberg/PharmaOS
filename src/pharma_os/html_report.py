@@ -168,6 +168,8 @@ def _default_nct_report_path(nct_id: str, store: MemoryStore) -> Path:
     db_path = Path(db_path)
     if str(db_path) != ":memory:" and db_path.parent.name == ".pharma_os":
         return db_path.parent.parent / "reports" / filename
+    if str(db_path) != ":memory:" and db_path.parent != Path("."):
+        return db_path.parent / "reports" / filename
     return Path("reports") / filename
 
 
