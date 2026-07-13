@@ -5,10 +5,6 @@ AI-native pharma operating system prototype with a memory-aware Control Tower an
 Start with:
 
 - [Detailed system architecture guide](docs/system_architecture_detailed.md)
-- [Concise system architecture description](docs/system_architecture_concise.md)
-- [Project brief](docs/project_brief.md)
-- [Architecture decisions](docs/architecture_decisions.md)
-- [Lean implementation plan](docs/build_plan.md)
 
 ## Architecture
 
