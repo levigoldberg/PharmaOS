@@ -78,7 +78,7 @@ Whenever a change affects architecture, workflows, capabilities, runtime behavio
 
 ## Repo Layout
 
-- `docs/`: detailed and concise system architecture guides, project brief, architecture decisions, and historical lean build plan.
+- `docs/`: retained architecture documentation, currently `system_architecture_detailed.md`.
 - `src/pharma_os/cli.py`: command-line entry point.
 - `src/pharma_os/orchestrator.py`: direct workflow runs plus Control Tower orchestration.
 - `src/pharma_os/control_tower.py`: Control Tower planning primitives and plan validation.
